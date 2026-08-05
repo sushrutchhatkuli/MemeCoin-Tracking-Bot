@@ -12,7 +12,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { extractBuys, priceEntry } from '../smart_money.mjs';
+import {
+  extractBuys,
+  priceEntry,
+  validateWatchlistEntry,
+  formatSmartMoneyLine,
+} from '../smart_money.mjs';
 import { scoreToken, concentrationCapFor, runSecurityAudit } from '../audit.mjs';
 
 const MINT = 'MintAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -187,6 +192,61 @@ test('a whale cannot rescue a token below the holder floor', () => {
   assert.equal(result.safetyGateFailed, true);
   assert.equal(result.verdict, 'UNVERIFIED / LOW HOLDERS');
   assert.notEqual(result.verdict, 'BUY SIGNAL');
+});
+
+/* ------------------------------------------------------------------ *
+ * Watchlist validation + callout formatting
+ * ------------------------------------------------------------------ */
+
+test('rejects addresses that are not valid Solana base58', () => {
+  // 45 chars — the real failure found in a live watchlist. Silently matched
+  // nothing, which is indistinguishable from "no whales detected".
+  const tooLong = validateWatchlistEntry({
+    address: '8b9RzKk9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
+  });
+  assert.equal(tooLong.valid, false);
+  assert.match(tooLong.reason, /wrong length/);
+
+  // 0, O, I and l are outside the base58 alphabet.
+  assert.equal(validateWatchlistEntry({ address: `0OIl${'1'.repeat(36)}` }).valid, false);
+
+  assert.equal(
+    validateWatchlistEntry({ address: '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM' }).valid,
+    true
+  );
+});
+
+test('callout shows spend and entry market cap when a trade was replayed', () => {
+  const line = formatSmartMoneyLine({
+    displayLabel: 'Alpha Whale #1',
+    solscanUrl: 'https://solscan.io/account/ABC',
+    stats: { winRate: '84%', netProfitUsd: '+$145k' },
+    solSpent: 7.5,
+    usdSpent: 1200,
+    entryMarketCapUsd: 18000,
+    entryMinutesAfterLaunch: 2,
+    pct: 1.2,
+  });
+  assert.match(line, /Alpha Whale #1/);
+  assert.match(line, /84% WR \| \+\$145k Profit/);
+  assert.match(line, /Bought 7\.50 SOL \(\$1k\) at \$18k MC/);
+  assert.match(line, /2m after launch ⚡/);
+});
+
+test('callout reports position instead of inventing a spend when unattributable', () => {
+  const line = formatSmartMoneyLine({
+    displayLabel: 'Alpha Whale #2',
+    solscanUrl: 'https://solscan.io/account/DEF',
+    stats: null,
+    solSpent: null,
+    usdSpent: null,
+    entryMarketCapUsd: null,
+    entryMinutesAfterLaunch: null,
+    pct: 3.14,
+  });
+  assert.match(line, /Holds 3\.14% of supply/);
+  assert.doesNotMatch(line, /Bought/);
+  assert.doesNotMatch(line, /MC/);
 });
 
 /* ------------------------------------------------------------------ *

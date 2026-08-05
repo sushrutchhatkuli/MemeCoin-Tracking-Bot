@@ -12,6 +12,7 @@ import { dirname } from 'node:path';
 
 import { fetchLiveHolderDistribution } from './sources.mjs';
 import { concentrationCapFor } from './audit.mjs';
+import { formatSmartMoneyLine } from './smart_money.mjs';
 
 /* ------------------------------------------------------------------ *
  * .env
@@ -259,6 +260,15 @@ export function buildDigest({ rows, scanned, noteCount, startedAt, tradeLink }) 
         if (r.smartMoney) extras.push(`🐋x${r.smartMoney}`);
         if (r.devStatus === 'GOOD DEV ✅') extras.push('dev✅');
         lines.push(`${head} — ${esc(extras.join(' · '))}`);
+
+        // Dedicated smart-money callout beneath the token line. Only reached on
+        // WATCH / BUY SIGNAL rows: a SCAM/AVOID token never shows whale detail,
+        // because surfacing it there is precisely the trick the safety override
+        // exists to defeat.
+        for (const m of r.smartMoneyDetail ?? []) {
+          lines.push(`  ↳ ${formatSmartMoneyLine(m, { html: true })}`);
+        }
+
         if (verdict === 'BUY SIGNAL') {
           lines.push(`     📲 <a href="${esc(tradeUrl(r.address, tradeLink, r.chain))}">Trade</a> · <code>${esc(r.address)}</code>`);
         }

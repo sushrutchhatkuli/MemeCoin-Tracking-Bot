@@ -25,18 +25,50 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  *   ["Wallet1...", "Wallet2..."]                         (bare array)
  *   { "wallets": [ { "address": "...", "label": "..." } ] } (annotated)
  */
+/**
+ * Solana addresses are base58 (no 0, O, I, l) and 32–44 characters.
+ * An address that fails this can never match a real holder, so a typo in the
+ * watchlist would otherwise present as "no smart money found" forever — a
+ * silent failure that looks identical to a working module.
+ */
+const BASE58_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+export function validateWatchlistEntry(entry) {
+  const address = String(entry?.address ?? '');
+  if (!BASE58_ADDRESS.test(address)) {
+    return {
+      valid: false,
+      reason:
+        address.length < 32 || address.length > 44
+          ? `wrong length (${address.length}; Solana addresses are 32–44 chars)`
+          : 'contains characters outside the base58 alphabet',
+    };
+  }
+  return { valid: true };
+}
+
 export async function loadWatchlist(path) {
   try {
     const raw = JSON.parse(await readFile(path, 'utf8'));
     const entries = Array.isArray(raw) ? raw : (raw.wallets ?? []);
 
-    const normalised = entries
+    const candidates = entries
       .map((e) => (typeof e === 'string' ? { address: e } : e))
       // `enabled: false` keeps the shipped placeholder from registering as a real
       // watchlist entry, which would report the module as configured when it isn't.
       .filter(
         (w) => w?.address && w.enabled !== false && !String(w.address).startsWith('EXAMPLE_')
       );
+
+    const invalid = [];
+    const normalised = candidates.filter((w) => {
+      const check = validateWatchlistEntry(w);
+      if (!check.valid) {
+        invalid.push({ address: w.address, label: w.label ?? null, reason: check.reason });
+        return false;
+      }
+      return true;
+    });
 
     const index = new Map();
     for (const w of normalised) {
@@ -61,10 +93,57 @@ export async function loadWatchlist(path) {
             : null,
       });
     }
-    return { index, count: normalised.length };
+    return { index, count: normalised.length, invalid };
   } catch {
-    return { index: new Map(), count: 0 };
+    return { index: new Map(), count: 0, invalid: [] };
   }
+}
+
+/**
+ * One-line smart money callout, shared by the digest and the alert card so the
+ * two can never drift apart.
+ *
+ * Renders only what is actually known. Spend and entry market cap are derived
+ * from the buy transaction, so they are absent when the wallet was matched from
+ * the holder list rather than a replayed trade — in which case the position size
+ * is shown instead of inventing a figure.
+ */
+export function formatSmartMoneyLine(match, { html = false } = {}) {
+  // Telegram parses HTML, so any literal '<' in the body (notably the "<1m"
+  // timing) is read as an unclosed tag and the whole message is rejected.
+  const esc = (s) =>
+    html
+      ? String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      : String(s);
+  const link = (url) => (html ? `<a href="${url}">${url}</a>` : url);
+
+  const stats = [];
+  if (match.stats?.winRate) stats.push(`${match.stats.winRate} WR`);
+  if (match.stats?.netProfitUsd) stats.push(`${match.stats.netProfitUsd} Profit`);
+  const statsPart = stats.length ? ` (${stats.join(' | ')})` : '';
+
+  let action;
+  if (match.solSpent && match.usdSpent) {
+    const mc = match.entryMarketCapUsd ? ` at ${shortUsd(match.entryMarketCapUsd)} MC` : '';
+    action = `Bought ${match.solSpent.toFixed(2)} SOL (${shortUsd(match.usdSpent)})${mc}`;
+  } else {
+    action = `Holds ${match.pct.toFixed(2)}% of supply`;
+  }
+
+  const timing =
+    match.entryMinutesAfterLaunch !== null && match.entryMinutesAfterLaunch !== undefined
+      ? ` · ${match.entryMinutesAfterLaunch < 1 ? '<1m' : `${Math.round(match.entryMinutesAfterLaunch)}m`} after launch${match.entryMinutesAfterLaunch <= 10 ? ' ⚡' : ''}`
+      : '';
+
+  const body = `🐋 SMART MONEY: ${match.displayLabel}${statsPart} ${action}${timing} | 🔗 `;
+  return esc(body) + link(match.solscanUrl);
+}
+
+function shortUsd(n) {
+  if (n === null || n === undefined || Number.isNaN(n)) return '?';
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `$${Math.round(n / 1e3)}k`;
+  return `$${Math.round(n)}`;
 }
 
 /* ------------------------------------------------------------------ *

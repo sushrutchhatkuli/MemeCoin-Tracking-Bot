@@ -70,6 +70,66 @@
       "reason": "Post-mortem: $FomoCoin fell -100% within 1.01h (pair delisted)",
       "added": "2026-08-05",
       "source": "post-mortem"
+    },
+    {
+      "address": "3ZPhb3ateyWDVBfRRCqAsFswiCFKpXfNhEGY2WTL2L9E",
+      "reason": "Post-mortem: $MOOZA fell -98.5% within 1.01h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "CVQFXyMW5W7fNXn7iXQbobrQjfVzxKGnDHwNzwttTb6c",
+      "reason": "Post-mortem: $BOARD fell -81.9% within 1.26h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "AyeSWiQksaQFvwmgCAsHjwLnE5okA9VYcmsAKnBMfte6",
+      "reason": "Post-mortem: $Fantasy fell -85.9% within 1.07h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "AZXNCQHzazxGPLYDWWndkeNfqPHrWsUp51WotsEcxTeX",
+      "reason": "Post-mortem: $LACC fell -82.3% within 1.06h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "GdRSPexhxbQz5H2zFQrNN2BAZUqEjAULBigTPvQ6oDMP",
+      "reason": "Post-mortem: $Kimchi fell -87.8% within 1.06h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "C3irJJnfcioeyFQ7nhNQrEV9jShQiqfFKG7bvcf11JwH",
+      "reason": "Post-mortem: $Orangoontan fell -86.5% within 1.06h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "3HEGr2RhTsGPsapbYXMhMzSX7qF3cHW4DCSKF6JofMH2",
+      "reason": "Post-mortem: $BLOWIE fell -82.2% within 2.49h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "23QuARJvRDKYy7c9QM8NCVZJSBKy3EALUkzSvf5Gft3U",
+      "reason": "Post-mortem: $MARS fell -83.6% within 1.66h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "F5XvCe4233m6mHRbkkq2ZsFvqrPAnRrDBExeQy2fwagQ",
+      "reason": "Post-mortem: $HODL fell -94.9% within 1.07h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "D9gQ6RhKEpnobPBUdWY5bPQt2p3zGk3iVz6ChpUi2ArA",
+      "reason": "Post-mortem: $HODL fell -95.7% within 1.07h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
     }
   ],
   "mints": [

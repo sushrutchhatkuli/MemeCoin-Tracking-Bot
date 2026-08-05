@@ -46,3 +46,7 @@ package-lock.json
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Personal notes — may contain keys pasted while configuring
+00 To Do List.md
+*To Do List.md

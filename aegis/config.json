@@ -22,7 +22,7 @@
     "youngTokenHours": 2,
     "minLpLockedPct": 99,
     "maxTotalTaxPct": 5,
-    "buySignalScore": 75,
+    "buySignalScore": 80,
     "watchScore": 55,
     "minUniqueHolders": 150,
     "lowHolderScoreCap": 45
@@ -73,7 +73,7 @@
 
   "telegram": {
     "enabled": true,
-    "minScore": 75,
+    "minScore": 80,
     "cooldownHours": 6,
     "sendScanDigest": true,
     "requireLiveReaudit": false
@@ -81,14 +81,6 @@
 
   "writeNotes": true,
 
-  "_tradeLinkNote": [
-    "Verified working route, from a share link out of the FOMO mobile app.",
-    "NOTE: fomo.app does NOT resolve — that is the Android package id",
-    "(family.fomo.app), not a web domain. The live host is fomo.family, and its",
-    "/trade/{mint} path returns a 404 body under a 200 status. Only",
-    "/tokens/{chain}/{address} renders real token content.",
-    "Placeholders: {chain} = dexscreener chain id, {address} = contract."
-  ],
   "tradeLinkTemplate": "https://fomo.family/tokens/{chain}/{address}",
   "tradeLinkLabel": "Trade on FOMO App",
 

@@ -338,6 +338,13 @@ export async function runScan(args = {}) {
       ? `🐋 Smart money watchlist: ${watchlist.count} wallet(s) loaded`
       : '🐋 Smart money watchlist: empty (module inactive — see aegis/smart_wallets.json)'
   );
+  // A malformed address matches nothing, which is indistinguishable from
+  // "no whales found". Say so loudly rather than let it look like it works.
+  for (const bad of watchlist.invalid ?? []) {
+    console.log(
+      `   ⚠️  REJECTED ${bad.label ? `"${bad.label}" ` : ''}${bad.address} — ${bad.reason}`
+    );
+  }
 
   if (config.deployer.enabled) {
     const harvest = await harvestLaunchFeed(deployerCache, now.getTime());
@@ -451,6 +458,10 @@ export async function runScan(args = {}) {
       sells: demand.m5.sells,
       liqPct: demand.liqToMcapPct,
       smartMoney: smartMoney?.detected ? smartMoney.count : 0,
+      // Whale detail is attached only when the token passed every safety gate;
+      // a blocked token must never carry a smart-money endorsement.
+      smartMoneyDetail:
+        smartMoney?.detected && !verdictInfo.safetyGateFailed ? smartMoney.matches : [],
       devStatus: deployer?.status ?? null,
       failReason: audit.failures?.[0] ?? null,
     });
