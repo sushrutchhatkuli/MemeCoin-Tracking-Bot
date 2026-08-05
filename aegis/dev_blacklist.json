@@ -1,0 +1,42 @@
+{
+  "_comment": [
+    "Permanent blacklist. Any token whose deployer is listed in `wallets`, or",
+    "whose mint is listed in `mints`, scores 0 and is verdict SCAM/AVOID.",
+    "",
+    "IMPORTANT — the two lists are not interchangeable:",
+    "  wallets = the DEPLOYER/creator wallet that minted the token",
+    "  mints   = the TOKEN contract address itself",
+    "Putting a mint in `wallets` silently never matches, which looks like",
+    "protection while providing none. post_mortem.mjs appends to `wallets`",
+    "automatically when a scanned token rugs."
+  ],
+  "wallets": [
+    {
+      "address": "6pGfoXu8TXaCepjdyWZaVagaTT1fVeFAyZvPdSFAao2t",
+      "reason": "Deployer of $lighton — low-liquidity trap (MC ~$1.5k, sub-150 holders)",
+      "added": "2026-08-04",
+      "source": "manual"
+    },
+    {
+      "address": "3CQnNpEiGBMhb8Y7zogR5Rf1HK3V5zpLZRZg4BNA4ZXw",
+      "reason": "Post-mortem: $HILTON fell -100% within 1h (pair delisted)",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "GguKCgLYxwtWgpXzubxkq7E3ZzAYQFbda71DvfbkrKPh",
+      "reason": "Post-mortem: $ADJ fell -100% within 1h (pair delisted)",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    }
+  ],
+  "mints": [
+    {
+      "address": "HbKd9vnxRmtX6ERyFm27c6FBnm9uxyndRWiqshF3Lig",
+      "symbol": "lighton",
+      "reason": "Low-liquidity trap. NOTE: this is the TOKEN mint, not a deployer wallet — it was originally supplied as a deployer address.",
+      "added": "2026-08-04",
+      "source": "manual"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "name": "aegis-crypto",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Autonomous on-chain token scanner: security auditing, deployer reputation, smart money tracking, Obsidian notes and Telegram alerts.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node aegis/index.mjs",
+    "scan": "node aegis/index.mjs",
+    "watch": "node aegis/index.mjs --watch 12",
+    "test:telegram": "node aegis/index.mjs --test-telegram"
+  },
+  "dependencies": {}
+}

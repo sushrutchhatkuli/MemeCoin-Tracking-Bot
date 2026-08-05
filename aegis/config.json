@@ -1,0 +1,94 @@
+{
+  "vaultPath": "../Memecoin/Crypto finder",
+  "notesFolder": "Signals",
+  "chains": ["solana", "base", "ethereum", "bsc"],
+
+  "rpcUrl": "https://api.mainnet-beta.solana.com",
+
+  "filters": {
+    "minLiquidityUsd": 4000,
+    "minMarketCapUsd": 12000,
+    "maxMarketCapUsd": 8000000,
+    "maxAgeHours": 96,
+    "minTxns24h": 40
+  },
+
+  "thresholds": {
+    "buySignalDemandRatio": 2.0,
+    "crashSellRatio": 3.0,
+    "minLiqToMcapPct": 15,
+    "maxTop10Pct": 25,
+    "minLpLockedPct": 99,
+    "maxTotalTaxPct": 5,
+    "buySignalScore": 75,
+    "watchScore": 55,
+    "minUniqueHolders": 150,
+    "lowHolderScoreCap": 45
+  },
+
+  "social": {
+    "bonusBothSocials": 10,
+    "bonusOneSocial": 5
+  },
+
+  "postMortem": {
+    "enabled": true,
+    "minAgeHours": 1,
+    "maxAgeHours": 6,
+    "rugDropPct": 80,
+    "rugMcapFloorUsd": 5000,
+    "winGainPct": 100
+  },
+
+  "deployer": {
+    "enabled": true,
+    "deployerScanSignatures": 40,
+    "deployerMaxTxLookups": 18,
+    "deployerCacheHours": 12,
+    "deployerMatureMinutes": 30,
+    "deployerDeadLiquidityUsd": 1000,
+    "deployerSuccessMcapUsd": 100000,
+    "deployerSerialMinDeploys": 3,
+    "deployerDeadRatio": 0.7,
+    "deployerGoodMinSuccesses": 2,
+    "deployerBurstMinMints": 4,
+    "deployerBurstWindowSec": 600,
+    "rpcDelayMs": 220
+  },
+
+  "smartMoney": {
+    "enabled": true,
+    "watchlistFile": "smart_wallets.json",
+    "earlyAccumulationMinutes": 10,
+    "scoreBonus": 15,
+    "scanRecentBuyers": true,
+    "buyerScanSignatures": 60,
+    "buyerMaxTxLookups": 25,
+    "buyerRetries": 2,
+    "rpcBackoffMs": 700,
+    "rpcDelayMs": 220
+  },
+
+  "telegram": {
+    "enabled": true,
+    "minScore": 75,
+    "cooldownHours": 6,
+    "sendScanDigest": true
+  },
+
+  "writeNotes": true,
+
+  "_tradeLinkNote": [
+    "Verified working route, from a share link out of the FOMO mobile app.",
+    "NOTE: fomo.app does NOT resolve — that is the Android package id",
+    "(family.fomo.app), not a web domain. The live host is fomo.family, and its",
+    "/trade/{mint} path returns a 404 body under a 200 status. Only",
+    "/tokens/{chain}/{address} renders real token content.",
+    "Placeholders: {chain} = dexscreener chain id, {address} = contract."
+  ],
+  "tradeLinkTemplate": "https://fomo.family/tokens/{chain}/{address}",
+  "tradeLinkLabel": "Trade on FOMO App",
+
+  "requestDelayMs": 350,
+  "maxTokensPerScan": 40
+}

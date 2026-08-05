@@ -1,0 +1,80 @@
+#!/usr/bin/env node
+/**
+ * Aegis-Crypto entry point — this is what the scheduler runs.
+ *
+ *   node index.mjs                     one scan pass, then exit
+ *   node index.mjs --watch             stay resident, scan on an interval
+ *   node index.mjs --token <address>   deep-dive a single contract
+ *   node index.mjs --test-telegram     verify Telegram credentials
+ *
+ * For Windows Task Scheduler use the default (single pass) form: the scheduler
+ * owns the timing, so a resident process would double up. `--watch` exists for
+ * running it in a terminal you keep open.
+ */
+
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+import { runScan, parseArgs } from './scan.mjs';
+import { runPostMortem, annotateNotes } from './post_mortem.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+const WATCH_DEFAULT_MINUTES = 12;
+
+function stamp() {
+  return new Date().toISOString().replace('T', ' ').slice(0, 19);
+}
+
+async function once(args) {
+  const started = Date.now();
+  console.log(`\n═══ Aegis scan @ ${stamp()} ═══`);
+  try {
+    const result = await runScan(args);
+
+    // Post-mortem runs after the scan so this pass's observations are already
+    // recorded, and is isolated in its own try: a failure here must not lose
+    // the scan results that already succeeded.
+    if (!args.token && !args.testTelegram) {
+      try {
+        const config = JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'));
+        if (config.postMortem?.enabled !== false) {
+          const pm = await runPostMortem({ config });
+          if (pm.results?.length && config.writeNotes !== false) {
+            const n = await annotateNotes({ config, results: pm.results });
+            if (n) console.log(`📝 Post-mortem verdict stamped onto ${n} note(s).`);
+          }
+        }
+      } catch (err) {
+        console.error(`⚠️  Post-mortem failed (scan results kept): ${err.message}`);
+      }
+    }
+
+    console.log(
+      `═══ Done in ${((Date.now() - started) / 1000).toFixed(0)}s — ` +
+        `${result?.written?.length ?? 0} note(s), ${result?.alerts?.length ?? 0} alert(s) ═══`
+    );
+    return true;
+  } catch (err) {
+    // In watch mode a single failed pass must not kill the loop — a transient
+    // upstream outage should cost one cycle, not the whole session.
+    console.error(`═══ Scan failed: ${err.message} ═══`);
+    return false;
+  }
+}
+
+const argv = process.argv.slice(2);
+const args = parseArgs(argv);
+const watchIndex = argv.indexOf('--watch');
+const watch = watchIndex !== -1;
+
+if (!watch) {
+  const ok = await once(args);
+  process.exit(ok ? 0 : 1);
+} else {
+  const minutes = Number(argv[watchIndex + 1]) || WATCH_DEFAULT_MINUTES;
+  console.log(`👁️  Watch mode: scanning every ${minutes} minute(s). Ctrl+C to stop.`);
+  await once(args);
+  setInterval(() => once(args), minutes * 60 * 1000);
+}

@@ -1,0 +1,93 @@
+# Render Blueprint for Aegis-Crypto
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Deploys the scanner as a Cron Job that runs every 12 minutes.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# READ THIS BEFORE DEPLOYING — two things behave differently in the cloud:
+#
+# 1. THE FILESYSTEM IS EPHEMERAL.
+#    Every cron run starts from a fresh container, so aegis/.state/ is empty at
+#    the start of each run. Consequences:
+#      - Holder growth velocity always reports "baseline" (it needs a prior
+#        snapshot to diff against).
+#      - The deployer index rebuilds from scratch each run, so it never
+#        compounds the way it does locally.
+#      - The alert cooldown cannot persist, so a token that stays qualified
+#        could re-alert every 12 minutes.
+#    BUY SIGNAL is rare enough that the last point is tolerable in practice, but
+#    if you lower TELEGRAM_MIN_SCORE, expect repeats.
+#    To keep state, use the Background Worker option at the bottom instead.
+#
+# 2. OBSIDIAN NOTES WRITTEN HERE GO NOWHERE.
+#    The vault lives on your PC. Notes written inside a Render container are
+#    discarded when it exits. That is why WRITE_NOTES is false below — in the
+#    cloud, Telegram IS the output. Keep the local Windows scheduled task
+#    running if you want the vault to keep filling up.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  - type: cron
+    name: aegis-scanner
+    runtime: node
+    plan: starter
+    region: oregon
+    schedule: "*/12 * * * *"
+    buildCommand: npm install
+    startCommand: node aegis/index.mjs
+    envVars:
+      # Secrets — sync:false means "prompt me in the dashboard, never store in git"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+
+      # Optional but strongly recommended. The public Solana RPC throttles the
+      # buyer replay to roughly 10 of 25 transactions; a dedicated endpoint
+      # (Helius / QuickNode) removes that ceiling.
+      - key: SOLANA_RPC_URL
+        sync: false
+
+      # Cloud output settings
+      - key: TELEGRAM_SEND_DIGEST
+        value: "true"      # push every verdict (WATCH / SCAM / CRASH / BUY) per scan
+      - key: WRITE_NOTES
+        value: "false"     # notes cannot reach your local vault from here
+      - key: TELEGRAM_MIN_SCORE
+        value: "75"
+      - key: SCAN_LIMIT
+        value: "25"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ALTERNATIVE: Background Worker with a persistent disk.
+#
+# Use this instead of the cron job if you want state to survive between runs —
+# real holder velocity, a compounding deployer index, and a working alert
+# cooldown. The worker stays resident and schedules itself with --watch.
+#
+# Cron Jobs cannot mount disks on Render; Background Workers can. Delete the
+# `type: cron` service above if you switch, and do not run both.
+#
+#  - type: worker
+#    name: aegis-worker
+#    runtime: node
+#    plan: starter
+#    region: oregon
+#    buildCommand: npm install
+#    startCommand: node aegis/index.mjs --watch 12
+#    disk:
+#      name: aegis-state
+#      mountPath: /opt/render/project/src/aegis/.state
+#      sizeGB: 1
+#    envVars:
+#      - key: TELEGRAM_BOT_TOKEN
+#        sync: false
+#      - key: TELEGRAM_CHAT_ID
+#        sync: false
+#      - key: SOLANA_RPC_URL
+#        sync: false
+#      - key: TELEGRAM_SEND_DIGEST
+#        value: "true"
+#      - key: WRITE_NOTES
+#        value: "false"
+# ─────────────────────────────────────────────────────────────────────────────

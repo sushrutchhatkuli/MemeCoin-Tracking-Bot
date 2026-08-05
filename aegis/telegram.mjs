@@ -1,0 +1,350 @@
+/**
+ * Telegram signal notifier.
+ *
+ * Fires only on high-conviction results (BUY SIGNAL at or above the configured
+ * score floor) and de-duplicates per token, because the scanner is designed to
+ * run every 10-15 minutes and would otherwise re-alert the same token on every
+ * pass until it fell out of the window.
+ */
+
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
+
+/* ------------------------------------------------------------------ *
+ * .env
+ * ------------------------------------------------------------------ */
+
+/**
+ * Minimal .env reader. Deliberately not a dependency: the whole pipeline is
+ * dependency-free, and this only needs KEY=VALUE. Values already present in the
+ * real environment win, so the scheduled task can inject secrets instead.
+ */
+export async function loadEnv(path) {
+  const env = {};
+  try {
+    const raw = await readFile(path, 'utf8');
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq === -1) continue;
+      const key = trimmed.slice(0, eq).trim();
+      let value = trimmed.slice(eq + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      env[key] = value;
+    }
+  } catch {
+    /* no .env file — fall through to process.env */
+  }
+  const pick = (key) => process.env[key] || env[key] || null;
+  return {
+    botToken: pick('TELEGRAM_BOT_TOKEN'),
+    chatId: pick('TELEGRAM_CHAT_ID'),
+    rpcOverride: pick('SOLANA_RPC_URL'),
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Alert de-duplication
+ * ------------------------------------------------------------------ */
+
+export async function loadAlertLog(path) {
+  try {
+    return JSON.parse(await readFile(path, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+export async function saveAlertLog(path, log) {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(log, null, 2), 'utf8');
+}
+
+function shouldAlert(log, key, cooldownHours, now) {
+  const last = log[key];
+  if (!last) return true;
+  return now - last.sentAt >= cooldownHours * 3600 * 1000;
+}
+
+/* ------------------------------------------------------------------ *
+ * Message
+ * ------------------------------------------------------------------ */
+
+const esc = (s) =>
+  String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+/**
+ * Build a trade URL from the configured template. Not hardcoded, because the
+ * original `fomo.app/trade/{address}` host does not exist — `fomo.app` is the
+ * Android package id and FOMO ships no web token page.
+ */
+export function tradeUrl(address, tradeLink, chain = 'solana') {
+  const template = tradeLink?.template ?? 'https://fomo.family/tokens/{chain}/{address}';
+  return template.replace('{chain}', chain).replace('{address}', address);
+}
+
+const usdShort = (n) => {
+  if (n === null || n === undefined || Number.isNaN(n)) return '?';
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `$${Math.round(n / 1e3)}k`;
+  return `$${Math.round(n)}`;
+};
+
+/** Whale detail block — only ever reached on a token that passed every gate. */
+function renderWhales(smartMoney) {
+  if (!smartMoney?.detected) return [];
+
+  const lines = [
+    '',
+    '🐋 <b>INSIDER / SMART MONEY ACTIVITY:</b>',
+    `• Smart Money Detected: ${smartMoney.count} Elite Whale${smartMoney.count === 1 ? '' : 's'} ✅`,
+  ];
+
+  for (const w of smartMoney.matches) {
+    const shortAddr = `${w.address.slice(0, 6)}…${w.address.slice(-4)}`;
+    lines.push(`• Wallet: <code>${esc(shortAddr)}</code> (${esc(w.displayLabel)})`);
+    lines.push(`• Whale Profile: 🔗 <a href="${esc(w.solscanUrl)}">solscan.io/account/${esc(shortAddr)}</a>`);
+
+    if (w.usdSpent && w.solSpent) {
+      const atMcap = w.entryMarketCapUsd ? ` at ${usdShort(w.entryMarketCapUsd)} Market Cap` : '';
+      lines.push(`• Action: Bought ${usdShort(w.usdSpent)} (${w.solSpent.toFixed(2)} SOL)${esc(atMcap)}`);
+    } else {
+      lines.push(
+        `• Action: Holds ${w.pct.toFixed(2)}% of supply <i>(spend not attributable${w.via === 'holder' ? ' — matched on holder list' : ' — multi-buyer transaction'})</i>`
+      );
+    }
+
+    if (w.entryMinutesAfterLaunch !== null && w.entryMinutesAfterLaunch !== undefined) {
+      const m = w.entryMinutesAfterLaunch;
+      lines.push(
+        `• Timing: Entered ${m < 1 ? '<1 min' : `${m.toFixed(0)} mins`} after launch${m <= 10 ? ' ⚡' : ''}`
+      );
+    } else {
+      lines.push('• Timing: <i>entry time not recovered</i>');
+    }
+
+    if (w.stats) {
+      const bits = [
+        w.stats.winRate && `${esc(w.stats.winRate)} Win-Rate`,
+        w.stats.trades && `${esc(w.stats.trades)} Trades`,
+        w.stats.netProfitUsd && `${esc(w.stats.netProfitUsd)} Profit`,
+      ].filter(Boolean);
+      lines.push(`• Whale Stats: ${bits.join(' | ')} <i>(from your watchlist)</i>`);
+    } else {
+      lines.push('• Whale Stats: <i>none on file — add win_rate/trades/net_profit_usd to smart_wallets.json</i>');
+    }
+  }
+  return lines;
+}
+
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink }) {
+  const symbol = pair.baseToken?.symbol ?? 'UNKNOWN';
+  const address = pair.baseToken.address;
+  const usd = (n) =>
+    n === null || n === undefined || Number.isNaN(n)
+      ? 'Unknown'
+      : `$${Math.round(n).toLocaleString('en-US')}`;
+
+  const smartLine = !smartMoney?.configured
+    ? '⚪ Watchlist not configured'
+    : smartMoney.detected
+      ? `✅ ${smartMoney.count} tracked wallet(s)${smartMoney.earlyBuyers ? ` — ${smartMoney.earlyBuyers} bought early` : ''}`
+      : '⚪ None detected';
+
+  const devLine =
+    deployer?.status === 'GOOD DEV ✅'
+      ? `✅ Proven (${deployer.successfulLaunches} past $100k+ launches)`
+      : deployer?.status === 'SERIAL RUGGER 🔴'
+        ? '🔴 SERIAL RUGGER'
+        : '⚪ Unknown / new deployer';
+
+  const ratio =
+    demand.m5.sells > 0 ? (demand.m5.buys / demand.m5.sells).toFixed(1) : '∞';
+
+  return [
+    smartMoney?.detected
+      ? '🚀 <b>HIGH PROBABILITY SIGNAL</b> 🚀'
+      : '🚀 <b>BUY SIGNAL</b> 🚀',
+    `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
+    `<i>Confidence ${verdictInfo.score}/100</i>`,
+    ...renderWhales(smartMoney),
+    '',
+    '🔒 <b>SAFETY &amp; DENSITY AUDIT:</b>',
+    `• Holders: ${security?.totalHolders ?? '?'} Wallets (${verdictInfo.holderGate?.passed ? `Passed ${verdictInfo.holderGate.floor}+ Floor ✅` : 'Floor NOT passed ❌'})`,
+    `• Top 10 Concentration: ${security?.top10Pct === null || security?.top10Pct === undefined ? '?' : `${security.top10Pct.toFixed(1)}%`} (Passed &lt;25% Cap ✅)`,
+    `• Security Status: ${verdictInfo.securityStatus === 'PASSED' ? 'PASSED ALL AUDITS ✅' : esc(verdictInfo.securityStatus ?? '?')}`,
+    `• Deployer: ${esc(devLine)}`,
+    '',
+    '📊 <b>MARKET:</b>',
+    `• Market Cap: ${usd(demand.marketCap)} | Liquidity: ${usd(demand.liquidityUsd)} (${demand.liqToMcapPct.toFixed(0)}%)`,
+    `• 5m Buys/Sells: ${demand.m5.buys} / ${demand.m5.sells} (${ratio}x)`,
+    `• Smart Money: ${esc(smartLine)}`,
+    '',
+    `<code>${esc(address)}</code>`,
+    '',
+    `📲 <a href="${esc(tradeUrl(address, tradeLink, pair.chainId))}">[ Open in FOMO App ]</a>`,
+    `📈 <a href="https://dexscreener.com/${esc(pair.chainId)}/${esc(address)}">DexScreener</a>`,
+    '',
+    '<i>Automated on-chain analysis, not financial advice.</i>',
+  ].join('\n');
+}
+
+/* ------------------------------------------------------------------ *
+ * Scan digest — the terminal output, delivered
+ * ------------------------------------------------------------------ */
+
+const TELEGRAM_MAX_CHARS = 4096;
+
+const VERDICT_ORDER = ['BUY SIGNAL', 'CRASH WARNING', 'SCAM/AVOID', 'WATCH'];
+const VERDICT_ICON = {
+  'BUY SIGNAL': '🚀',
+  'CRASH WARNING': '🔴',
+  'SCAM/AVOID': '☠️',
+  WATCH: '👀',
+};
+
+const short = (n) => {
+  if (n === null || n === undefined || Number.isNaN(n)) return '?';
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `$${Math.round(n / 1e3)}k`;
+  return `$${Math.round(n)}`;
+};
+
+/**
+ * Every audited token, grouped by verdict — the console view, for when the
+ * scanner runs somewhere you cannot watch it (Render, Task Scheduler).
+ */
+export function buildDigest({ rows, scanned, noteCount, startedAt, tradeLink }) {
+  const when = new Date(startedAt).toISOString().replace('T', ' ').slice(0, 16);
+  const grouped = new Map(VERDICT_ORDER.map((v) => [v, []]));
+  for (const r of rows) {
+    if (!grouped.has(r.verdict)) grouped.set(r.verdict, []);
+    grouped.get(r.verdict).push(r);
+  }
+
+  const lines = [
+    `📊 <b>Aegis Scan</b> — ${when} UTC`,
+    `<i>${scanned} audited · ${noteCount} note(s) written</i>`,
+  ];
+
+  for (const verdict of VERDICT_ORDER) {
+    const items = (grouped.get(verdict) ?? []).sort((a, b) => b.score - a.score);
+    if (!items.length) continue;
+
+    lines.push('', `${VERDICT_ICON[verdict]} <b>${esc(verdict)}</b> (${items.length})`);
+
+    for (const r of items) {
+      const head = `  • <b>$${esc(r.symbol)}</b> <code>${r.score}/100</code>`;
+      if (verdict === 'SCAM/AVOID') {
+        lines.push(`${head} — ${esc(r.failReason ?? 'audit failed')}`);
+      } else {
+        const extras = [
+          `MC ${short(r.marketCap)}`,
+          `5m ${r.buys}/${r.sells}`,
+          `liq ${r.liqPct.toFixed(0)}%`,
+        ];
+        if (r.smartMoney) extras.push(`🐋x${r.smartMoney}`);
+        if (r.devStatus === 'GOOD DEV ✅') extras.push('dev✅');
+        lines.push(`${head} — ${esc(extras.join(' · '))}`);
+        if (verdict === 'BUY SIGNAL') {
+          lines.push(`     📲 <a href="${esc(tradeUrl(r.address, tradeLink, r.chain))}">Trade</a> · <code>${esc(r.address)}</code>`);
+        }
+      }
+    }
+  }
+
+  if (!rows.length) lines.push('', '<i>No tokens passed the pre-audit filters this pass.</i>');
+
+  let text = lines.join('\n');
+  if (text.length > TELEGRAM_MAX_CHARS) {
+    text = `${text.slice(0, TELEGRAM_MAX_CHARS - 40).trimEnd()}\n<i>… truncated</i>`;
+  }
+  return text;
+}
+
+/* ------------------------------------------------------------------ *
+ * Send
+ * ------------------------------------------------------------------ */
+
+export async function sendTelegram({ botToken, chatId, text }) {
+  if (!botToken || !chatId) {
+    return { ok: false, error: 'TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set' };
+  }
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) {
+      return { ok: false, error: body.description ?? `HTTP ${res.status}` };
+    }
+    return { ok: true, messageId: body.result?.message_id };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Gate + send. Returns a result describing what happened so the scanner can log
+ * it honestly rather than implying an alert went out when it did not.
+ */
+export async function maybeAlert({ result, pair, credentials, config, alertLog, now }) {
+  const { verdictInfo, demand, smartMoney, deployer, security, audit } = result;
+
+  if (!config.telegram.enabled) return { status: 'disabled' };
+
+  // Hard safety block, checked independently of the verdict rather than relying
+  // on it. The scoring path already forces these to SCAM/AVOID, but this is the
+  // rule that must not fail: a whale buying their own scam must never produce a
+  // notification. Two independent checks, so a future scoring change cannot
+  // silently reopen the hole.
+  if (verdictInfo.safetyGateFailed) {
+    return { status: 'blocked-safety', reason: verdictInfo.safetyGateReason };
+  }
+  if (audit.status !== 'PASSED') return { status: 'blocked-audit-not-passed' };
+
+  if (verdictInfo.verdict !== 'BUY SIGNAL') return { status: 'not-a-signal' };
+  if (verdictInfo.score < config.telegram.minScore) return { status: 'below-score-floor' };
+
+  const key = `${pair.chainId}:${pair.baseToken.address}`;
+  if (!shouldAlert(alertLog, key, config.telegram.cooldownHours, now)) {
+    return { status: 'cooldown' };
+  }
+
+  if (!credentials.botToken || !credentials.chatId) {
+    return { status: 'no-credentials' };
+  }
+
+  const text = buildMessage({
+    pair,
+    demand,
+    verdictInfo: { ...verdictInfo, securityStatus: audit.status },
+    smartMoney,
+    deployer,
+    security,
+    tradeLink: { template: config.tradeLinkTemplate, label: config.tradeLinkLabel },
+  });
+
+  const sent = await sendTelegram({ ...credentials, text });
+  if (sent.ok) {
+    alertLog[key] = { sentAt: now, symbol: pair.baseToken.symbol, score: verdictInfo.score };
+    return { status: 'sent' };
+  }
+  return { status: 'failed', error: sent.error };
+}

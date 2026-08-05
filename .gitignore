@@ -1,0 +1,48 @@
+# ── Secrets — never commit ──────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa
+id_rsa.*
+id_ecdsa
+id_ed25519
+*_rsa
+*.ppk
+credentials.json
+service-account*.json
+.npmrc
+.netrc
+
+# ── Runtime state ───────────────────────────────────────────────────────
+# Snapshots (holder velocity), deployer cache, and the alert dedupe log.
+# Machine-local and regenerable — keep it out of git.
+.state/
+**/.state/
+
+# ── Generated output ────────────────────────────────────────────────────
+# Aegis writes a new note every scan, so this folder grows continuously and
+# is fully regenerable. Tracking it would add thousands of churning files to
+# every push and gives the Render deploy nothing.
+# Delete the line below if you want your notes backed up in git.
+Memecoin/Crypto finder/Signals/
+
+# Obsidian per-machine UI state (keep the vault config, drop the workspace).
+# Needs the ** prefix: a pattern containing a slash is anchored to the repo
+# root, so a bare `.obsidian/workspace.json` would miss the nested vault.
+**/.obsidian/workspace.json
+**/.obsidian/workspace-mobile.json
+
+# ── Node ────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# ── OS ──────────────────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+.DS_Store
