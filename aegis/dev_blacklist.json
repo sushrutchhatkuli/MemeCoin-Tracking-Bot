@@ -178,6 +178,12 @@
       "reason": "Post-mortem: $SPESH fell -74.4% within 1.05h",
       "added": "2026-08-05",
       "source": "post-mortem"
+    },
+    {
+      "address": "HBYzRFKRHGdd6N7UkY4QkGU5Vmt26qZu9pTV8mopump",
+      "reason": "Post-mortem: $longcat fell -86.8% within 1.05h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
     }
   ],
   "mints": [

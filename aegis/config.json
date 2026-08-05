@@ -137,11 +137,16 @@
       "and Dune 401 without a paid key, Cielo's public feed is empty, Solscan",
       "refuses connections. So the list is EARNED from Aegis's own observations",
       "(buyer replay + post-mortem grading) rather than fetched. Seed it instantly",
-      "with:  node auto_top_whales.mjs --import <leaderboard.csv>"
+      "with:  node auto_top_whales.mjs --import <leaderboard.csv>",
+      "",
+      "syncIntervalHours = 2: re-ranks win rates and rewrites smart_wallets.json",
+      "every 2h during the normal 12-minute scan. The ledger itself updates on",
+      "EVERY scan (buys recorded, outcomes graded) — this interval only controls",
+      "how often the ranking is recomputed and the watchlist file rewritten."
     ],
     "enabled": true,
     "observe": true,
-    "syncEveryHours": 24,
+    "syncIntervalHours": 2,
     "minWinRatePct": 75,
     "minNetProfitUsd": 50000,
     "minLifetimeTrades": 100,

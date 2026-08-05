@@ -35,7 +35,11 @@ async function maybeSyncWhales() {
   const config = JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'));
   if (config.eliteWhales?.enabled === false) return;
 
-  const everyMs = (config.eliteWhales?.syncEveryHours ?? 24) * 3600 * 1000;
+  // `syncEveryHours` is the previous key name, still honoured so an older
+  // config keeps working after an update.
+  const intervalHours =
+    config.eliteWhales?.syncIntervalHours ?? config.eliteWhales?.syncEveryHours ?? 2;
+  const everyMs = intervalHours * 3600 * 1000;
   let last = 0;
   try {
     last = JSON.parse(await readFile(WHALE_SYNC_MARKER, 'utf8')).lastSyncAt ?? 0;
@@ -45,7 +49,7 @@ async function maybeSyncWhales() {
 
   if (Date.now() - last < everyMs) return;
 
-  console.log(`\n🐋 Elite whale sync (every ${config.eliteWhales?.syncEveryHours ?? 24}h)…`);
+  console.log(`\n🐋 Elite whale sync (every ${intervalHours}h)…`);
   await syncTopWhales({});
   const { writeFile: wf, mkdir: mk } = await import('node:fs/promises');
   await mk(dirname(WHALE_SYNC_MARKER), { recursive: true });
