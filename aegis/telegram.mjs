@@ -150,7 +150,7 @@ function renderWhales(smartMoney) {
   return lines;
 }
 
-export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit }) {
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory }) {
   const symbol = pair.baseToken?.symbol ?? 'UNKNOWN';
   const address = pair.baseToken.address;
   const usd = (n) =>
@@ -175,11 +175,18 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     demand.m5.sells > 0 ? (demand.m5.buys / demand.m5.sells).toFixed(1) : '∞';
 
   return [
-    smartMoney?.detected
-      ? '🚀 <b>HIGH PROBABILITY SIGNAL</b> 🚀'
-      : '🚀 <b>BUY SIGNAL</b> 🚀',
+    // Signal type leads, because it determines how the trade should be held —
+    // that decision matters more than the score.
+    signalCategory?.category === 'LONG-TERM GEM'
+      ? '💎 <b>LONG-TERM INVESTMENT GEM SIGNAL</b> 💎'
+      : signalCategory?.category === 'FAST SCALP'
+        ? '⚡ <b>FAST MOMENTUM SCALP SIGNAL</b> ⚡'
+        : smartMoney?.detected
+          ? '🚀 <b>HIGH PROBABILITY SIGNAL</b> 🚀'
+          : '🚀 <b>BUY SIGNAL</b> 🚀',
     `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
     `<i>Confidence ${verdictInfo.score}/100</i>`,
+    ...(signalCategory?.advice ? ['', `<b>${esc(signalCategory.advice)}</b>`] : []),
     ...renderWhales(smartMoney),
     '',
     '🔒 <b>SAFETY &amp; DENSITY AUDIT:</b>',
@@ -258,6 +265,8 @@ export function buildDigest({ rows, scanned, noteCount, startedAt, tradeLink }) 
           `liq ${r.liqPct.toFixed(0)}%`,
         ];
         if (r.smartMoney) extras.push(`🐋x${r.smartMoney}`);
+        if (r.category === 'LONG-TERM GEM') extras.push('💎GEM');
+        else if (r.category === 'FAST SCALP') extras.push('⚡SCALP');
         if (r.devStatus === 'GOOD DEV ✅') extras.push('dev✅');
         lines.push(`${head} — ${esc(extras.join(' · '))}`);
 
@@ -415,6 +424,7 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     security,
     tradeLink: { template: config.tradeLinkTemplate, label: config.tradeLinkLabel },
     reaudit,
+    signalCategory: result.signalCategory,
   });
 
   const sent = await sendTelegram({ ...credentials, text });

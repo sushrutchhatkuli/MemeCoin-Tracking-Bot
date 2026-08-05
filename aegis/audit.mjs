@@ -229,7 +229,102 @@ export function analyzeDemand(pair, security) {
       h6: pct(pair?.priceChange?.h6) ?? 0,
       h24: pct(pair?.priceChange?.h24) ?? 0,
     },
-    ageHours: pair?.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / 3.6e6 : null,
+    ...resolveAge(pair, security),
+  };
+}
+
+/**
+ * Age, with an explicit provenance flag.
+ *
+ * `pairCreatedAt` is authoritative but absent on most bonding-curve pairs, so
+ * the indexer's first-sighting timestamp is used as a floor when it is missing.
+ * That floor is a LOWER BOUND — the token existed at least that long — which is
+ * safe for "is this young?" but must never be used to prove "this is ≥24h old".
+ * `ageIsLowerBound` records which one it is so callers can require certainty.
+ */
+function resolveAge(pair, security) {
+  if (pair?.pairCreatedAt) {
+    return {
+      ageHours: (Date.now() - pair.pairCreatedAt) / 3.6e6,
+      ageSource: 'pairCreatedAt',
+      ageIsLowerBound: false,
+    };
+  }
+  if (security?.detectedAt) {
+    return {
+      ageHours: (Date.now() - security.detectedAt) / 3.6e6,
+      ageSource: 'indexer-first-seen',
+      ageIsLowerBound: true,
+    };
+  }
+  return { ageHours: null, ageSource: null, ageIsLowerBound: true };
+}
+
+/* ------------------------------------------------------------------ *
+ * Dual-mode signal classification
+ * ------------------------------------------------------------------ */
+
+export const SIGNAL_CATEGORY = {
+  GEM: 'LONG-TERM GEM',
+  SCALP: 'FAST SCALP',
+  NONE: 'UNCLASSIFIED',
+};
+
+/**
+ * Sort a qualifying token into a holding style.
+ *
+ * The two tiers are deliberately asymmetric about missing data. GEM advice says
+ * hold for days or weeks, so every one of its conditions must be positively
+ * proven — an unknown age or unknown holder count disqualifies. SCALP advice
+ * says take profit quickly, which stays sound even if the token turns out older
+ * than assumed, so it tolerates an unproven age.
+ */
+export function classifySignal({ demand, security, config }) {
+  const g = config.signalCategories?.gem ?? {};
+  const s = config.signalCategories?.scalp ?? {};
+  const holders = security?.ok ? security.totalHolders : null;
+
+  const mcap = demand.marketCap ?? 0;
+  const liq = demand.liquidityUsd ?? 0;
+  const age = demand.ageHours;
+
+  const gemChecks = {
+    marketCap: mcap >= (g.minMarketCapUsd ?? 1_000_000),
+    liquidity: liq >= (g.minLiquidityUsd ?? 100_000),
+    // Requires a confirmed age: a lower-bound estimate cannot establish maturity.
+    age: age !== null && age >= (g.minAgeHours ?? 24) && demand.ageIsLowerBound === false,
+    holders: holders !== null && holders !== undefined && holders >= (g.minHolders ?? 1000),
+  };
+  if (Object.values(gemChecks).every(Boolean)) {
+    return {
+      category: SIGNAL_CATEGORY.GEM,
+      label: '💎 LONG-TERM INVESTMENT GEM',
+      advice: g.advice ?? '💎 Long-term accumulation setup — suitable for holding over days/weeks.',
+      scoreBoost: g.scoreBoost ?? 10,
+      checks: gemChecks,
+    };
+  }
+
+  const inScalpBand =
+    mcap >= (s.minMarketCapUsd ?? 15_000) && mcap <= (s.maxMarketCapUsd ?? 300_000);
+  const youngEnough = age === null || age < (s.maxAgeHours ?? 24);
+  if (inScalpBand && youngEnough) {
+    return {
+      category: SIGNAL_CATEGORY.SCALP,
+      label: '⚡ FAST MOMENTUM SCALP',
+      advice: s.advice ?? '⚡ Fast momentum trade — take initial profit at +50% to +100%!',
+      scoreBoost: 0,
+      checks: { marketCap: inScalpBand, age: youngEnough },
+    };
+  }
+
+  return {
+    category: SIGNAL_CATEGORY.NONE,
+    label: 'UNCLASSIFIED',
+    advice: null,
+    scoreBoost: 0,
+    checks: gemChecks,
+    reason: `MC $${Math.round(mcap).toLocaleString('en-US')} / age ${age === null ? 'unknown' : `${age.toFixed(1)}h`} fits neither tier`,
   };
 }
 
@@ -343,6 +438,7 @@ export function scoreToken({
   smartMoneyConfig,
   social,
   blacklistHit,
+  signalCategory,
 }) {
   // Demand — 30 pts
   const demandScore =
@@ -393,8 +489,19 @@ export function scoreToken({
   // can and cannot tell you). Forfeited on a safety failure for the same reason.
   const socialBonus = safetyGateFailed ? 0 : (social?.scoreBonus ?? 0);
 
+  // Category boost — rewards the deep-liquidity, multi-day tier. Forfeited on a
+  // safety failure like every other bonus.
+  const categoryBonus = safetyGateFailed ? 0 : (signalCategory?.scoreBoost ?? 0);
+
   let score = Math.round(
-    demandScore + depthScore + distScore + momentumScore + tractionScore + smartBonus + socialBonus
+    demandScore +
+      depthScore +
+      distScore +
+      momentumScore +
+      tractionScore +
+      smartBonus +
+      socialBonus +
+      categoryBonus
   );
   score -= catalysts.bearish.length * 4;
   score = clamp(score, 0, 100);
@@ -504,6 +611,7 @@ export function scoreToken({
       traction: Math.round(tractionScore),
       smartMoney: smartBonus,
       social: socialBonus,
+      category: categoryBonus,
       bearishPenalty: catalysts.bearish.length * 4,
     },
   };

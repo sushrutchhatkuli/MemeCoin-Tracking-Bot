@@ -130,6 +130,30 @@
       "reason": "Post-mortem: $HODL fell -95.7% within 1.07h",
       "added": "2026-08-05",
       "source": "post-mortem"
+    },
+    {
+      "address": "8SSGsj3DjkXv496NWwV8nAqkRHFkSg3xpPMEhynHwBVB",
+      "reason": "Post-mortem: $PlutoCoin fell -93.7% within 2.05h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "FFPmqVLMj9TNbQXcrXyevcM3pxGaK4ApaAT4oLq2b3S7",
+      "reason": "Post-mortem: $Kody fell -93.6% within 1.05h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "FM6Abu7DuKRroDQQeMVJuj8LRgawRV2x62pAjjUHEFz3",
+      "reason": "Post-mortem: $Nole fell -66.6% within 1.07h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "9tgin6FQGF8PB5xoF6RXut8BHXR2UZUYvuj9AQXau8qX",
+      "reason": "Post-mortem: $Stacky fell -75.9% within 1.07h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
     }
   ],
   "mints": [

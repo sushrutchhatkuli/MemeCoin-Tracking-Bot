@@ -33,6 +33,36 @@
     "bonusOneSocial": 5
   },
 
+  "_signalCategoryNote": [
+    "Two holding styles. GEM requires every condition positively proven —",
+    "an unknown age or holder count disqualifies it — because its advice is to",
+    "hold for days/weeks. SCALP tolerates an unproven age since 'take profit",
+    "quickly' stays sound either way.",
+    "",
+    "Measured from 453 post-mortem outcomes as of 2026-08-05:",
+    "  $15k-300k (the SCALP band) failed 40% of the time (154/389),",
+    "  median time to failure 1.86h. $300k-1M failed 3% (1/29).",
+    "  Nothing has ever been scanned at >=$1M, so GEM will not fire until",
+    "  discovery surfaces larger tokens. Raise filters.maxMarketCapUsd and",
+    "  widen discovery if you want that tier to populate."
+  ],
+  "signalCategories": {
+    "gem": {
+      "minMarketCapUsd": 1000000,
+      "minLiquidityUsd": 100000,
+      "minAgeHours": 24,
+      "minHolders": 1000,
+      "scoreBoost": 10,
+      "advice": "💎 Long-term accumulation setup — suitable for holding over days/weeks."
+    },
+    "scalp": {
+      "minMarketCapUsd": 15000,
+      "maxMarketCapUsd": 300000,
+      "maxAgeHours": 24,
+      "advice": "⚡ Fast momentum trade — take initial profit at +50% to +100%!"
+    }
+  },
+
   "postMortem": {
     "enabled": true,
     "minAgeHours": 1,

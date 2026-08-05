@@ -372,6 +372,10 @@ export async function fetchSolanaSecurity(mint, { rpcUrl = null } = {}) {
       description: r.description,
     })),
     rugcheckScore: d.score_normalised ?? null,
+    // Fallback age source. DexScreener omits pairCreatedAt for most
+    // bonding-curve pairs, which would otherwise leave age unknown on exactly
+    // the newest tokens — where age matters most.
+    detectedAt: d.detectedAt ? Date.parse(d.detectedAt) : null,
     launchpad: d.launchpad?.name ?? d.deployPlatform ?? null,
     creator: d.creator ?? null,
     creatorBalance: d.creatorBalance ?? null,

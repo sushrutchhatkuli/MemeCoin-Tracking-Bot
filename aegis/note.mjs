@@ -85,6 +85,7 @@ function tagFor(verdict, auditStatus) {
 /** Extra tags so Dataview can filter on the two new modules directly. */
 function extraTags(smartMoney, deployer, verdictInfo, social) {
   const tags = [];
+  if (verdictInfo.categoryTag) tags.push(verdictInfo.categoryTag);
   if (verdictInfo.serialRugger) tags.push('dev/serial-rugger');
   else if (deployer?.status === 'GOOD DEV ✅') tags.push('dev/good');
   else tags.push('dev/unknown');
@@ -121,6 +122,7 @@ export function renderNote({
   deployer,
   social,
   blacklistHit,
+  signalCategory,
   tradeLink,
   now,
 }) {
@@ -161,6 +163,10 @@ export function renderNote({
     `impact_type: ${yamlStr(verdictInfo.impact)}`,
     `security_status: ${yamlStr(SECURITY_LABEL[audit.status])}`,
     `top_10_holder_pct: ${yamlStr(security?.ok ? pctStr(security.top10Pct) : 'Unknown')}`,
+    `signal_category: ${yamlStr(signalCategory?.category ?? 'UNCLASSIFIED')}`,
+    `trade_advice: ${yamlStr(signalCategory?.advice ?? '')}`,
+    `age_hours: ${demand.ageHours === null ? 'null' : demand.ageHours.toFixed(1)}`,
+    `age_source: ${yamlStr(demand.ageSource ?? 'unknown')}`,
     `holder_density_status: ${yamlStr(verdictInfo.holderGate?.status ?? 'Unknown')}`,
     `holder_floor_passed: ${verdictInfo.holderGate?.passed === null || verdictInfo.holderGate?.passed === undefined ? 'null' : verdictInfo.holderGate.passed}`,
     `social_presence: ${yamlStr(social?.status ?? 'Unknown')}`,
@@ -187,7 +193,20 @@ export function renderNote({
     '  - token/analysis',
     `  - ${tagFor(verdictInfo.verdict, audit.status)}`,
     `  - chain/${chainId}`,
-    ...extraTags(smartMoney, deployer, verdictInfo, social).map((t) => `  - ${t}`),
+    ...extraTags(
+      smartMoney,
+      deployer,
+      {
+        ...verdictInfo,
+        categoryTag:
+          signalCategory?.category === 'LONG-TERM GEM'
+            ? 'signal/long-term-gem'
+            : signalCategory?.category === 'FAST SCALP'
+              ? 'signal/fast-scalp'
+              : null,
+      },
+      social
+    ).map((t) => `  - ${t}`),
     '---',
   ].join('\n');
 
@@ -228,6 +247,7 @@ export function renderNote({
 
 > [!${verdictInfo.verdict === 'SCAM/AVOID' ? 'danger' : audit.status === 'UNVERIFIED' || verdictInfo.verdict === 'CRASH WARNING' || verdictInfo.verdict === 'UNVERIFIED / LOW HOLDERS' ? 'warning' : 'info'}] Verdict: ${verdictInfo.blacklisted ? '⛔ BLACKLISTED DEPLOYER' : verdictInfo.serialRugger ? '🔴 AVOID / SERIAL RUGGER' : verdictInfo.verdict}
 > Confidence \`${verdictInfo.score}/100\` · Security \`${audit.status}\` · Deployer \`${deployer?.status ?? 'UNKNOWN / NEW'}\` · Direction ${directionLine}
+${signalCategory && signalCategory.category !== 'UNCLASSIFIED' ? `\n> [!tip] ${signalCategory.label}\n> ${signalCategory.advice}` : ''}
 
 ## 📊 Summary & Key Metrics
 - **Chain**: \`${chainLabel}\` (\`${pair.dexId ?? 'unknown dex'}\`)
@@ -285,6 +305,7 @@ ${riskEvents}
 | Traction (holders, socials) | ${b.traction} | 15 |
 | Smart money bonus | +${b.smartMoney} | 15 |
 | Social presence bonus | +${b.social} | 10 |
+| Category bonus (long-term gem) | +${b.category} | 10 |
 | Bearish catalyst penalty | -${b.bearishPenalty} | — |
 | **Total** | **${verdictInfo.score}** | **100** |
 

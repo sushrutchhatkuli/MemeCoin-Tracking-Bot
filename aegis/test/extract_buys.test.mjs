@@ -18,7 +18,12 @@ import {
   validateWatchlistEntry,
   formatSmartMoneyLine,
 } from '../smart_money.mjs';
-import { scoreToken, concentrationCapFor, runSecurityAudit } from '../audit.mjs';
+import {
+  scoreToken,
+  concentrationCapFor,
+  runSecurityAudit,
+  classifySignal,
+} from '../audit.mjs';
 
 const MINT = 'MintAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const POOL = 'PoolBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
@@ -247,6 +252,94 @@ test('callout reports position instead of inventing a spend when unattributable'
   assert.match(line, /Holds 3\.14% of supply/);
   assert.doesNotMatch(line, /Bought/);
   assert.doesNotMatch(line, /MC/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Dual-mode signal classification
+ * ------------------------------------------------------------------ */
+
+const catConfig = {
+  signalCategories: {
+    gem: {
+      minMarketCapUsd: 1_000_000,
+      minLiquidityUsd: 100_000,
+      minAgeHours: 24,
+      minHolders: 1000,
+      scoreBoost: 10,
+      advice: 'gem advice',
+    },
+    scalp: { minMarketCapUsd: 15_000, maxMarketCapUsd: 300_000, maxAgeHours: 24, advice: 'scalp advice' },
+  },
+};
+
+const gemDemand = {
+  marketCap: 2_500_000,
+  liquidityUsd: 400_000,
+  ageHours: 72,
+  ageIsLowerBound: false,
+};
+
+test('classifies a mature deep-liquidity token as LONG-TERM GEM', () => {
+  const r = classifySignal({
+    demand: gemDemand,
+    security: { ok: true, totalHolders: 5000 },
+    config: catConfig,
+  });
+  assert.equal(r.category, 'LONG-TERM GEM');
+  assert.equal(r.scoreBoost, 10);
+  assert.equal(r.advice, 'gem advice');
+});
+
+test('GEM requires a CONFIRMED age, not a lower-bound estimate', () => {
+  // Age came from the indexer's first-sighting timestamp, which only proves the
+  // token is AT LEAST this old at the moment it was indexed. Advice to hold for
+  // weeks must not rest on an estimate.
+  const r = classifySignal({
+    demand: { ...gemDemand, ageIsLowerBound: true },
+    security: { ok: true, totalHolders: 5000 },
+    config: catConfig,
+  });
+  assert.notEqual(r.category, 'LONG-TERM GEM');
+});
+
+test('GEM is refused when holder count is unknown', () => {
+  const r = classifySignal({
+    demand: gemDemand,
+    security: { ok: true, totalHolders: null },
+    config: catConfig,
+  });
+  assert.notEqual(r.category, 'LONG-TERM GEM');
+});
+
+test('classifies a young mid-cap token as FAST SCALP', () => {
+  const r = classifySignal({
+    demand: { marketCap: 65_000, liquidityUsd: 20_000, ageHours: 3, ageIsLowerBound: false },
+    security: { ok: true, totalHolders: 800 },
+    config: catConfig,
+  });
+  assert.equal(r.category, 'FAST SCALP');
+  assert.equal(r.scoreBoost, 0, 'scalps get no score boost');
+});
+
+test('SCALP tolerates unknown age; the advice holds either way', () => {
+  const r = classifySignal({
+    demand: { marketCap: 65_000, liquidityUsd: 20_000, ageHours: null, ageIsLowerBound: true },
+    security: { ok: true, totalHolders: 800 },
+    config: catConfig,
+  });
+  assert.equal(r.category, 'FAST SCALP');
+});
+
+test('a token between the two bands is left unclassified', () => {
+  // $500k is above the scalp ceiling but below the gem floor — deliberately no
+  // advice rather than forcing it into the nearest tier.
+  const r = classifySignal({
+    demand: { marketCap: 500_000, liquidityUsd: 60_000, ageHours: 5, ageIsLowerBound: false },
+    security: { ok: true, totalHolders: 2000 },
+    config: catConfig,
+  });
+  assert.equal(r.category, 'UNCLASSIFIED');
+  assert.equal(r.advice, null);
 });
 
 /* ------------------------------------------------------------------ *

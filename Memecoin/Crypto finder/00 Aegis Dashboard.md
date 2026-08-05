@@ -12,6 +12,57 @@ tags:
 
 ---
 
+## 💎 Long-Term Investment Watchlist
+
+Market cap ≥ $1M, liquidity ≥ $100k, age ≥ 24h (confirmed), holders ≥ 1,000.
+
+```dataview
+TABLE WITHOUT ID
+  file.link AS "Token",
+  confidence_score AS "Score",
+  market_cap AS "MCap",
+  liquidity AS "Liq",
+  holder_count AS "Holders",
+  age_hours AS "Age (h)",
+  signal_verdict AS "Verdict"
+FROM "Signals"
+WHERE signal_category = "LONG-TERM GEM"
+SORT confidence_score DESC
+```
+
+> [!note] Empty is expected for now
+> Across 453 post-mortem outcomes, **no token has ever been scanned at ≥$1M
+> market cap** — discovery runs on DexScreener's new/boosted feeds, which skew
+> small. This tier will stay empty until discovery is widened.
+
+---
+
+## ⚡ Fast Momentum Scalps
+
+Market cap $15k–$300k, under 24 hours old.
+
+```dataview
+TABLE WITHOUT ID
+  file.link AS "Token",
+  confidence_score AS "Score",
+  market_cap AS "MCap",
+  liq_to_mcap_pct AS "Depth",
+  buys_sells_5m AS "5m B/S",
+  age_hours AS "Age (h)",
+  holder_count AS "Holders"
+FROM "Signals"
+WHERE signal_category = "FAST SCALP" AND signal_verdict != "SCAM/AVOID"
+SORT confidence_score DESC
+LIMIT 30
+```
+
+> [!warning] Measured failure rate in this band: 40%
+> Of 389 scanned tokens in the $15k–$300k range, **154 fell to effectively zero**,
+> median 1.86 hours from scan. The `$300k–$1M` band failed 3% (1/29) over the
+> same period. Position sizing matters more than signal quality here.
+
+---
+
 ## 🚀 Active Buy Signals
 
 ```dataview

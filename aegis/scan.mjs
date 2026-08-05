@@ -26,6 +26,7 @@ import {
   analyzeDemand,
   detectCatalysts,
   scoreToken,
+  classifySignal,
 } from './audit.mjs';
 import { renderNote, noteFilename } from './note.mjs';
 import { loadState, saveState, computeVelocity, recordSnapshot } from './state.mjs';
@@ -245,6 +246,8 @@ async function analyzeToken({ pair, config, state, watchlist, deployerCache, bla
     deployer: security?.ok ? security.creator : null,
   });
 
+  const signalCategory = classifySignal({ demand, security, config });
+
   const catalysts = detectCatalysts(pair, security, demand, velocity, config.thresholds, {
     smartMoney,
     deployer,
@@ -263,6 +266,7 @@ async function analyzeToken({ pair, config, state, watchlist, deployerCache, bla
     smartMoneyConfig: config.smartMoney,
     social,
     blacklistHit,
+    signalCategory,
   });
 
   return {
@@ -276,6 +280,7 @@ async function analyzeToken({ pair, config, state, watchlist, deployerCache, bla
     deployer,
     social,
     blacklistHit,
+    signalCategory,
   };
 }
 
@@ -292,6 +297,7 @@ async function writeNote({ pair, result, notesDir, config, now }) {
     deployer: result.deployer,
     social: result.social,
     blacklistHit: result.blacklistHit,
+    signalCategory: result.signalCategory,
     tradeLink: { template: config.tradeLinkTemplate, label: config.tradeLinkLabel },
     now,
   });
@@ -439,12 +445,18 @@ export async function runScan(args = {}) {
           ? ' dev:GOOD✅'
           : '';
     const smTag = smartMoney?.detected ? ` 🐋x${smartMoney.count}` : '';
+    const catTag =
+      result.signalCategory?.category === 'LONG-TERM GEM'
+        ? ' 💎GEM'
+        : result.signalCategory?.category === 'FAST SCALP'
+          ? ' ⚡SCALP'
+          : '';
     const holders = verdictInfo.holderGate?.holders;
     console.log(
       `${icon} $${symbol.padEnd(12)} ${String(verdictInfo.score).padStart(3)}/100  ${verdictInfo.verdict.padEnd(24)} ` +
         `sec:${audit.status.padEnd(11)} hodl:${String(holders ?? '?').padStart(5)} ` +
         `5m ${demand.m5.buys}/${demand.m5.sells}  liq ${demand.liqToMcapPct.toFixed(0)}%` +
-        `${devTag}${smTag}${socialBadge(social)}`
+        `${devTag}${smTag}${catTag}${socialBadge(social)}`
     );
 
     digestRows.push({
@@ -458,6 +470,9 @@ export async function runScan(args = {}) {
       sells: demand.m5.sells,
       liqPct: demand.liqToMcapPct,
       smartMoney: smartMoney?.detected ? smartMoney.count : 0,
+      category: result.signalCategory?.category ?? 'UNCLASSIFIED',
+      categoryLabel: result.signalCategory?.label ?? null,
+      advice: result.signalCategory?.advice ?? null,
       // Whale detail is attached only when the token passed every safety gate;
       // a blocked token must never carry a smart-money endorsement.
       smartMoneyDetail:
