@@ -43,7 +43,7 @@ async function getJson(url, { timeoutMs = 20000, retries = 2 } = {}) {
  * plus boosted tokens (paid promotion, which is where most launch traffic goes).
  * Returns de-duplicated { chainId, tokenAddress } records.
  */
-export async function discoverCandidates(chains) {
+export async function discoverCandidates(chains, discovery = {}) {
   const endpoints = [
     'https://api.dexscreener.com/token-profiles/latest/v1',
     'https://api.dexscreener.com/token-boosts/latest/v1',
@@ -51,21 +51,56 @@ export async function discoverCandidates(chains) {
   ];
 
   const seen = new Map();
+  const add = (chainId, tokenAddress, extra = {}) => {
+    if (!chainId || !tokenAddress) return false;
+    if (chains.length && !chains.includes(chainId)) return false;
+    const key = `${chainId}:${tokenAddress.toLowerCase()}`;
+    if (seen.has(key)) return false;
+    seen.set(key, { chainId, tokenAddress, ...extra });
+    return true;
+  };
+
   for (const url of endpoints) {
     const res = await getJson(url);
     if (!res.ok || !Array.isArray(res.data)) continue;
     for (const entry of res.data) {
-      const chainId = entry?.chainId;
-      const tokenAddress = entry?.tokenAddress;
-      if (!chainId || !tokenAddress) continue;
-      if (chains.length && !chains.includes(chainId)) continue;
-      const key = `${chainId}:${tokenAddress.toLowerCase()}`;
-      if (seen.has(key)) continue;
-      seen.set(key, { chainId, tokenAddress, socialHints: entry?.links ?? [] });
+      add(entry?.chainId, entry?.tokenAddress, {
+        socialHints: entry?.links ?? [],
+        via: 'boost/profile',
+      });
     }
     await sleep(250);
   }
-  return [...seen.values()];
+
+  const fromFeeds = seen.size;
+
+  // Second source, deliberately different in character. The boost and profile
+  // feeds are launch-oriented and skew tiny — measured across a full sample they
+  // returned nothing above $1M. The search endpoint surfaces established pairs,
+  // so the union spans both ends instead of only the newest launches.
+  // (DexScreener publishes no trending endpoint; every variant 403s or 404s.)
+  const queries = discovery.searchQueries ?? [];
+  const floor = discovery.searchMinMarketCapUsd ?? 300000;
+
+  for (const q of queries) {
+    const res = await getJson(
+      `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`
+    );
+    if (!res.ok || !Array.isArray(res.data?.pairs)) continue;
+    for (const pair of res.data.pairs) {
+      const mcap = pair?.marketCap ?? pair?.fdv ?? 0;
+      // Only take the larger pairs from search — the small ones are already
+      // covered by the launch feeds, and re-adding them wastes audit budget.
+      if (mcap < floor) continue;
+      add(pair?.chainId, pair?.baseToken?.address, { via: `search:${q}` });
+    }
+    await sleep(300);
+  }
+
+  return {
+    candidates: [...seen.values()],
+    stats: { fromFeeds, fromSearch: seen.size - fromFeeds, total: seen.size },
+  };
 }
 
 /* ------------------------------------------------------------------ *

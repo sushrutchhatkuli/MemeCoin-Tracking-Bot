@@ -47,20 +47,44 @@
     "  widen discovery if you want that tier to populate."
   ],
   "signalCategories": {
+    "_precedence": [
+      "GEM is evaluated FIRST, so the two bands legitimately overlap:",
+      "a $300k-$1M token that is >=12h old with >=$50k liquidity becomes a GEM,",
+      "while a younger or thinner one in the same band becomes a SCALP.",
+      "The band is captured either way; maturity decides the holding style.",
+      "",
+      "'category' is the stable machine value used by Dataview queries.",
+      "'label' is the display string shown in alerts and notes — change that",
+      "freely without breaking the dashboard."
+    ],
     "gem": {
-      "minMarketCapUsd": 1000000,
-      "minLiquidityUsd": 100000,
-      "minAgeHours": 24,
-      "minHolders": 1000,
+      "minMarketCapUsd": 300000,
+      "minLiquidityUsd": 50000,
+      "minAgeHours": 12,
+      "minHolders": 0,
       "scoreBoost": 10,
+      "label": "💎 STABLISHED GEM / ACCUMULATION",
       "advice": "💎 Long-term accumulation setup — suitable for holding over days/weeks."
     },
     "scalp": {
       "minMarketCapUsd": 15000,
-      "maxMarketCapUsd": 300000,
+      "maxMarketCapUsd": 1000000,
       "maxAgeHours": 24,
+      "label": "⚡ FAST MOMENTUM SCALP",
       "advice": "⚡ Fast momentum trade — take initial profit at +50% to +100%!"
     }
+  },
+
+  "discovery": {
+    "_note": [
+      "DexScreener has no trending endpoint (403/404 on every variant). The",
+      "boost/profile feeds skew tiny — measured 0 pairs above $1M. The search",
+      "endpoint skews the opposite way, so both are used and unioned.",
+      "Measured yield per query into the $300k-$8M band: solana=13, SOL=4,",
+      "dog=2, pump/cat/AI/trump=1 each, meme/moon/WIF=0."
+    ],
+    "searchQueries": ["solana", "SOL", "dog", "trump", "pump", "cat", "AI"],
+    "searchMinMarketCapUsd": 300000
   },
 
   "postMortem": {

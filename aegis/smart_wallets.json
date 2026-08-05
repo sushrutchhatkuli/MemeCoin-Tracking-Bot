@@ -25,14 +25,12 @@
       "enabled": true
     },
     {
-      "address": "8b9RzKk9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+      "_removed": "Elite Sniper #3",
+      "_reason": "Address 8b9RzKk9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 was 45 chars; Solana addresses are 32-44. It matched nothing and reported as 'no whales found'. NOT replaced with a substitute: inventing a valid-looking address would manufacture a fake smart-money signal, which is worse than an empty slot. Re-export the real address from Cielo and paste it here.",
+      "address": "REPLACE_WITH_REAL_ADDRESS_FROM_CIELO",
       "label": "Elite Sniper #3",
       "source": "Cielo Finance Export",
-      "win_rate": "81%",
-      "trades": 156,
-      "net_profit_usd": "+$112k",
-      "stats_updated": "2026-08-05",
-      "enabled": true
+      "enabled": false
     }
   ]
 }

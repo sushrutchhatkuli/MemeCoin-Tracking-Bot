@@ -293,12 +293,17 @@ export function classifySignal({ demand, security, config }) {
     liquidity: liq >= (g.minLiquidityUsd ?? 100_000),
     // Requires a confirmed age: a lower-bound estimate cannot establish maturity.
     age: age !== null && age >= (g.minAgeHours ?? 24) && demand.ageIsLowerBound === false,
-    holders: holders !== null && holders !== undefined && holders >= (g.minHolders ?? 1000),
+    // Holder count must be KNOWN even when the minimum is 0. Advice to hold for
+    // weeks should not rest on missing distribution data; the global 150-holder
+    // safety floor still applies separately.
+    holders: holders !== null && holders !== undefined && holders >= (g.minHolders ?? 0),
   };
+  // GEM is tested first, so an overlapping token (>=$300k, mature) is treated as
+  // an accumulation setup rather than a scalp. Maturity decides holding style.
   if (Object.values(gemChecks).every(Boolean)) {
     return {
       category: SIGNAL_CATEGORY.GEM,
-      label: '💎 LONG-TERM INVESTMENT GEM',
+      label: g.label ?? '💎 LONG-TERM INVESTMENT GEM',
       advice: g.advice ?? '💎 Long-term accumulation setup — suitable for holding over days/weeks.',
       scoreBoost: g.scoreBoost ?? 10,
       checks: gemChecks,
@@ -311,7 +316,7 @@ export function classifySignal({ demand, security, config }) {
   if (inScalpBand && youngEnough) {
     return {
       category: SIGNAL_CATEGORY.SCALP,
-      label: '⚡ FAST MOMENTUM SCALP',
+      label: s.label ?? '⚡ FAST MOMENTUM SCALP',
       advice: s.advice ?? '⚡ Fast momentum trade — take initial profit at +50% to +100%!',
       scoreBoost: 0,
       checks: { marketCap: inScalpBand, age: youngEnough },

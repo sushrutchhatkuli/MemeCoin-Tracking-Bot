@@ -258,17 +258,23 @@ test('callout reports position instead of inventing a spend when unattributable'
  * Dual-mode signal classification
  * ------------------------------------------------------------------ */
 
+// Mirrors the shipped config: GEM floor $300k / $50k liq / 12h, SCALP up to $1M.
 const catConfig = {
   signalCategories: {
     gem: {
-      minMarketCapUsd: 1_000_000,
-      minLiquidityUsd: 100_000,
-      minAgeHours: 24,
-      minHolders: 1000,
+      minMarketCapUsd: 300_000,
+      minLiquidityUsd: 50_000,
+      minAgeHours: 12,
+      minHolders: 0,
       scoreBoost: 10,
       advice: 'gem advice',
     },
-    scalp: { minMarketCapUsd: 15_000, maxMarketCapUsd: 300_000, maxAgeHours: 24, advice: 'scalp advice' },
+    scalp: {
+      minMarketCapUsd: 15_000,
+      maxMarketCapUsd: 1_000_000,
+      maxAgeHours: 24,
+      advice: 'scalp advice',
+    },
   },
 };
 
@@ -278,6 +284,45 @@ const gemDemand = {
   ageHours: 72,
   ageIsLowerBound: false,
 };
+
+test('GEM wins the overlap: a mature $500k token is accumulation, not a scalp', () => {
+  // $500k sits inside BOTH bands now. GEM is evaluated first, so maturity
+  // decides — this is the documented precedence, not an accident.
+  const r = classifySignal({
+    demand: { marketCap: 500_000, liquidityUsd: 80_000, ageHours: 18, ageIsLowerBound: false },
+    security: { ok: true, totalHolders: 3000 },
+    config: catConfig,
+  });
+  assert.equal(r.category, 'LONG-TERM GEM');
+  assert.equal(r.scoreBoost, 10);
+});
+
+test('the same $500k token is a SCALP when too young or too thin for GEM', () => {
+  const young = classifySignal({
+    demand: { marketCap: 500_000, liquidityUsd: 80_000, ageHours: 4, ageIsLowerBound: false },
+    security: { ok: true, totalHolders: 3000 },
+    config: catConfig,
+  });
+  assert.equal(young.category, 'FAST SCALP', 'under 12h -> scalp');
+
+  const thin = classifySignal({
+    demand: { marketCap: 500_000, liquidityUsd: 20_000, ageHours: 18, ageIsLowerBound: false },
+    security: { ok: true, totalHolders: 3000 },
+    config: catConfig,
+  });
+  assert.equal(thin.category, 'FAST SCALP', 'liquidity below $50k -> scalp');
+});
+
+test('the 97% survival band ($300k-$1M) is now always captured', () => {
+  for (const mc of [300_000, 650_000, 999_999]) {
+    const r = classifySignal({
+      demand: { marketCap: mc, liquidityUsd: 20_000, ageHours: 3, ageIsLowerBound: false },
+      security: { ok: true, totalHolders: 900 },
+      config: catConfig,
+    });
+    assert.notEqual(r.category, 'UNCLASSIFIED', `$${mc} must classify`);
+  }
+});
 
 test('classifies a mature deep-liquidity token as LONG-TERM GEM', () => {
   const r = classifySignal({
@@ -330,11 +375,11 @@ test('SCALP tolerates unknown age; the advice holds either way', () => {
   assert.equal(r.category, 'FAST SCALP');
 });
 
-test('a token between the two bands is left unclassified', () => {
-  // $500k is above the scalp ceiling but below the gem floor — deliberately no
-  // advice rather than forcing it into the nearest tier.
+test('a token outside both bands is left unclassified', () => {
+  // Above the scalp ceiling but too thin and too young for GEM — deliberately
+  // no advice rather than forcing it into the nearest tier.
   const r = classifySignal({
-    demand: { marketCap: 500_000, liquidityUsd: 60_000, ageHours: 5, ageIsLowerBound: false },
+    demand: { marketCap: 4_000_000, liquidityUsd: 20_000, ageHours: 3, ageIsLowerBound: false },
     security: { ok: true, totalHolders: 2000 },
     config: catConfig,
   });

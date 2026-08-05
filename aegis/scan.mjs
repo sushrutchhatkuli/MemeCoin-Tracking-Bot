@@ -375,8 +375,10 @@ export async function runScan(args = {}) {
     pairs = [pair];
   } else {
     console.log(`🔎 Discovering launches on: ${chains.join(', ')}`);
-    const candidates = await discoverCandidates(chains);
-    console.log(`   ${candidates.length} candidates surfaced.`);
+    const { candidates, stats } = await discoverCandidates(chains, config.discovery);
+    console.log(
+      `   ${stats.total} candidates surfaced (${stats.fromFeeds} from launch feeds, ${stats.fromSearch} from search).`
+    );
 
     const byChain = new Map();
     for (const c of candidates) {
