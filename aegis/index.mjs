@@ -19,6 +19,7 @@ import { dirname, join } from 'node:path';
 import { runScan, parseArgs } from './scan.mjs';
 import { runPostMortem, annotateNotes } from './post_mortem.mjs';
 import { syncTopWhales } from './auto_top_whales.mjs';
+import { sampleTrajectory } from './trajectory.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -86,6 +87,21 @@ async function once(args) {
         await maybeSyncWhales();
       } catch (err) {
         console.error(`⚠️  Whale sync failed (scan results kept): ${err.message}`);
+      }
+
+      // Hourly trajectory sample. Cheap, append-only, and survives reboots
+      // because it rides the existing scheduled task rather than a session.
+      try {
+        const row = await sampleTrajectory(HERE);
+        if (row) {
+          console.log(
+            `📈 Trajectory: ${row.wallets} wallets · ${row.decided} decided token(s) · ` +
+              `fail ${row.tokenFailRate}% vs base ${row.baseFailRate}% · ` +
+              `max graded/wallet ${row.maxGraded} · ${row.recurring} recurring`
+          );
+        }
+      } catch (err) {
+        console.error(`⚠️  Trajectory sample failed: ${err.message}`);
       }
     }
 

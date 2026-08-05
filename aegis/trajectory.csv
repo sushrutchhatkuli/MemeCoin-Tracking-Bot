@@ -1,0 +1,2 @@
+timestamp,wallets,tokens,decided_tokens,token_fail_pct,base_fail_pct,max_graded_per_wallet,wallets_with_2plus
+2026-08-05 09:27,1215,28,8,50.0,85.0,2,2
