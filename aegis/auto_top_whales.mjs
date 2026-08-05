@@ -425,8 +425,9 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
   const { evaluated, qualified } = applyEliteRules(wellFormed, rules);
 
   // ---- reporting ---------------------------------------------------
-  const failing = { winRate: 0, netProfit: 0, trades: 0 };
+  const failing = { sample: 0, winRate: 0, netProfit: 0, trades: 0 };
   for (const c of evaluated) {
+    if (!c.checks.sample) failing.sample++;
     if (!c.checks.winRate) failing.winRate++;
     if (!c.checks.netProfit) failing.netProfit++;
     if (!c.checks.trades) failing.trades++;
@@ -434,6 +435,13 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
 
   console.log('');
   console.log(`📊 Composite Elite Ranking — ${evaluated.length} candidate(s) evaluated`);
+  // Reported first because it is the gate that actually disqualifies most
+  // candidates. Leaving it out made Rule 2 look like the sole blocker while a
+  // 100%-win-rate-on-one-trade population sat behind it.
+  console.log(
+    `   Gate 0  graded sample ≥ ${rules.minGradedBuys ?? 0}  → ${evaluated.length - failing.sample} pass` +
+      (failing.sample === evaluated.length ? '   ← blocking everything' : '')
+  );
   console.log(`   Rule 1  win rate ≥ ${rules.minWinRatePct}%      → ${evaluated.length - failing.winRate} pass`);
   console.log(
     rules.profitRule === 'skip'
@@ -456,7 +464,18 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     console.log('⏭️  No wallet cleared all three rules — smart_wallets.json left untouched.');
     console.log('   The rules are strict by design; an empty elite list is correct when');
     console.log('   nothing has earned a place, and is safer than a padded one.');
-    if (!importPath) {
+    if (!importPath && failing.sample === evaluated.length) {
+      const decided = maturity?.decidedTokens ?? 0;
+      console.log(`   Every wallet failed the graded-sample floor of ${rules.minGradedBuys}.`);
+      console.log(`   Only ${decided} token(s) in the ledger have a decided outcome, and a wallet`);
+      console.log(`   cannot have more graded buys than there are decided tokens — so the floor`);
+      console.log(`   is unreachable until many more tokens resolve AND the same wallets recur`);
+      console.log(`   across them. Most wallets are seen exactly once.`);
+      console.log('');
+      console.log('   This is a long game: observe mode needs weeks of recurring traders.');
+      console.log('   For a list today, import a leaderboard:');
+      console.log('     node auto_top_whales.mjs --import <file.csv>');
+    } else if (!importPath) {
       if (rules.profitRule !== 'skip' && failing.netProfit === evaluated.length) {
         console.log('   Rule 2 rejected every candidate. That is expected in OBSERVE mode:');
         console.log('   lifetime realized P&L cannot be derived from observation — Aegis sees');

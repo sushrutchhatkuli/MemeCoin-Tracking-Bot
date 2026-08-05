@@ -202,6 +202,54 @@
       "reason": "Post-mortem: $APE fell -66.5% within 1.05h",
       "added": "2026-08-05",
       "source": "post-mortem"
+    },
+    {
+      "address": "97YkKbCGLwkr5ushJ2ArbsfPpsg1pE4scN1bFpqzyuNc",
+      "reason": "Post-mortem: $Wally fell -81.5% within 1.05h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "GTneR5B5u29P63gxuEdqhMgwBXCRpSmuhxEpjmmNMyVt",
+      "reason": "Post-mortem: $PSTOCKS fell -87.7% within 1.05h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "7NFHa81vqhEBDLq5YyuiGS81f6TB5GXdobuy5srgsmq4",
+      "reason": "Post-mortem: $MAGIC fell -87.6% within 1.24h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "4wEMRu2x45y1xPjEeDt3qdwrtjraBgF2vD6L1uHbbt2u",
+      "reason": "Post-mortem: $GERMANUS fell -100% within 1.05h (pair delisted)",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "0xe2194c5834c4640e470ad70ccb5448df1c3d3563",
+      "reason": "Post-mortem: $SPCM fell -80.9% within 3.45h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "CU4L8gvTNGVu6FGGaLQKbSKbia5adhhA6ERVTF1DNr4Y",
+      "reason": "Post-mortem: $JELON fell -68% within 2.25h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM",
+      "reason": "Post-mortem: $Hachiwari fell -61% within 2.05h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "GT5au36AvFTxc4yfRHh1dMWkLtsxDRHz2VW5MmvcKjM7",
+      "reason": "Post-mortem: $ハク fell -85.9% within 1.65h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
     }
   ],
   "mints": [
