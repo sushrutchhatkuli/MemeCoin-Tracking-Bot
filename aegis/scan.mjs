@@ -48,6 +48,7 @@ import {
   buildDigest,
 } from './telegram.mjs';
 import { analyzeSocials, socialBadge } from './social_scanner.mjs';
+import { migrationStatus, MIGRATION } from './migration.mjs';
 import {
   loadObservations,
   saveObservations,
@@ -279,6 +280,7 @@ async function analyzeToken({
   });
 
   const signalCategory = classifySignal({ demand, security, config });
+  const migration = migrationStatus(pair, security, config);
 
   const catalysts = detectCatalysts(pair, security, demand, velocity, config.thresholds, {
     smartMoney,
@@ -313,6 +315,7 @@ async function analyzeToken({
     social,
     blacklistHit,
     signalCategory,
+    migration,
   };
 }
 
@@ -330,6 +333,7 @@ async function writeNote({ pair, result, notesDir, config, now }) {
     social: result.social,
     blacklistHit: result.blacklistHit,
     signalCategory: result.signalCategory,
+    migration: result.migration,
     tradeLink: { template: config.tradeLinkTemplate, label: config.tradeLinkLabel },
     now,
   });

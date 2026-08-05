@@ -123,6 +123,7 @@ export function renderNote({
   social,
   blacklistHit,
   signalCategory,
+  migration,
   tradeLink,
   now,
 }) {
@@ -164,6 +165,8 @@ export function renderNote({
     `security_status: ${yamlStr(SECURITY_LABEL[audit.status])}`,
     `top_10_holder_pct: ${yamlStr(security?.ok ? pctStr(security.top10Pct) : 'Unknown')}`,
     `signal_category: ${yamlStr(signalCategory?.category ?? 'UNCLASSIFIED')}`,
+    `migration_status: ${yamlStr(migration?.state ?? 'UNKNOWN')}`,
+    `tradeable_now: ${migration?.tradeable === false ? 'false' : 'true'}`,
     `trade_advice: ${yamlStr(signalCategory?.advice ?? '')}`,
     `age_hours: ${demand.ageHours === null ? 'null' : demand.ageHours.toFixed(1)}`,
     `age_source: ${yamlStr(demand.ageSource ?? 'unknown')}`,
@@ -247,7 +250,7 @@ export function renderNote({
 
 > [!${verdictInfo.verdict === 'SCAM/AVOID' ? 'danger' : audit.status === 'UNVERIFIED' || verdictInfo.verdict === 'CRASH WARNING' || verdictInfo.verdict === 'UNVERIFIED / LOW HOLDERS' ? 'warning' : 'info'}] Verdict: ${verdictInfo.blacklisted ? '⛔ BLACKLISTED DEPLOYER' : verdictInfo.serialRugger ? '🔴 AVOID / SERIAL RUGGER' : verdictInfo.verdict}
 > Confidence \`${verdictInfo.score}/100\` · Security \`${audit.status}\` · Deployer \`${deployer?.status ?? 'UNKNOWN / NEW'}\` · Direction ${directionLine}
-${signalCategory && signalCategory.category !== 'UNCLASSIFIED' ? `\n> [!tip] ${signalCategory.label}\n> ${signalCategory.advice}` : ''}
+${migration?.label ? `\n> [!warning] ${migration.label}\n> ${migration.detail}` : ''}${signalCategory && signalCategory.category !== 'UNCLASSIFIED' ? `\n> [!tip] ${signalCategory.label}\n> ${signalCategory.advice}` : ''}
 
 ## 📊 Summary & Key Metrics
 - **Chain**: \`${chainLabel}\` (\`${pair.dexId ?? 'unknown dex'}\`)

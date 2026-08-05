@@ -150,7 +150,7 @@ function renderWhales(smartMoney) {
   return lines;
 }
 
-export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory }) {
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration }) {
   const symbol = pair.baseToken?.symbol ?? 'UNKNOWN';
   const address = pair.baseToken.address;
   const usd = (n) =>
@@ -186,6 +186,11 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
           : '🚀 <b>BUY SIGNAL</b> 🚀',
     `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
     `<i>Confidence ${verdictInfo.score}/100</i>`,
+    // Placed above the advice: if the buy button is locked, the trading advice
+    // is not actionable yet and the reader needs to know that first.
+    ...(migration?.label
+      ? ['', `<b>${esc(migration.label)}</b>`, `<i>${esc(migration.detail)}</i>`]
+      : []),
     ...(signalCategory?.advice ? ['', `<b>${esc(signalCategory.advice)}</b>`] : []),
     ...renderWhales(smartMoney),
     '',
@@ -425,6 +430,7 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     tradeLink: { template: config.tradeLinkTemplate, label: config.tradeLinkLabel },
     reaudit,
     signalCategory: result.signalCategory,
+    migration: result.migration,
   });
 
   const sent = await sendTelegram({ ...credentials, text });

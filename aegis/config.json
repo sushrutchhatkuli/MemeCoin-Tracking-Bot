@@ -150,10 +150,25 @@
     "minWinRatePct": 75,
     "minNetProfitUsd": 50000,
     "minLifetimeTrades": 100,
-    "topN": 50,
-    "profitRule": "strict",
-    "minGradedBuys": 10,
-    "minRepresentativeness": 0.5
+    "topN": 5,
+    "profitRule": "skip",
+    "minGradedBuys": 3,
+    "minRepresentativeness": 0.5,
+    "_option2Note": [
+      "Top-5 Earned Whales. minGradedBuys lowered 10 -> 3 because the ledger",
+      "showed 0 wallets could ever reach 10: a wallet cannot hold more graded",
+      "buys than there are decided tokens, and recurrence collapses 3-4x per",
+      "level (1466 wallets at >=1, 36 at >=2, 9 at >=3, 2 at >=5).",
+      "",
+      "profitRule is 'skip' because nothing writes otherwise — lifetime realized",
+      "P&L is not derivable from observation. Ranking is therefore on win rate +",
+      "on-chain activity only. Imported leaderboards still carry real P&L.",
+      "",
+      "SAMPLE-SIZE WARNING: at minGradedBuys=3 with a 75% win-rate bar, a wallet",
+      "with exactly 3 graded buys must be 3/3 perfect (2/3 = 66.7% fails). So the",
+      "first entries are near-perfect records over very few trades. Treat these",
+      "as candidates to watch, not proven edge, until their graded counts grow."
+    ]
   },
   "telegram": {
     "enabled": true,
