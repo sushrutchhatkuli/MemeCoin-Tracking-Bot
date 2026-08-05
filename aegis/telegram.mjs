@@ -10,6 +10,9 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
+import { fetchLiveHolderDistribution } from './sources.mjs';
+import { concentrationCapFor } from './audit.mjs';
+
 /* ------------------------------------------------------------------ *
  * .env
  * ------------------------------------------------------------------ */
@@ -146,7 +149,7 @@ function renderWhales(smartMoney) {
   return lines;
 }
 
-export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink }) {
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit }) {
   const symbol = pair.baseToken?.symbol ?? 'UNKNOWN';
   const address = pair.baseToken.address;
   const usd = (n) =>
@@ -180,7 +183,8 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     '',
     '🔒 <b>SAFETY &amp; DENSITY AUDIT:</b>',
     `• Holders: ${security?.totalHolders ?? '?'} Wallets (${verdictInfo.holderGate?.passed ? `Passed ${verdictInfo.holderGate.floor}+ Floor ✅` : 'Floor NOT passed ❌'})`,
-    `• Top 10 Concentration: ${security?.top10Pct === null || security?.top10Pct === undefined ? '?' : `${security.top10Pct.toFixed(1)}%`} (Passed &lt;25% Cap ✅)`,
+    `• Top 10 Concentration: ${security?.top10Pct === null || security?.top10Pct === undefined ? '?' : `${security.top10Pct.toFixed(1)}%`}${reaudit?.ran ? ` (re-checked live: ${reaudit.now?.toFixed(1)}%, cap ${reaudit.cap}% ✅)` : ` (cap ${esc(String(concentrationCapFor(demand?.ageHours ?? null, { maxTop10Pct: 25, maxTop10PctYoung: 20 }).cap))}% ✅)`}`,
+    `• Holder Data: ${security?.distributionSource === 'rpc-live' ? 'live on-chain ✅' : 'cached indexer ⚠️'}${reaudit?.ran ? '' : reaudit?.reason ? ` · re-audit skipped (${esc(String(reaudit.reason).slice(0, 60))})` : ''}`,
     `• Security Status: ${verdictInfo.securityStatus === 'PASSED' ? 'PASSED ALL AUDITS ✅' : esc(verdictInfo.securityStatus ?? '?')}`,
     `• Deployer: ${esc(devLine)}`,
     '',
@@ -304,6 +308,61 @@ export async function sendTelegram({ botToken, chatId, text }) {
  * Gate + send. Returns a result describing what happened so the scanner can log
  * it honestly rather than implying an alert went out when it did not.
  */
+/**
+ * Re-read concentration from chain immediately before dispatch.
+ *
+ * The audit that produced this signal ran earlier in the scan — seconds to
+ * minutes ago, and against a possibly-cached holder list. That is enough time
+ * for a cabal to accumulate. This is the last check before the alert reaches a
+ * phone, so it re-reads live and cancels if concentration has crossed the cap.
+ *
+ * When no dedicated RPC is configured the re-audit cannot run. The behaviour
+ * then is governed by `telegram.requireLiveReaudit`:
+ *   false (default) — dispatch, and mark the alert as un-reverified
+ *   true            — cancel, failing closed
+ * Default is false only because keyless RPCs refuse the call entirely, so
+ * failing closed would silence every alert rather than filter risky ones.
+ */
+export async function preDispatchReaudit({ result, pair, config }) {
+  if (pair.chainId !== 'solana') {
+    return { ran: false, reason: 'non-Solana chain', pass: true };
+  }
+  const security = result.security;
+  if (!security?.ok) return { ran: false, reason: 'no security record', pass: true };
+
+  // Reuse the exact exclusion set from the original audit. Recomputing it, or
+  // omitting it, would compare a pool-excluded figure against a pool-inclusive
+  // one and produce a bogus "concentration spiked" cancellation.
+  const live = await fetchLiveHolderDistribution({
+    mint: pair.baseToken.address,
+    rpcUrl: config.rpcUrl,
+    excludedAddresses: security.excludedAddresses ?? new Set(),
+    topN: 10,
+  });
+
+  if (!live.ok) {
+    return { ran: false, reason: live.error, pass: !config.telegram.requireLiveReaudit };
+  }
+
+  const { cap, tier } = concentrationCapFor(result.demand?.ageHours ?? null, config.thresholds);
+  const before = security.top10Pct;
+  const nowPct = live.topNPct;
+  const pass = nowPct !== null && nowPct < cap;
+
+  return {
+    ran: true,
+    pass,
+    cap,
+    tier,
+    before,
+    now: nowPct,
+    drift: before !== null && nowPct !== null ? nowPct - before : null,
+    reason: pass
+      ? null
+      : `top 10 concentration is ${nowPct?.toFixed(1)}% at dispatch, above the ${cap}% cap (${tier})`,
+  };
+}
+
 export async function maybeAlert({ result, pair, credentials, config, alertLog, now }) {
   const { verdictInfo, demand, smartMoney, deployer, security, audit } = result;
 
@@ -331,6 +390,12 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     return { status: 'no-credentials' };
   }
 
+  // Last gate before the alert leaves the machine.
+  const reaudit = await preDispatchReaudit({ result, pair, config });
+  if (!reaudit.pass) {
+    return { status: 'blocked-reaudit', reason: reaudit.reason, reaudit };
+  }
+
   const text = buildMessage({
     pair,
     demand,
@@ -339,12 +404,13 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     deployer,
     security,
     tradeLink: { template: config.tradeLinkTemplate, label: config.tradeLinkLabel },
+    reaudit,
   });
 
   const sent = await sendTelegram({ ...credentials, text });
   if (sent.ok) {
     alertLog[key] = { sentAt: now, symbol: pair.baseToken.symbol, score: verdictInfo.score };
-    return { status: 'sent' };
+    return { status: 'sent', reaudit };
   }
   return { status: 'failed', error: sent.error };
 }

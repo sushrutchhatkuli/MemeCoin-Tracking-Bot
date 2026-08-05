@@ -13,7 +13,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { extractBuys, priceEntry } from '../smart_money.mjs';
-import { scoreToken } from '../audit.mjs';
+import { scoreToken, concentrationCapFor, runSecurityAudit } from '../audit.mjs';
 
 const MINT = 'MintAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const POOL = 'PoolBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
@@ -187,6 +187,53 @@ test('a whale cannot rescue a token below the holder floor', () => {
   assert.equal(result.safetyGateFailed, true);
   assert.equal(result.verdict, 'UNVERIFIED / LOW HOLDERS');
   assert.notEqual(result.verdict, 'BUY SIGNAL');
+});
+
+/* ------------------------------------------------------------------ *
+ * Age-tiered concentration cap
+ * ------------------------------------------------------------------ */
+
+const capThresholds = { maxTop10Pct: 25, maxTop10PctYoung: 20, youngTokenHours: 2 };
+
+test('young tokens get the tighter 20% concentration cap', () => {
+  assert.equal(concentrationCapFor(0.5, capThresholds).cap, 20);
+  assert.equal(concentrationCapFor(1.9, capThresholds).cap, 20);
+});
+
+test('established tokens keep the 25% cap', () => {
+  assert.equal(concentrationCapFor(2.0, capThresholds).cap, 25);
+  assert.equal(concentrationCapFor(48, capThresholds).cap, 25);
+});
+
+test('unknown age fails safe to the strict cap', () => {
+  // DexScreener omits pairCreatedAt for many bonding-curve pairs, so this is
+  // the common path, not an edge case.
+  const { cap, tier } = concentrationCapFor(null, capThresholds);
+  assert.equal(cap, 20);
+  assert.match(tier, /age unknown/);
+});
+
+test('a 22% token passes when established but fails when young', () => {
+  const security = {
+    ok: true,
+    chainKind: 'solana',
+    mintAuthority: null,
+    freezeAuthority: null,
+    lpLockedPct: 100,
+    top10Pct: 22,
+    insiderPct: 0,
+    risks: [],
+    rugged: false,
+    totalHolders: 900,
+  };
+  const th = { ...capThresholds, minLpLockedPct: 99 };
+
+  const established = runSecurityAudit(security, th, { ageHours: 10 });
+  assert.equal(established.status, 'PASSED', '22% is under the 25% established cap');
+
+  const young = runSecurityAudit(security, th, { ageHours: 0.5 });
+  assert.equal(young.status, 'FAILED', '22% must fail the 20% young-token cap');
+  assert.match(young.failures[0], /Insider Concentration/);
 });
 
 test('a clean token with whales still reaches BUY SIGNAL', () => {

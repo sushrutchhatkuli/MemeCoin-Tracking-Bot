@@ -20,9 +20,35 @@ const ratio = (a, b) => (b > 0 ? a / b : a > 0 ? Infinity : 0);
  * SCAM/AVOID poisons the blacklist with tokens that were merely too new, and it
  * teaches you to distrust the one label that has to stay trustworthy.
  */
-export function runSecurityAudit(security, thresholds) {
+/**
+ * Concentration cap, tightened for young tokens.
+ *
+ * A token in its first couple of hours has no track record, and insider
+ * accumulation is easiest to hide there — so it gets a buffer below the
+ * standard cap.
+ *
+ * When age cannot be determined the STRICT cap applies. DexScreener omits
+ * `pairCreatedAt` for many bonding-curve pairs, so unknown age is common rather
+ * than exotic; defaulting to the loose cap would quietly hand the buffer back
+ * to exactly the newest tokens it exists to protect against.
+ */
+export function concentrationCapFor(ageHours, thresholds) {
+  const strict = thresholds.maxTop10PctYoung ?? 20;
+  const standard = thresholds.maxTop10Pct ?? 25;
+  const youngHours = thresholds.youngTokenHours ?? 2;
+
+  if (ageHours === null || ageHours === undefined) {
+    return { cap: strict, tier: 'young (age unknown — strict cap applied)' };
+  }
+  return ageHours < youngHours
+    ? { cap: strict, tier: `young (<${youngHours}h)` }
+    : { cap: standard, tier: `established (≥${youngHours}h)` };
+}
+
+export function runSecurityAudit(security, thresholds, { ageHours = null } = {}) {
   const checks = [];
   const add = (label, passed, detail) => checks.push({ label, passed, detail });
+  const { cap: top10Cap, tier: ageTier } = concentrationCapFor(ageHours, thresholds);
 
   if (!security?.ok) {
     add('Security data', null, `Unavailable — ${security?.error ?? 'unknown error'}`);
@@ -62,14 +88,18 @@ export function runSecurityAudit(security, thresholds) {
     const insiderNote = security.graphInsidersDetected
       ? ` — ${security.graphInsidersDetected} insider wallets in ${security.insiderNetworks} bundle network(s)`
       : '';
+    const sourceNote =
+      security.distributionSource === 'rpc-live'
+        ? ' [live on-chain]'
+        : ' [cached indexer — may lag]';
     add(
       'Insider Concentration',
       security.top10Pct === null
         ? null
-        : security.top10Pct < thresholds.maxTop10Pct && security.insiderPct < 10,
+        : security.top10Pct < top10Cap && security.insiderPct < 10,
       security.top10Pct === null
         ? 'Holder distribution not yet indexed'
-        : `Top 10 non-DEX hold ${security.top10Pct.toFixed(1)}% (limit ${thresholds.maxTop10Pct}%), flagged insiders ${security.insiderPct.toFixed(1)}%${insiderNote}`
+        : `Top 10 non-DEX hold ${security.top10Pct.toFixed(1)}% (limit ${top10Cap}% — ${ageTier})${sourceNote}, flagged insiders ${security.insiderPct.toFixed(1)}%${insiderNote}`
     );
 
     add(
@@ -126,10 +156,10 @@ export function runSecurityAudit(security, thresholds) {
 
     add(
       'Insider Concentration',
-      security.top10Pct === null ? null : security.top10Pct < thresholds.maxTop10Pct,
+      security.top10Pct === null ? null : security.top10Pct < top10Cap,
       security.top10Pct === null
         ? 'Holder distribution not yet indexed'
-        : `Top 10 non-LP hold ${security.top10Pct.toFixed(1)}% (limit ${thresholds.maxTop10Pct}%)`
+        : `Top 10 non-LP hold ${security.top10Pct.toFixed(1)}% (limit ${top10Cap}% — ${ageTier})`
     );
   }
 

@@ -18,6 +18,8 @@
     "crashSellRatio": 3.0,
     "minLiqToMcapPct": 15,
     "maxTop10Pct": 25,
+    "maxTop10PctYoung": 20,
+    "youngTokenHours": 2,
     "minLpLockedPct": 99,
     "maxTotalTaxPct": 5,
     "buySignalScore": 75,
@@ -73,7 +75,8 @@
     "enabled": true,
     "minScore": 75,
     "cooldownHours": 6,
-    "sendScanDigest": true
+    "sendScanDigest": true,
+    "requireLiveReaudit": false
   },
 
   "writeNotes": true,

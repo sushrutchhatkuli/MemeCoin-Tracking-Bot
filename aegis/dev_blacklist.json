@@ -28,6 +28,48 @@
       "reason": "Post-mortem: $ADJ fell -100% within 1h (pair delisted)",
       "added": "2026-08-05",
       "source": "post-mortem"
+    },
+    {
+      "address": "5ZuV8eqkvzYFVEKbLvGBdexL2tFv7E5BCd2HZpjqbdg",
+      "reason": "Post-mortem: $Memecoin fell -100% within 1.01h (pair delisted)",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "AbVkRUfynaEo6PMWyBCihRcirKbu3GkiyEoH5vny8aT9",
+      "reason": "Post-mortem: $KONG fell -100% within 1.01h (pair delisted)",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "9meyzDKziwduPznwvRiyrYhQiZMVrqvJaFkmH6EJRPAG",
+      "reason": "Post-mortem: $DOGEJONES fell -100% within 1.01h (pair delisted)",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "5t9xBNuDdGTGpjaPTx6hKd7sdRJbvtKS8Mhq6qVbo8Qz",
+      "reason": "Post-mortem: $cotton fell -100% within 1.01h (pair delisted)",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "J2VCkPykUp7JJV8nT66LMyPHzuoBWGBfdkVXUWVd2zZZ",
+      "reason": "Post-mortem: $NEVER fell -82.3% within 1.61h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "4bghJqNCiPKiY6XkXTWsruLxKjvXNouweg6Zh1thWumF",
+      "reason": "Post-mortem: $Fomohouse fell -100% within 1.61h (pair delisted)",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "C7zPnA5sUjJXXVE2wKTz41xdFXEFJZR7LFM4QiYtaR4E",
+      "reason": "Post-mortem: $FomoCoin fell -100% within 1.01h (pair delisted)",
+      "added": "2026-08-05",
+      "source": "post-mortem"
     }
   ],
   "mints": [

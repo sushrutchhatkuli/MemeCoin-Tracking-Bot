@@ -161,9 +161,10 @@ async function analyzeToken({ pair, config, state, watchlist, deployerCache, bla
   const address = pair.baseToken.address;
   const key = `${pair.chainId}:${address.toLowerCase()}`;
 
-  const security = await fetchSecurity(pair.chainId, address);
-  let audit = runSecurityAudit(security, config.thresholds);
+  const security = await fetchSecurity(pair.chainId, address, { rpcUrl: config.rpcUrl });
   const demand = analyzeDemand(pair, security);
+  // Age drives the concentration cap, so demand must be computed first.
+  let audit = runSecurityAudit(security, config.thresholds, { ageHours: demand.ageHours });
 
   const observation = {
     holders: security?.totalHolders ?? null,
@@ -474,6 +475,10 @@ export async function runScan(args = {}) {
       console.log(`   ⚠️  Telegram alert FAILED for $${symbol}: ${alert.error}`);
     } else if (alert.status === 'no-credentials') {
       console.log(`   📲 $${symbol} qualified for an alert but Telegram is not configured`);
+    } else if (alert.status === 'blocked-reaudit') {
+      console.log(`   🛑 $${symbol} alert CANCELLED at dispatch — ${alert.reason}`);
+    } else if (alert.status === 'blocked-safety') {
+      console.log(`   🛑 $${symbol} alert blocked by safety gate — ${alert.reason}`);
     }
 
     await sleep(config.requestDelayMs);

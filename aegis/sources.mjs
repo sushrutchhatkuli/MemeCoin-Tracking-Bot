@@ -199,10 +199,89 @@ export function computeHolderDistribution({ holders, totalSupply, excludedAddres
 }
 
 /* ------------------------------------------------------------------ *
+ * Live on-chain holder distribution (Solana RPC)
+ * ------------------------------------------------------------------ */
+
+async function solanaRpc(url, method, params, timeoutMs = 15000) {
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (body.error) return { error: `${body.error.code}: ${body.error.message}`.slice(0, 120) };
+    if (!res.ok) return { error: `HTTP ${res.status}` };
+    return { result: body.result };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+/**
+ * Read holder distribution straight from chain, bypassing the indexer cache.
+ *
+ * WHY THIS OFTEN RETURNS null:
+ * `getTokenLargestAccounts` is expensive server-side and every keyless endpoint
+ * refuses it — the public Solana RPC rate-limits it per-method, and dRPC/Ankr/
+ * BlockEden all require a paid plan. It works as soon as `rpcUrl` points at a
+ * dedicated endpoint (Helius, QuickNode, Triton). Until then the caller falls
+ * back to the cached indexer and the note says so explicitly, because
+ * presenting stale numbers as live is worse than admitting they are stale.
+ *
+ * ACCURACY CAVEAT even when it works: the RPC returns the top 20 token
+ * ACCOUNTS, not wallets, and not the full holder set. Aggregating by owner (as
+ * below) is correct for those 20, but a whale split across more accounts than
+ * that is still understated. This buys freshness, not unlimited depth.
+ */
+export async function fetchLiveHolderDistribution({ mint, rpcUrl, excludedAddresses, topN = 10 }) {
+  if (!rpcUrl) return { ok: false, error: 'no rpcUrl configured' };
+
+  const supply = await solanaRpc(rpcUrl, 'getTokenSupply', [mint]);
+  if (supply.error) return { ok: false, error: `getTokenSupply: ${supply.error}` };
+  const totalSupply = supply.result?.value?.uiAmount;
+  if (!totalSupply) return { ok: false, error: 'supply unavailable' };
+
+  const largest = await solanaRpc(rpcUrl, 'getTokenLargestAccounts', [mint]);
+  if (largest.error) return { ok: false, error: `getTokenLargestAccounts: ${largest.error}` };
+  const accounts = largest.result?.value ?? [];
+  if (!accounts.length) return { ok: false, error: 'no token accounts returned' };
+
+  // Token accounts carry no owner, so resolve them in one batched call.
+  const owners = await solanaRpc(rpcUrl, 'getMultipleAccounts', [
+    accounts.map((a) => a.address),
+    { encoding: 'jsonParsed' },
+  ]);
+  if (owners.error) return { ok: false, error: `getMultipleAccounts: ${owners.error}` };
+
+  const holders = accounts.map((a, i) => ({
+    address: a.address,
+    owner: owners.result?.value?.[i]?.data?.parsed?.info?.owner ?? a.address,
+    uiAmount: a.uiAmount ?? 0,
+  }));
+
+  const distribution = computeHolderDistribution({
+    holders,
+    totalSupply,
+    excludedAddresses,
+    topN,
+  });
+
+  return {
+    ok: true,
+    source: 'rpc-live',
+    fetchedAt: Date.now(),
+    accountsSampled: accounts.length,
+    ...distribution,
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Solana security (RugCheck)
  * ------------------------------------------------------------------ */
 
-export async function fetchSolanaSecurity(mint) {
+export async function fetchSolanaSecurity(mint, { rpcUrl = null } = {}) {
   const res = await getJson(`https://api.rugcheck.xyz/v1/tokens/${mint}/report`, {
     timeoutMs: 25000,
   });
@@ -238,10 +317,32 @@ export async function fetchSolanaSecurity(mint) {
         })
       : null;
 
-  const holders = distribution?.allHolders ?? [];
+  // Prefer a live on-chain read when an RPC is available. The cached indexer
+  // can lag insider accumulation by minutes, which is exactly the window a
+  // cabal uses to load up after the audit ran.
+  let distributionSource = 'rugcheck-cached';
+  let liveError = null;
+  let finalDistribution = distribution;
+
+  if (rpcUrl) {
+    const live = await fetchLiveHolderDistribution({
+      mint,
+      rpcUrl,
+      excludedAddresses: excluded,
+      topN: 10,
+    });
+    if (live.ok) {
+      finalDistribution = live;
+      distributionSource = 'rpc-live';
+    } else {
+      liveError = live.error;
+    }
+  }
+
+  const holders = finalDistribution?.allHolders ?? [];
   // null (unknown) rather than 0 when the provider returned no holder data —
   // an empty array must never be scored as perfect distribution.
-  const top10Pct = distribution ? distribution.topNPct : null;
+  const top10Pct = finalDistribution ? finalDistribution.topNPct : null;
   const insiderPct = holders
     .filter((h) => h.insider)
     .reduce((sum, h) => sum + (h.pct ?? 0), 0);
@@ -275,12 +376,22 @@ export async function fetchSolanaSecurity(mint) {
     creator: d.creator ?? null,
     creatorBalance: d.creatorBalance ?? null,
     // Full distribution detail — supply breakdown and both denominators.
-    distribution,
+    distribution: finalDistribution,
+    // Exported so the pre-dispatch re-audit can reuse the identical exclusion
+    // set rather than recomputing a different one.
+    excludedAddresses: excluded,
+    // Which source the concentration figure actually came from, and how stale
+    // it may be. Surfaced in the note so a cached number is never mistaken for
+    // a live one.
+    distributionSource,
+    distributionFetchedAt: finalDistribution?.fetchedAt ?? null,
+    liveHolderError: liveError,
+    cachedDistribution: distribution,
     totalSupply,
     // Unfiltered provider records, kept so the calibration tool can reproduce
     // other trackers' conventions (e.g. per-token-account, no LP filter).
     rawHolders: d.topHolders ?? [],
-    topHolders: distribution?.topHolders ?? [],
+    topHolders: finalDistribution?.topHolders ?? [],
     // Full filtered list — smart-money matching should search every tracked
     // holder, not just the ten that drive the concentration check.
     allHolders: holders,
@@ -365,8 +476,8 @@ export async function fetchEvmSecurity(chainId, contract) {
 }
 
 /** Dispatch to the right security provider for the chain. */
-export async function fetchSecurity(chainId, address) {
-  if (chainId === 'solana') return fetchSolanaSecurity(address);
+export async function fetchSecurity(chainId, address, opts = {}) {
+  if (chainId === 'solana') return fetchSolanaSecurity(address, opts);
   if (isEvmChain(chainId)) return fetchEvmSecurity(chainId, address);
   return { ok: false, error: `no security provider for chain: ${chainId}` };
 }
