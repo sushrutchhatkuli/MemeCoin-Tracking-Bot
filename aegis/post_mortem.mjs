@@ -24,6 +24,7 @@ import { dirname, resolve, join } from 'node:path';
 import { fetchPairsBatch } from './sources.mjs';
 import { loadState, saveState, baselineWithin } from './state.mjs';
 import { loadBlacklist, blacklistDeployer } from './blacklist.mjs';
+import { loadObservations, saveObservations, applyOutcomes } from './wallet_observations.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -152,6 +153,16 @@ export async function runPostMortem({ dryRun = false, config } = {}) {
     await mkdir(dirname(historyPath), { recursive: true });
     await writeFile(historyPath, JSON.stringify(history, null, 2), 'utf8');
     await saveState(statePath, state);
+
+    // Grade every observed buy of these tokens. This is what turns raw buyer
+    // sightings into a wallet track record.
+    const obsPath = join(HERE, '.state', 'wallet_observations.json');
+    const observations = await loadObservations(obsPath);
+    const graded = applyOutcomes(observations, results);
+    if (graded) {
+      await saveObservations(obsPath, observations);
+      console.log(`🐋 Elite ledger: graded ${graded} observed buy(s) against these outcomes`);
+    }
   }
 
   console.log(

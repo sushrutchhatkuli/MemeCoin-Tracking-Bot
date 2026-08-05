@@ -1,0 +1,444 @@
+#!/usr/bin/env node
+/**
+ * Automated Top-50 Elite Whale Sync — Composite Elite Ranking.
+ *
+ *   node auto_top_whales.mjs                 rank from Aegis's own observations
+ *   node auto_top_whales.mjs --import <file> rank from a leaderboard export
+ *   node auto_top_whales.mjs --dry-run       report only, do not write
+ *   node auto_top_whales.mjs --report        show current qualification progress
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY THERE ARE TWO MODES
+ *
+ * The three ranking rules need win rate, realized P&L and lifetime trade count
+ * per wallet. Getting those for *the whole of Solana* requires enumerating every
+ * trader, and no provider exposes that: GMGN returns 403 behind Cloudflare,
+ * Birdeye and Dune return 401 without a paid key, Cielo's public feed is empty,
+ * Solscan refuses the connection. Verified, not assumed.
+ *
+ * So the top-50 list cannot be *fetched*. It can be:
+ *
+ *   OBSERVE mode (default) — earned. Aegis already replays pool trades and sees
+ *   real buyers; the post-mortem already grades those tokens WIN/FAIL. Joining
+ *   them produces a leaderboard derived from Aegis's own evidence, tuned to the
+ *   exact token population it scans. It starts empty and compounds daily, the
+ *   same way the deployer index reached 600+ entries without any feed.
+ *
+ *   IMPORT mode — seeded. Point --import at a CSV/JSON export from GMGN, Cielo,
+ *   Birdeye or Dune. The three composite rules are applied strictly to that
+ *   data, so the ranking logic is identical; only the source differs.
+ *
+ * What this module will NOT do is invent 50 plausible-looking addresses with
+ * plausible-looking win rates. That would manufacture exactly the false signal
+ * the scanner exists to filter out.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+import { readFile, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve, join, extname } from 'node:path';
+
+import { loadObservations, walletStats } from './wallet_observations.mjs';
+import { validateWatchlistEntry } from './smart_money.mjs';
+import { loadEnv } from './telegram.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+/* ------------------------------------------------------------------ *
+ * Composite Elite Ranking
+ * ------------------------------------------------------------------ */
+
+export const ELITE_RULES = {
+  minWinRatePct: 75,
+  minNetProfitUsd: 50_000,
+  minLifetimeTrades: 100,
+  topN: 50,
+  // A win rate over 2 graded trades is noise. Without a floor, the first wallet
+  // to catch one pump would enter the list at 100%.
+  minGradedBuys: 10,
+};
+
+/**
+ * Apply all three rules. A candidate must pass every one — the rules are AND,
+ * not a weighted blend, so a spectacular win rate cannot compensate for a thin
+ * trade history (which is how small-sample flukes get mistaken for skill).
+ */
+export function applyEliteRules(candidates, rules = ELITE_RULES) {
+  // Rule 2 is a LIFETIME metric. Observation cannot produce it: Aegis sees a
+  // wallet's buys only on the tokens it happened to scan, over a window of
+  // hours, and never sees the exits — so an observed profit figure is a slice,
+  // not a career total, and will never legitimately clear $50k.
+  //
+  // `profitRule: 'skip'` ranks on the two rules that ARE measurable from
+  // observation rather than returning an empty list forever. It is opt-in and
+  // never silently applied to imported data, which does carry real lifetime P&L.
+  const skipProfit = rules.profitRule === 'skip';
+
+  const evaluated = candidates.map((c) => {
+    const checks = {
+      sample:
+        c.gradedBuys === undefined ||
+        c.gradedBuys === null ||
+        c.gradedBuys >= (rules.minGradedBuys ?? 0),
+      winRate: c.winRatePct !== null && c.winRatePct >= rules.minWinRatePct,
+      netProfit: skipProfit
+        ? true
+        : c.netProfitUsd !== null && c.netProfitUsd >= rules.minNetProfitUsd,
+      trades: c.lifetimeTrades !== null && c.lifetimeTrades >= rules.minLifetimeTrades,
+    };
+    return { ...c, checks, qualified: Object.values(checks).every(Boolean) };
+  });
+
+  const qualified = evaluated
+    .filter((c) => c.qualified)
+    // Rule 1 is the primary sort; profit and trade count break ties.
+    .sort(
+      (a, b) =>
+        b.winRatePct - a.winRatePct ||
+        (b.netProfitUsd ?? 0) - (a.netProfitUsd ?? 0) ||
+        b.lifetimeTrades - a.lifetimeTrades
+    )
+    .slice(0, rules.topN);
+
+  return { evaluated, qualified };
+}
+
+const money = (n) =>
+  n === null || n === undefined
+    ? '?'
+    : Math.abs(n) >= 1000
+      ? `${n < 0 ? '-' : '+'}$${Math.round(Math.abs(n) / 1000)}k`
+      : `${n < 0 ? '-' : '+'}$${Math.round(Math.abs(n))}`;
+
+/** Render the watchlist file in the format smart_money.mjs consumes. */
+export function buildWatchlist(qualified, { source, rules }) {
+  return {
+    _comment: [
+      'AUTO-GENERATED by auto_top_whales.mjs — manual edits are overwritten on',
+      'the next sync. Add hand-picked wallets to a separate file instead.',
+      '',
+      `Source: ${source}`,
+      `Generated: ${new Date().toISOString()}`,
+      `Rules applied (all three must pass): win rate >= ${rules.minWinRatePct}%,`,
+      `net profit >= $${rules.minNetProfitUsd.toLocaleString('en-US')}, lifetime trades >= ${rules.minLifetimeTrades}.`,
+      `Selected top ${rules.topN} by win rate, then profit, then trade count.`,
+    ],
+    generated: {
+      at: new Date().toISOString(),
+      source,
+      rules,
+      count: qualified.length,
+    },
+    wallets: qualified.map((w, i) => ({
+      address: w.address,
+      label: `Elite Whale #${i + 1} (${w.winRatePct.toFixed(0)}% WR | ${money(w.netProfitUsd)})`,
+      win_rate: `${w.winRatePct.toFixed(0)}%`,
+      trades: w.lifetimeTrades,
+      net_profit_usd: money(w.netProfitUsd),
+      solscan: `https://solscan.io/account/${w.address}`,
+      source: w.source ?? source,
+      stats_updated: new Date().toISOString().slice(0, 10),
+      metrics_basis: w.basis ?? 'unknown',
+      enabled: true,
+    })),
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * OBSERVE mode
+ * ------------------------------------------------------------------ */
+
+async function candidatesFromObservations(config) {
+  const store = await loadObservations(join(HERE, '.state', 'wallet_observations.json'));
+  const wallets = Object.entries(store.wallets);
+  if (!wallets.length) return { candidates: [], totalSeen: 0 };
+
+  // SOL/USD for profit estimation, taken from a live pair so it matches every
+  // other dollar figure the scanner reports.
+  const SOL_MINT = 'So11111111111111111111111111111111111111112';
+  let solUsd = 0;
+  try {
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${SOL_MINT}`);
+    const d = await r.json();
+    // priceUsd is always the BASE token's price. Pairs where SOL is the quote
+    // report the other token's price, so filtering on base is required — taking
+    // any pair yields nonsense like "SOL @ $0.01".
+    const solPairs = (d.pairs ?? [])
+      .filter((x) => x.baseToken?.address === SOL_MINT && Number(x.priceUsd) > 0)
+      .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
+    solUsd = solPairs.length ? Number(solPairs[0].priceUsd) : 0;
+  } catch {
+    /* profit estimation degrades to null without it */
+  }
+
+  // Ledger maturity. Failures take 1–6h to be graded while pumps register
+  // almost immediately, so a young ledger contains WINs and NEUTRALs but no
+  // FAILs — and every win rate computed from it is inflated toward 100%.
+  // Ranking on that would fabricate an elite list out of survivorship bias.
+  const allBuys = wallets.flatMap(([, e]) => e.buys);
+  const graded = allBuys.filter((b) => b.outcome && b.outcome !== 'NEUTRAL');
+  const fails = graded.filter((b) => b.outcome === 'FAIL').length;
+  const maturity = {
+    tokens: new Set(allBuys.map((b) => b.token)).size,
+    gradedBuys: graded.length,
+    fails,
+    mature: fails > 0,
+  };
+
+  const candidates = [];
+  for (const [address, entry] of wallets) {
+    const s = walletStats(entry, solUsd);
+    candidates.push({
+      address,
+      winRatePct: s.winRatePct,
+      netProfitUsd: s.estimatedProfitUsd,
+      gradedBuys: s.gradedBuys,
+      // Observed positions, not lifetime trades. Enriched below for wallets
+      // that clear the other two rules, because the enrichment costs an RPC
+      // call each and most candidates never get that far.
+      lifetimeTrades: s.gradedBuys,
+      observed: s,
+      source: 'aegis-observed',
+      basis: 'observed buys graded by post-mortem (not lifetime realized P&L)',
+    });
+  }
+  return { candidates, totalSeen: wallets.length, solUsd, maturity };
+}
+
+/** Count on-chain signatures as a lifetime-activity proxy for finalists. */
+async function enrichLifetimeTrades(candidates, rpcUrl) {
+  if (!rpcUrl) return;
+  for (const c of candidates) {
+    try {
+      const r = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getSignaturesForAddress',
+          params: [c.address, { limit: 1000 }],
+        }),
+        signal: AbortSignal.timeout(20000),
+      });
+      const j = await r.json();
+      if (Array.isArray(j.result)) {
+        c.lifetimeTrades = j.result.length;
+        c.basis += `; lifetime activity = ${j.result.length} signatures${j.result.length === 1000 ? ' (capped)' : ''}`;
+      }
+    } catch {
+      /* leave the observed count in place */
+    }
+    await new Promise((r) => setTimeout(r, 220));
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * IMPORT mode
+ * ------------------------------------------------------------------ */
+
+const NUM = (v) => {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(String(v).replace(/[$,%+\s]/g, '').replace(/k$/i, 'e3').replace(/m$/i, 'e6'));
+  return Number.isFinite(n) ? n : null;
+};
+
+/** Pick a field by any of several plausible header names. */
+const pick = (row, names) => {
+  for (const n of names) {
+    for (const key of Object.keys(row)) {
+      if (key.toLowerCase().replace(/[\s_-]/g, '') === n) return row[key];
+    }
+  }
+  return null;
+};
+
+function parseCsv(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  if (!lines.length) return [];
+  const headers = lines[0].split(',').map((h) => h.trim().replace(/^"|"$/g, ''));
+  return lines.slice(1).map((line) => {
+    const cells = line.match(/("([^"]|"")*"|[^,]*)/g)?.filter((_, i) => i % 2 === 0) ?? line.split(',');
+    const row = {};
+    headers.forEach((h, i) => {
+      row[h] = String(cells[i] ?? '').trim().replace(/^"|"$/g, '');
+    });
+    return row;
+  });
+}
+
+async function candidatesFromImport(path) {
+  const text = await readFile(path, 'utf8');
+  const rows =
+    extname(path).toLowerCase() === '.csv'
+      ? parseCsv(text)
+      : (() => {
+          const j = JSON.parse(text);
+          return Array.isArray(j) ? j : (j.wallets ?? j.data ?? j.results ?? []);
+        })();
+
+  return rows
+    .map((row) => ({
+      address: String(
+        pick(row, ['address', 'wallet', 'walletaddress', 'account', 'owner']) ?? ''
+      ).trim(),
+      winRatePct: NUM(pick(row, ['winrate', 'winratepct', 'wr', 'winrate%'])),
+      netProfitUsd: NUM(
+        pick(row, ['netprofit', 'netprofitusd', 'realizedpnl', 'pnl', 'profit', 'totalpnl'])
+      ),
+      lifetimeTrades: NUM(pick(row, ['trades', 'tradecount', 'totaltrades', 'txcount', 'swaps'])),
+      source: 'imported-leaderboard',
+      basis: `imported from ${path.split(/[\\/]/).pop()}`,
+    }))
+    .filter((c) => c.address);
+}
+
+/* ------------------------------------------------------------------ *
+ * Main
+ * ------------------------------------------------------------------ */
+
+export async function syncTopWhales({ importPath = null, dryRun = false, reportOnly = false } = {}) {
+  const config = JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'));
+
+  // Apply the same .env RPC override the scanner uses. Without this the
+  // enrichment step silently ran against the public RPC and got throttled
+  // mid-pass, so Rule 3 reported wildly different pass counts on identical
+  // data depending on how much rate limit was left.
+  const env = await loadEnv(join(HERE, '.env'));
+  if (env.rpcOverride) config.rpcUrl = env.rpcOverride;
+
+  const rules = { ...ELITE_RULES, ...(config.eliteWhales ?? {}) };
+
+  let candidates = [];
+  let source;
+  let totalSeen = 0;
+  let maturity = null;
+
+  if (importPath) {
+    candidates = await candidatesFromImport(resolve(importPath));
+    source = `import:${importPath}`;
+    totalSeen = candidates.length;
+    console.log(`📥 Imported ${candidates.length} candidate wallet(s) from ${importPath}`);
+  } else {
+    const obs = await candidatesFromObservations(config);
+    candidates = obs.candidates;
+    totalSeen = obs.totalSeen;
+    maturity = obs.maturity;
+    source = 'aegis-observed';
+    console.log(
+      `🔍 Observed ledger: ${totalSeen} wallet(s) seen buying scanned tokens` +
+        (obs.solUsd ? ` (SOL @ $${obs.solUsd.toFixed(2)})` : '')
+    );
+
+    if (maturity && !maturity.mature) {
+      console.log('');
+      console.log('🛑 LEDGER NOT YET MATURE — refusing to rank.');
+      console.log(
+        `   ${maturity.gradedBuys} graded buy(s) across ${maturity.tokens} token(s), but ZERO failures.`
+      );
+      console.log('   Losers take 1–6h to be graded while pumps register immediately, so a');
+      console.log('   young ledger contains only winners. Every win rate in it reads ~100%,');
+      console.log('   and ranking now would fabricate an elite list from survivorship bias.');
+      console.log('   Let the scanner run a few more hours; this clears itself.');
+      return { qualified: [], evaluated: [], written: false, maturity };
+    }
+  }
+
+  // Reject malformed addresses before they can occupy a slot.
+  const wellFormed = [];
+  let rejected = 0;
+  for (const c of candidates) {
+    if (validateWatchlistEntry(c).valid) wellFormed.push(c);
+    else rejected++;
+  }
+  if (rejected) console.log(`   ⚠️  ${rejected} candidate(s) rejected as invalid Solana addresses`);
+
+  // Enrich everything clearing Rule 1, and only Rule 1.
+  //
+  // Gating on Rule 2 as well was a bug: lifetimeTrades starts as the observed
+  // position count, so Rule 3 can only ever pass AFTER enrichment. Requiring
+  // Rule 2 first meant no candidate was enriched, and Rule 3 reported 0 passes
+  // regardless of the wallet's real history. Win rate is the cheap discriminator
+  // and is computed without any network call, so it is the right gate.
+  const shortlist = wellFormed.filter(
+    (c) => c.winRatePct !== null && c.winRatePct >= rules.minWinRatePct
+  );
+  if (!importPath && shortlist.length) {
+    console.log(`   ↳ enriching ${shortlist.length} shortlisted wallet(s) with on-chain activity…`);
+    await enrichLifetimeTrades(shortlist, config.rpcUrl);
+  }
+
+  const { evaluated, qualified } = applyEliteRules(wellFormed, rules);
+
+  // ---- reporting ---------------------------------------------------
+  const failing = { winRate: 0, netProfit: 0, trades: 0 };
+  for (const c of evaluated) {
+    if (!c.checks.winRate) failing.winRate++;
+    if (!c.checks.netProfit) failing.netProfit++;
+    if (!c.checks.trades) failing.trades++;
+  }
+
+  console.log('');
+  console.log(`📊 Composite Elite Ranking — ${evaluated.length} candidate(s) evaluated`);
+  console.log(`   Rule 1  win rate ≥ ${rules.minWinRatePct}%      → ${evaluated.length - failing.winRate} pass`);
+  console.log(
+    rules.profitRule === 'skip'
+      ? `   Rule 2  net profit          → SKIPPED (lifetime P&L is not observable; see config)`
+      : `   Rule 2  net profit ≥ $${rules.minNetProfitUsd.toLocaleString('en-US')} → ${evaluated.length - failing.netProfit} pass`
+  );
+  console.log(`   Rule 3  trades ≥ ${rules.minLifetimeTrades}         → ${evaluated.length - failing.trades} pass`);
+  console.log(`   ✅ passing all three: ${qualified.length} (writing top ${Math.min(qualified.length, rules.topN)})`);
+
+  for (const [i, w] of qualified.slice(0, 10).entries()) {
+    console.log(
+      `   ${String(i + 1).padStart(2)}. ${w.address}  ${w.winRatePct.toFixed(0)}% WR · ${money(w.netProfitUsd)} · ${w.lifetimeTrades} trades`
+    );
+  }
+
+  if (reportOnly) return { qualified, evaluated, written: false };
+
+  if (!qualified.length) {
+    console.log('');
+    console.log('⏭️  No wallet cleared all three rules — smart_wallets.json left untouched.');
+    console.log('   The rules are strict by design; an empty elite list is correct when');
+    console.log('   nothing has earned a place, and is safer than a padded one.');
+    if (!importPath) {
+      if (rules.profitRule !== 'skip' && failing.netProfit === evaluated.length) {
+        console.log('   Rule 2 rejected every candidate. That is expected in OBSERVE mode:');
+        console.log('   lifetime realized P&L cannot be derived from observation — Aegis sees');
+        console.log('   a wallet\'s buys only on tokens it scanned, and never its exits.');
+        console.log('   Either set eliteWhales.profitRule = "skip" to rank on win rate +');
+        console.log('   lifetime activity, or import a leaderboard that carries real P&L:');
+      } else {
+        console.log('   OBSERVE mode needs more graded history. To seed it now,');
+      }
+      console.log('     node auto_top_whales.mjs --import <file.csv>');
+    }
+    return { qualified, evaluated, written: false };
+  }
+
+  const watchlist = buildWatchlist(qualified, { source, rules });
+  if (!dryRun) {
+    await writeFile(
+      join(HERE, config.smartMoney.watchlistFile),
+      JSON.stringify(watchlist, null, 2),
+      'utf8'
+    );
+    console.log(`\n💾 Wrote ${qualified.length} elite wallet(s) to ${config.smartMoney.watchlistFile}`);
+  } else {
+    console.log('\n[DRY RUN] nothing written');
+  }
+
+  return { qualified, evaluated, written: !dryRun };
+}
+
+// CLI
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  const argv = process.argv.slice(2);
+  const i = argv.indexOf('--import');
+  await syncTopWhales({
+    importPath: i !== -1 ? argv[i + 1] : null,
+    dryRun: argv.includes('--dry-run'),
+    reportOnly: argv.includes('--report'),
+  });
+}

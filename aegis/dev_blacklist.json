@@ -154,6 +154,30 @@
       "reason": "Post-mortem: $Stacky fell -75.9% within 1.07h",
       "added": "2026-08-05",
       "source": "post-mortem"
+    },
+    {
+      "address": "FfSa1RqwJpyXjTrxg2tAsHfWakWt8yuhKyby2v19QkCf",
+      "reason": "Post-mortem: $KIDNEY fell -92.7% within 4.25h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "WLHv2UAZm6z4KyaaELi5pjdbJh6RESMva1Rnn8pJVVh",
+      "reason": "Post-mortem: $Inu fell -76.6% within 1.25h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "A5uuQh9ConjDHaQ1oeYtz57RxLgKKmusizFZevvHB9kk",
+      "reason": "Post-mortem: $SOLAURA fell -97.7% within 1.05h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "9mngmWWaZNwwymz3UEoFE8B3GTUwpSQXkmnTba8CF1KU",
+      "reason": "Post-mortem: $SPESH fell -74.4% within 1.05h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
     }
   ],
   "mints": [

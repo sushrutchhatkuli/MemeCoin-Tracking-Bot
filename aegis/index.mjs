@@ -18,6 +18,7 @@ import { dirname, join } from 'node:path';
 
 import { runScan, parseArgs } from './scan.mjs';
 import { runPostMortem, annotateNotes } from './post_mortem.mjs';
+import { syncTopWhales } from './auto_top_whales.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -25,6 +26,30 @@ const WATCH_DEFAULT_MINUTES = 12;
 
 function stamp() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
+}
+
+const WHALE_SYNC_MARKER = join(HERE, '.state', 'last_whale_sync.json');
+
+/** Run the elite-whale sync at most once per configured interval. */
+async function maybeSyncWhales() {
+  const config = JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'));
+  if (config.eliteWhales?.enabled === false) return;
+
+  const everyMs = (config.eliteWhales?.syncEveryHours ?? 24) * 3600 * 1000;
+  let last = 0;
+  try {
+    last = JSON.parse(await readFile(WHALE_SYNC_MARKER, 'utf8')).lastSyncAt ?? 0;
+  } catch {
+    /* never synced */
+  }
+
+  if (Date.now() - last < everyMs) return;
+
+  console.log(`\n🐋 Elite whale sync (every ${config.eliteWhales?.syncEveryHours ?? 24}h)…`);
+  await syncTopWhales({});
+  const { writeFile: wf, mkdir: mk } = await import('node:fs/promises');
+  await mk(dirname(WHALE_SYNC_MARKER), { recursive: true });
+  await wf(WHALE_SYNC_MARKER, JSON.stringify({ lastSyncAt: Date.now() }, null, 2), 'utf8');
 }
 
 async function once(args) {
@@ -48,6 +73,15 @@ async function once(args) {
         }
       } catch (err) {
         console.error(`⚠️  Post-mortem failed (scan results kept): ${err.message}`);
+      }
+
+      // Elite whale sync, rate-limited to once every 24h. Runs inside the
+      // ordinary 12-minute pass rather than as a separate scheduled task, so
+      // there is only one thing to schedule and it cannot drift out of sync.
+      try {
+        await maybeSyncWhales();
+      } catch (err) {
+        console.error(`⚠️  Whale sync failed (scan results kept): ${err.message}`);
       }
     }
 

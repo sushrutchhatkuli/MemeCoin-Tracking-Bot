@@ -48,6 +48,12 @@ import {
   buildDigest,
 } from './telegram.mjs';
 import { analyzeSocials, socialBadge } from './social_scanner.mjs';
+import {
+  loadObservations,
+  saveObservations,
+  recordBuys,
+  pruneObservations,
+} from './wallet_observations.mjs';
 import { loadBlacklist, checkBlacklist } from './blacklist.mjs';
 
 /**
@@ -158,7 +164,16 @@ function passesDepthFilter(demand, filters) {
   return null;
 }
 
-async function analyzeToken({ pair, config, state, watchlist, deployerCache, blacklist, now }) {
+async function analyzeToken({
+  pair,
+  config,
+  state,
+  watchlist,
+  deployerCache,
+  blacklist,
+  observations,
+  now,
+}) {
   const address = pair.baseToken.address;
   const key = `${pair.chainId}:${address.toLowerCase()}`;
 
@@ -188,12 +203,16 @@ async function analyzeToken({ pair, config, state, watchlist, deployerCache, bla
   // 25 RPC calls per token to answer a question nobody asked.
   let buyers = [];
   let buyerScan = null;
-  if (
+  // Replay runs when there is a watchlist to match against, OR when the elite
+  // tracker is building its own leaderboard — that ledger only grows if buyers
+  // are observed, so it must not depend on the watchlist already existing.
+  const wantBuyerReplay =
     config.smartMoney.enabled &&
     config.smartMoney.scanRecentBuyers &&
-    watchlist.count > 0 &&
-    pair.chainId === 'solana'
-  ) {
+    pair.chainId === 'solana' &&
+    (watchlist.count > 0 || config.eliteWhales?.observe !== false);
+
+  if (wantBuyerReplay) {
     buyerScan = await fetchRecentBuyers({
       rpcUrl: config.rpcUrl,
       poolAddress: pair.pairAddress,
@@ -201,6 +220,19 @@ async function analyzeToken({ pair, config, state, watchlist, deployerCache, bla
       cfg: config.smartMoney,
     });
     buyers = buyerScan.buyers ?? [];
+
+    // Feed the elite-whale ledger. These are real wallets that bought a token
+    // Aegis scanned; the post-mortem grades the outcome later.
+    if (observations && buyers.length) {
+      recordBuys(observations, {
+        buyers,
+        token: address,
+        chain: pair.chainId,
+        symbol: pair.baseToken.symbol,
+        marketCap: demand.marketCap,
+        now: now.getTime(),
+      });
+    }
   }
 
   const smartMoney = config.smartMoney.enabled
@@ -324,6 +356,8 @@ export async function runScan(args = {}) {
   const state = await loadState(statePath);
   const deployerCache = await loadDeployerCache(deployerCachePath);
   const alertLog = await loadAlertLog(alertLogPath);
+  const observationsPath = join(HERE, '.state', 'wallet_observations.json');
+  const observations = await loadObservations(observationsPath);
   const watchlist = await loadWatchlist(join(HERE, config.smartMoney.watchlistFile));
   const blacklist = await loadBlacklist(join(HERE, 'dev_blacklist.json'));
   console.log(
@@ -419,6 +453,7 @@ export async function runScan(args = {}) {
       watchlist,
       deployerCache,
       blacklist,
+      observations,
       now,
     });
     const { verdictInfo, audit, demand, deployer, smartMoney, social } = result;
@@ -515,6 +550,10 @@ export async function runScan(args = {}) {
   await saveState(statePath, state);
   await saveDeployerCache(deployerCachePath, deployerCache);
   await saveAlertLog(alertLogPath, alertLog);
+  pruneObservations(observations, now.getTime());
+  await saveObservations(observationsPath, observations);
+  const observedWallets = Object.keys(observations.wallets).length;
+  if (observedWallets) console.log(`🐋 Elite ledger: ${observedWallets} wallet(s) under observation`);
 
   // --- Report -------------------------------------------------------
   console.log(`\n📝 ${written.length} note(s) written to ${notesDir}`);

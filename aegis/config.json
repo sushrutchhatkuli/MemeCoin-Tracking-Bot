@@ -1,10 +1,13 @@
 {
   "vaultPath": "../Memecoin/Crypto finder",
   "notesFolder": "Signals",
-  "chains": ["solana", "base", "ethereum", "bsc"],
-
+  "chains": [
+    "solana",
+    "base",
+    "ethereum",
+    "bsc"
+  ],
   "rpcUrl": "https://api.mainnet-beta.solana.com",
-
   "filters": {
     "minLiquidityUsd": 4000,
     "minMarketCapUsd": 12000,
@@ -12,10 +15,9 @@
     "maxAgeHours": 96,
     "minTxns24h": 40
   },
-
   "thresholds": {
-    "buySignalDemandRatio": 2.0,
-    "crashSellRatio": 3.0,
+    "buySignalDemandRatio": 2,
+    "crashSellRatio": 3,
     "minLiqToMcapPct": 15,
     "maxTop10Pct": 25,
     "maxTop10PctYoung": 20,
@@ -27,12 +29,10 @@
     "minUniqueHolders": 150,
     "lowHolderScoreCap": 45
   },
-
   "social": {
     "bonusBothSocials": 10,
     "bonusOneSocial": 5
   },
-
   "_signalCategoryNote": [
     "Two holding styles. GEM requires every condition positively proven —",
     "an unknown age or holder count disqualifies it — because its advice is to",
@@ -63,7 +63,7 @@
       "minAgeHours": 12,
       "minHolders": 0,
       "scoreBoost": 10,
-      "label": "💎 STABLISHED GEM / ACCUMULATION",
+      "label": "💎 ESTABLISHED GEM / ACCUMULATION",
       "advice": "💎 Long-term accumulation setup — suitable for holding over days/weeks."
     },
     "scalp": {
@@ -74,7 +74,6 @@
       "advice": "⚡ Fast momentum trade — take initial profit at +50% to +100%!"
     }
   },
-
   "discovery": {
     "_note": [
       "DexScreener has no trending endpoint (403/404 on every variant). The",
@@ -83,10 +82,17 @@
       "Measured yield per query into the $300k-$8M band: solana=13, SOL=4,",
       "dog=2, pump/cat/AI/trump=1 each, meme/moon/WIF=0."
     ],
-    "searchQueries": ["solana", "SOL", "dog", "trump", "pump", "cat", "AI"],
+    "searchQueries": [
+      "solana",
+      "SOL",
+      "dog",
+      "trump",
+      "pump",
+      "cat",
+      "AI"
+    ],
     "searchMinMarketCapUsd": 300000
   },
-
   "postMortem": {
     "enabled": true,
     "minAgeHours": 1,
@@ -95,7 +101,6 @@
     "rugMcapFloorUsd": 5000,
     "winGainPct": 100
   },
-
   "deployer": {
     "enabled": true,
     "deployerScanSignatures": 40,
@@ -111,7 +116,6 @@
     "deployerBurstWindowSec": 600,
     "rpcDelayMs": 220
   },
-
   "smartMoney": {
     "enabled": true,
     "watchlistFile": "smart_wallets.json",
@@ -124,7 +128,26 @@
     "rpcBackoffMs": 700,
     "rpcDelayMs": 220
   },
-
+  "eliteWhales": {
+    "_note": [
+      "Composite Elite Ranking. All three rules must pass — they are AND, not a",
+      "weighted blend, so a small-sample 100% win rate cannot buy a place.",
+      "",
+      "No provider serves the ranking data: GMGN 403s behind Cloudflare, Birdeye",
+      "and Dune 401 without a paid key, Cielo's public feed is empty, Solscan",
+      "refuses connections. So the list is EARNED from Aegis's own observations",
+      "(buyer replay + post-mortem grading) rather than fetched. Seed it instantly",
+      "with:  node auto_top_whales.mjs --import <leaderboard.csv>"
+    ],
+    "enabled": true,
+    "observe": true,
+    "syncEveryHours": 24,
+    "minWinRatePct": 75,
+    "minNetProfitUsd": 50000,
+    "minLifetimeTrades": 100,
+    "topN": 50,
+    "profitRule": "strict"
+  },
   "telegram": {
     "enabled": true,
     "minScore": 80,
@@ -132,12 +155,9 @@
     "sendScanDigest": true,
     "requireLiveReaudit": false
   },
-
   "writeNotes": true,
-
   "tradeLinkTemplate": "https://fomo.family/tokens/{chain}/{address}",
   "tradeLinkLabel": "Trade on FOMO App",
-
   "requestDelayMs": 350,
   "maxTokensPerScan": 40
 }
