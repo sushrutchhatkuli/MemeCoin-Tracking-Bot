@@ -178,11 +178,50 @@ async function candidatesFromObservations(config) {
   const allBuys = wallets.flatMap(([, e]) => e.buys);
   const graded = allBuys.filter((b) => b.outcome && b.outcome !== 'NEUTRAL');
   const fails = graded.filter((b) => b.outcome === 'FAIL').length;
+  const observedFailRate = graded.length ? (fails / graded.length) * 100 : 0;
+
+  // Distinct tokens decided, and their failure rate. This is the honest view:
+  // the buy-weighted rate is dominated by whichever surviving token happened to
+  // attract the most buyers, so a single popular winner can drag it to ~1%.
+  const byToken = new Map();
+  for (const b of allBuys) {
+    if (b.outcome && b.outcome !== 'NEUTRAL' && !byToken.has(b.token)) {
+      byToken.set(b.token, b.outcome);
+    }
+  }
+  const tokenFails = [...byToken.values()].filter((v) => v === 'FAIL').length;
+  const tokenFailRate = byToken.size ? (tokenFails / byToken.size) * 100 : 0;
+
+  // Compare against the failure rate the post-mortem measures across ALL
+  // scanned tokens. If the ledger's population is far cleaner than reality, it
+  // is not a representative sample and any win rate drawn from it is inflated.
+  let baseFailRate = null;
+  try {
+    const h = JSON.parse(await readFile(join(HERE, 'learning_history.json'), 'utf8'));
+    const counts = (h.outcomes ?? []).reduce((a, x) => {
+      a[x.verdict] = (a[x.verdict] ?? 0) + 1;
+      return a;
+    }, {});
+    const decided = (counts.FAIL ?? 0) + (counts.WIN ?? 0);
+    if (decided >= 50) baseFailRate = ((counts.FAIL ?? 0) / decided) * 100;
+  } catch {
+    /* no history yet — fall back to the weak check below */
+  }
+
+  const minShare = config.eliteWhales?.minRepresentativeness ?? 0.5;
+  const required = baseFailRate === null ? null : baseFailRate * minShare;
+  const representative = required === null ? fails > 0 : tokenFailRate >= required;
+
   const maturity = {
     tokens: new Set(allBuys.map((b) => b.token)).size,
+    decidedTokens: byToken.size,
     gradedBuys: graded.length,
     fails,
-    mature: fails > 0,
+    observedFailRate,
+    tokenFailRate,
+    baseFailRate,
+    required,
+    mature: fails > 0 && representative,
   };
 
   const candidates = [];
@@ -332,14 +371,29 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
 
     if (maturity && !maturity.mature) {
       console.log('');
-      console.log('🛑 LEDGER NOT YET MATURE — refusing to rank.');
+      console.log('🛑 LEDGER NOT REPRESENTATIVE — refusing to rank.');
       console.log(
-        `   ${maturity.gradedBuys} graded buy(s) across ${maturity.tokens} token(s), but ZERO failures.`
+        `   ${maturity.gradedBuys} graded buy(s) across ${maturity.tokens} token(s); ` +
+          `${maturity.decidedTokens} token(s) decided.`
       );
-      console.log('   Losers take 1–6h to be graded while pumps register immediately, so a');
-      console.log('   young ledger contains only winners. Every win rate in it reads ~100%,');
-      console.log('   and ranking now would fabricate an elite list from survivorship bias.');
-      console.log('   Let the scanner run a few more hours; this clears itself.');
+      console.log(
+        `   Ledger failure rate : ${maturity.tokenFailRate.toFixed(1)}% by token, ` +
+          `${maturity.observedFailRate.toFixed(1)}% by buy`
+      );
+      if (maturity.baseFailRate !== null) {
+        console.log(
+          `   Post-mortem reality : ${maturity.baseFailRate.toFixed(1)}% across all scanned tokens ` +
+            `(need ≥ ${maturity.required.toFixed(1)}%)`
+        );
+        console.log('');
+        console.log('   The ledger is far cleaner than the market it samples, so win rates');
+        console.log('   drawn from it are inflated. Buyer replay only reads tokens with a live');
+        console.log('   pool, and one popular survivor can supply most of the graded buys —');
+        console.log('   a wallet that touched it once then reads as 100%.');
+      } else {
+        console.log('   No graded failures yet; losers take 1–6h while pumps register at once.');
+      }
+      console.log('   Ranking stays blocked until the sample looks like the market.');
       return { qualified: [], evaluated: [], written: false, maturity };
     }
   }

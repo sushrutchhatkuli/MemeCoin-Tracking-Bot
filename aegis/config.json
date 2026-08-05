@@ -151,7 +151,9 @@
     "minNetProfitUsd": 50000,
     "minLifetimeTrades": 100,
     "topN": 50,
-    "profitRule": "strict"
+    "profitRule": "strict",
+    "minGradedBuys": 10,
+    "minRepresentativeness": 0.5
   },
   "telegram": {
     "enabled": true,

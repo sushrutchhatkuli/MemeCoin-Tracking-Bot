@@ -184,6 +184,24 @@
       "reason": "Post-mortem: $longcat fell -86.8% within 1.05h",
       "added": "2026-08-05",
       "source": "post-mortem"
+    },
+    {
+      "address": "4Y5kP4tjiZJwhHwCbDBuKQeZpj58sRBksHuRKxf7Kt9y",
+      "reason": "Post-mortem: $2x6CAT fell -98.4% within 2.85h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "7jTcuL2JhDjqE7FRuc3x273cMENAiCmZmX5V867Rcuqn",
+      "reason": "Post-mortem: $Dinger fell -100% within 3.45h (pair delisted)",
+      "added": "2026-08-05",
+      "source": "post-mortem"
+    },
+    {
+      "address": "kjcByyimgefWuVutf9e7VK1dsJM9AYoa4EYRHy67dDu",
+      "reason": "Post-mortem: $APE fell -66.5% within 1.05h",
+      "added": "2026-08-05",
+      "source": "post-mortem"
     }
   ],
   "mints": [
