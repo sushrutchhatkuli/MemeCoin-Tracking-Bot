@@ -12,6 +12,84 @@ tags:
 
 ---
 
+## 🕵️ Table A — Active Insider & Inner-Circle Signals
+
+Tokens where cluster/insider activity was detected **and** every safety gate passed.
+
+```dataview
+TABLE WITHOUT ID
+  file.link AS "Token",
+  market_cap AS "MC at Scan",
+  insider_label AS "Insider Label",
+  insider_action AS "Action (Spend / MC / Timing)",
+  funder_network AS "Funder Network",
+  solscan_wallet_link AS "Whale Solscan",
+  fomo_app_link AS "FOMO Trade"
+FROM "Signals"
+WHERE insider_detected = true AND security_status = "PASSED ✅"
+SORT date DESC
+LIMIT 30
+```
+
+> [!note] What "insider" means here
+> Equities insiders are named in mandatory filings. On-chain there is no
+> registry, so this infers coordination from behaviour: several tracked or
+> co-funded wallets buying within 60 seconds, or a single buy too large for the
+> pool. **Coordination is not proof of inside knowledge** — a shared funder is
+> frequently just an exchange hot wallet that thousands of unrelated users
+> withdraw from.
+
+---
+
+## 🛡️ Table B — Anti-Rugpull Shield: Blocked Tokens
+
+Everything the security gate stopped, including tokens insiders were buying.
+
+```dataview
+TABLE WITHOUT ID
+  file.link AS "Token",
+  market_cap AS "Market Cap",
+  insider_detected AS "Insiders Bought?",
+  top_10_holder_pct AS "Top 10",
+  unique_holders AS "Holders",
+  dev_wallet_address AS "Deployer Wallet"
+FROM "Signals"
+WHERE security_status = "FAILED ❌"
+SORT date DESC
+LIMIT 30
+```
+
+> [!warning] Insider activity never overrides a failed audit
+> `insider_detected` can read `true` in this table. That is the point: a cabal
+> buying its own rug is the exact pattern the shield exists to stop. These are
+> scored 0 and their alerts are blocked.
+
+---
+
+## 🐋 Table C — Tracked Insider Wallet Directory
+
+Wallets currently in `smart_wallets.json`, with their observed record.
+
+```dataview
+TABLE WITHOUT ID
+  insider_label AS "Label",
+  insider_wallet AS "Wallet",
+  solscan_wallet_link AS "Solscan",
+  count(rows) AS "Signals Seen"
+FROM "Signals"
+WHERE insider_detected = true AND insider_wallet != ""
+GROUP BY insider_wallet
+SORT count(rows) DESC
+LIMIT 25
+```
+
+> [!info] Source of truth is the JSON, not the vault
+> The authoritative directory is `aegis/smart_wallets.json` — it carries win
+> rate, graded sample size and Solscan links. This table shows which of those
+> wallets have actually turned up in scans.
+
+---
+
 ## 💎 Long-Term Investment Watchlist
 
 Market cap ≥ $1M, liquidity ≥ $100k, age ≥ 24h (confirmed), holders ≥ 1,000.

@@ -97,6 +97,34 @@ function extraTags(smartMoney, deployer, verdictInfo, social) {
   return tags;
 }
 
+/**
+ * One-line insider action for the dashboard table: spend, entry market cap and
+ * timing for the lead wallet. Empty when nothing was attributable, rather than
+ * emitting a half-filled string that reads as data.
+ */
+function insiderActionSummary(clusters) {
+  const lead = clusters?.clusterBuying?.members?.[0] ?? clusters?.watchlisted?.[0];
+  if (!lead) return '';
+
+  const parts = [];
+  if (lead.solSpent !== null && lead.solSpent !== undefined) {
+    parts.push(
+      `${lead.solSpent.toFixed(2)} SOL${lead.usdSpent ? ` ($${Math.round(lead.usdSpent).toLocaleString('en-US')})` : ''}`
+    );
+  }
+  if (lead.entryMarketCapUsd) {
+    parts.push(`at $${Math.round(lead.entryMarketCapUsd).toLocaleString('en-US')} MC`);
+  }
+  if (lead.secondsAfterLaunch !== null && lead.secondsAfterLaunch !== undefined) {
+    parts.push(
+      lead.secondsAfterLaunch < 60
+        ? `${Math.round(lead.secondsAfterLaunch)}s after launch`
+        : `${Math.round(lead.secondsAfterLaunch / 60)}m after launch`
+    );
+  }
+  return parts.join(' · ');
+}
+
 /** Tri-state: true = passed, false = failed, null = provider had no data. */
 function checkRow(check) {
   const box = check.passed === true ? '- [x]' : '- [ ]';
@@ -124,6 +152,7 @@ export function renderNote({
   blacklistHit,
   signalCategory,
   migration,
+  clusters,
   tradeLink,
   now,
 }) {
@@ -165,6 +194,20 @@ export function renderNote({
     `security_status: ${yamlStr(SECURITY_LABEL[audit.status])}`,
     `top_10_holder_pct: ${yamlStr(security?.ok ? pctStr(security.top10Pct) : 'Unknown')}`,
     `signal_category: ${yamlStr(signalCategory?.category ?? 'UNCLASSIFIED')}`,
+    `insider_detected: ${clusters?.detected ? 'true' : 'false'}`,
+    `insider_label: ${yamlStr(clusters?.label ?? '')}`,
+    `insider_cluster_size: ${clusters?.clusterBuying?.size ?? 0}`,
+    `insider_wallet: ${yamlStr(clusters?.clusterBuying?.members?.[0]?.wallet ?? clusters?.watchlisted?.[0]?.wallet ?? '')}`,
+    `insider_action: ${yamlStr(insiderActionSummary(clusters))}`,
+    `funder_network: ${yamlStr(
+      clusters?.networks?.[0]
+        ? `${clusters.networks[0].size} wallets via ${clusters.networks[0].funderShort}`
+        : ''
+    )}`,
+    `solscan_wallet_link: ${yamlStr(clusters?.clusterBuying?.members?.[0]?.solscan ?? clusters?.watchlisted?.[0]?.solscan ?? '')}`,
+    `unique_holders: ${security?.totalHolders ?? 0}`,
+    `dexscreener_link: ${yamlStr(dexUrl)}`,
+    `fomo_app_link: ${yamlStr(fomoUrl)}`,
     `migration_status: ${yamlStr(migration?.state ?? 'UNKNOWN')}`,
     `tradeable_now: ${migration?.tradeable === false ? 'false' : 'true'}`,
     `trade_advice: ${yamlStr(signalCategory?.advice ?? '')}`,

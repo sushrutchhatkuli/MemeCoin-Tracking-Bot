@@ -49,6 +49,7 @@ import {
 } from './telegram.mjs';
 import { analyzeSocials, socialBadge } from './social_scanner.mjs';
 import { migrationStatus, MIGRATION } from './migration.mjs';
+import { detectInsiderClusters, clusterScoreBonus } from './insider_cluster.mjs';
 import {
   loadObservations,
   saveObservations,
@@ -173,6 +174,7 @@ async function analyzeToken({
   deployerCache,
   blacklist,
   observations,
+  funderCache,
   now,
 }) {
   const address = pair.baseToken.address;
@@ -282,6 +284,30 @@ async function analyzeToken({
   const signalCategory = classifySignal({ demand, security, config });
   const migration = migrationStatus(pair, security, config);
 
+  // Cluster analysis needs the replayed buyers and a SOL price consistent with
+  // every other dollar figure in the report.
+  const solUsd =
+    Number(pair.priceUsd) > 0 && Number(pair.priceNative) > 0 &&
+    (pair.quoteToken?.symbol === 'SOL' || pair.quoteToken?.symbol === 'WSOL')
+      ? Number(pair.priceUsd) / Number(pair.priceNative)
+      : null;
+
+  const clusters =
+    config.insiderCluster?.enabled !== false && pair.chainId === 'solana' && buyers.length
+      ? await detectInsiderClusters({
+          buyers,
+          watchlist,
+          pairCreatedAt: pair.pairCreatedAt ?? null,
+          liquidityUsd: demand.liquidityUsd,
+          solUsd,
+          config,
+          rpcUrl: config.rpcUrl,
+          funderCache,
+        })
+      : { detected: false, label: null, clusterBuying: null, oversized: [], networks: [], watchlisted: [] };
+
+  if (clusters?.detected) clusters.scoreBonus = clusterScoreBonus(clusters, config);
+
   const catalysts = detectCatalysts(pair, security, demand, velocity, config.thresholds, {
     smartMoney,
     deployer,
@@ -301,6 +327,7 @@ async function analyzeToken({
     social,
     blacklistHit,
     signalCategory,
+    clusters,
   });
 
   return {
@@ -316,6 +343,7 @@ async function analyzeToken({
     blacklistHit,
     signalCategory,
     migration,
+    clusters,
   };
 }
 
@@ -334,6 +362,7 @@ async function writeNote({ pair, result, notesDir, config, now }) {
     blacklistHit: result.blacklistHit,
     signalCategory: result.signalCategory,
     migration: result.migration,
+    clusters: result.clusters,
     tradeLink: { template: config.tradeLinkTemplate, label: config.tradeLinkLabel },
     now,
   });
@@ -362,6 +391,9 @@ export async function runScan(args = {}) {
   const alertLog = await loadAlertLog(alertLogPath);
   const observationsPath = join(HERE, '.state', 'wallet_observations.json');
   const observations = await loadObservations(observationsPath);
+  const funderCachePath = join(HERE, '.state', 'funder_cache.json');
+  let funderCache = {};
+  try { funderCache = JSON.parse(await readFile(funderCachePath, 'utf8')); } catch { /* first run */ }
   const watchlist = await loadWatchlist(join(HERE, config.smartMoney.watchlistFile));
   const blacklist = await loadBlacklist(join(HERE, 'dev_blacklist.json'));
   console.log(
@@ -458,6 +490,7 @@ export async function runScan(args = {}) {
       deployerCache,
       blacklist,
       observations,
+      funderCache,
       now,
     });
     const { verdictInfo, audit, demand, deployer, smartMoney, social } = result;
@@ -556,6 +589,7 @@ export async function runScan(args = {}) {
   await saveAlertLog(alertLogPath, alertLog);
   pruneObservations(observations, now.getTime());
   await saveObservations(observationsPath, observations);
+  await writeFile(funderCachePath, JSON.stringify(funderCache, null, 2), 'utf8');
   const observedWallets = Object.keys(observations.wallets).length;
   if (observedWallets) console.log(`🐋 Elite ledger: ${observedWallets} wallet(s) under observation`);
 

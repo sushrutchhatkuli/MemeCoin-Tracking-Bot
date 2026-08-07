@@ -19,7 +19,7 @@
     "buySignalDemandRatio": 2,
     "crashSellRatio": 3,
     "minLiqToMcapPct": 15,
-    "maxTop10Pct": 25,
+    "maxTop10Pct": 20,
     "maxTop10PctYoung": 20,
     "youngTokenHours": 2,
     "minLpLockedPct": 99,
@@ -74,6 +74,39 @@
       "advice": "⚡ Fast momentum trade — take initial profit at +50% to +100%!"
     }
   },
+  "insiderCluster": {
+    "_note": [
+      "Three pillars, adapted from the equities cluster-buying idea. The",
+      "adaptation is weaker by nature: equities insiders are named in mandatory",
+      "filings, on-chain ones are inferred from behaviour.",
+      "",
+      "PILLAR 1 cluster   — 2+ tracked or co-funded wallets buying inside the",
+      "                     launch window. One buyer is noise; several together",
+      "                     within seconds is coordination.",
+      "PILLAR 2 sizing    — a single buy over 5 SOL or over 5% of the pool.",
+      "                     Size cannot be faked.",
+      "PILLAR 3 funder    — wallets whose FIRST funding shares a source. Verified",
+      "                     working against Helius: a fresh wallet's earliest",
+      "                     transaction reveals both funder and amount.",
+      "",
+      "LIMITS: funder tracing only reaches wallets with <1000 lifetime",
+      "signatures (RPC page limit), which excludes established traders — fine,",
+      "since cabal wallets are purpose-made and fresh. A shared funder is often",
+      "just a CEX hot wallet, so it is reported but scored only lightly and",
+      "never treated as proof of insider knowledge."
+    ],
+    "enabled": true,
+    "clusterWindowSeconds": 60,
+    "minClusterWallets": 2,
+    "unusualBuySol": 5,
+    "unusualBuyLpPct": 5,
+    "traceTopBuyers": 8,
+    "bonusCluster": 10,
+    "bonusFunderNetwork": 8,
+    "bonusOversized": 5,
+    "bonusCap": 20
+  },
+
   "discovery": {
     "_note": [
       "DexScreener has no trending endpoint (403/404 on every variant). The",

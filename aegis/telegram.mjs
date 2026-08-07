@@ -103,6 +103,61 @@ const usdShort = (n) => {
   return `$${Math.round(n)}`;
 };
 
+/**
+ * Insider cluster block. Only ever reached on a token that cleared every safety
+ * gate — coordinated buying of a rug is still a rug, so this never appears on a
+ * blocked token.
+ */
+function renderClusters(clusters) {
+  if (!clusters?.detected) return [];
+
+  const lines = ['', '🕵️ <b>CLUSTER &amp; INSIDER ACTIVITY:</b>'];
+
+  const bits = [];
+  if (clusters.clusterBuying) bits.push(`${clusters.clusterBuying.size} wallets in launch window`);
+  if (clusters.networks.length) bits.push('same funder network');
+  if (clusters.oversized.length) bits.push(`${clusters.oversized.length} oversized buy(s)`);
+  lines.push(`• Cluster Detected: ${esc(bits.join(' + '))} ✅`);
+
+  // Individual wallets, largest first.
+  const members = (
+    clusters.clusterBuying?.members ?? clusters.watchlisted ?? []
+  ).slice(0, 5);
+  members.forEach((m, i) => {
+    const spend =
+      m.solSpent !== null && m.solSpent !== undefined
+        ? `Spent ${m.solSpent.toFixed(2)} SOL${m.usdSpent ? ` (${usdShort(m.usdSpent)})` : ''}`
+        : 'Spend not attributable';
+    const mc = m.entryMarketCapUsd ? ` at ${usdShort(m.entryMarketCapUsd)} MC` : '';
+    const timing =
+      m.secondsAfterLaunch !== null && m.secondsAfterLaunch !== undefined
+        ? ` (${m.secondsAfterLaunch < 60 ? `${Math.round(m.secondsAfterLaunch)}s` : `${Math.round(m.secondsAfterLaunch / 60)}m`} after launch)`
+        : '';
+    lines.push(
+      `• Wallet ${i + 1}: <a href="${esc(m.solscan)}">${esc(m.short)}</a>` +
+        `${m.label ? ` (${esc(m.label)})` : ''} — ${esc(spend + mc + timing)}`
+    );
+  });
+
+  for (const n of clusters.networks.slice(0, 2)) {
+    lines.push(
+      `• Funder Link: ${n.size} wallets funded by <a href="${esc(n.funderSolscan)}">${esc(n.funderShort)}</a>`
+    );
+  }
+
+  for (const o of clusters.oversized.slice(0, 2)) {
+    lines.push(`• ⚠️ Non-routine size: ${esc(o.short)} — ${esc(o.reason)}`);
+  }
+
+  // Stated every time. A shared funder is frequently just a CEX hot wallet, and
+  // coordination is not proof of inside knowledge.
+  lines.push(
+    '<i>Coordination signal, not proof of insider knowledge — shared funders are often exchange hot wallets.</i>'
+  );
+
+  return lines;
+}
+
 /** Whale detail block — only ever reached on a token that passed every gate. */
 function renderWhales(smartMoney) {
   if (!smartMoney?.detected) return [];
@@ -150,7 +205,7 @@ function renderWhales(smartMoney) {
   return lines;
 }
 
-export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration }) {
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters }) {
   const symbol = pair.baseToken?.symbol ?? 'UNKNOWN';
   const address = pair.baseToken.address;
   const usd = (n) =>
@@ -177,7 +232,9 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
   return [
     // Signal type leads, because it determines how the trade should be held —
     // that decision matters more than the score.
-    signalCategory?.category === 'LONG-TERM GEM'
+    clusters?.detected
+      ? '🚀 <b>INSIDER CLUSTER ALERT</b> 🚀'
+      : signalCategory?.category === 'LONG-TERM GEM'
       ? '💎 <b>LONG-TERM INVESTMENT GEM SIGNAL</b> 💎'
       : signalCategory?.category === 'FAST SCALP'
         ? '⚡ <b>FAST MOMENTUM SCALP SIGNAL</b> ⚡'
@@ -185,13 +242,14 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
           ? '🚀 <b>HIGH PROBABILITY SIGNAL</b> 🚀'
           : '🚀 <b>BUY SIGNAL</b> 🚀',
     `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
-    `<i>Confidence ${verdictInfo.score}/100</i>`,
+    `<i>Score ${verdictInfo.score}/100</i>${clusters?.label ? ` | <b>${esc(clusters.label)}</b>` : ''}`,
     // Placed above the advice: if the buy button is locked, the trading advice
     // is not actionable yet and the reader needs to know that first.
     ...(migration?.label
       ? ['', `<b>${esc(migration.label)}</b>`, `<i>${esc(migration.detail)}</i>`]
       : []),
     ...(signalCategory?.advice ? ['', `<b>${esc(signalCategory.advice)}</b>`] : []),
+    ...renderClusters(clusters),
     ...renderWhales(smartMoney),
     '',
     '🔒 <b>SAFETY &amp; DENSITY AUDIT:</b>',
@@ -431,6 +489,7 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     reaudit,
     signalCategory: result.signalCategory,
     migration: result.migration,
+    clusters: result.clusters,
   });
 
   const sent = await sendTelegram({ ...credentials, text });

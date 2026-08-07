@@ -34,11 +34,16 @@ const ratio = (a, b) => (b > 0 ? a / b : a > 0 ? Infinity : 0);
  */
 export function concentrationCapFor(ageHours, thresholds) {
   const strict = thresholds.maxTop10PctYoung ?? 20;
-  const standard = thresholds.maxTop10Pct ?? 25;
-  const youngHours = thresholds.youngTokenHours ?? 2;
+  const standard = thresholds.maxTop10Pct ?? 20;
 
+  // A single flat cap by default. The age-tiered variant is retained only for
+  // configs that still set a looser `maxTop10Pct`, and even then the strict cap
+  // applies whenever age cannot be proven.
+  if (strict === standard) return { cap: strict, tier: 'all tokens' };
+
+  const youngHours = thresholds.youngTokenHours ?? 2;
   if (ageHours === null || ageHours === undefined) {
-    return { cap: strict, tier: 'young (age unknown — strict cap applied)' };
+    return { cap: strict, tier: 'age unknown — strict cap applied' };
   }
   return ageHours < youngHours
     ? { cap: strict, tier: `young (<${youngHours}h)` }
@@ -444,6 +449,7 @@ export function scoreToken({
   social,
   blacklistHit,
   signalCategory,
+  clusters,
 }) {
   // Demand — 30 pts
   const demandScore =
@@ -498,6 +504,10 @@ export function scoreToken({
   // safety failure like every other bonus.
   const categoryBonus = safetyGateFailed ? 0 : (signalCategory?.scoreBoost ?? 0);
 
+  // Insider-cluster bonus. Forfeited on a safety failure like every other
+  // bonus: coordinated buying of a rug is still a rug.
+  const clusterBonus = safetyGateFailed ? 0 : (clusters?.scoreBonus ?? 0);
+
   let score = Math.round(
     demandScore +
       depthScore +
@@ -506,7 +516,8 @@ export function scoreToken({
       tractionScore +
       smartBonus +
       socialBonus +
-      categoryBonus
+      categoryBonus +
+      clusterBonus
   );
   score -= catalysts.bearish.length * 4;
   score = clamp(score, 0, 100);
@@ -617,6 +628,7 @@ export function scoreToken({
       smartMoney: smartBonus,
       social: socialBonus,
       category: categoryBonus,
+      insiderCluster: clusterBonus,
       bearishPenalty: catalysts.bearish.length * 4,
     },
   };
