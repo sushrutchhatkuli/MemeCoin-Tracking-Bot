@@ -56,3 +56,5 @@ desktop.ini
 
 # Stray files from malformed shell args
 *gmail.com*
+*.log.*
+loop.log*
