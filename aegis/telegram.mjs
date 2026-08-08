@@ -221,10 +221,36 @@ function renderClusters(clusters) {
     lines.push(`• ⚠️ Non-routine size: ${esc(o.short)} — ${esc(o.reason)}`);
   }
 
+  // Named cluster, when network discovery corroborated the funder graph.
+  const net = clusters.network;
+  if (net?.clusters?.length) {
+    const c = net.clusters[0];
+    lines.push(
+      `• Network: Cabal Cluster of ${c.size} wallets (${esc(c.confidence)} confidence, funder-graph verified)`
+    );
+    if (net.added?.length) {
+      lines.push(`• Net expanded: +${net.added.length} connected wallet(s) now tracked`);
+    }
+  }
+
+  // Direct profile links for the lead wallet. Three destinations because each
+  // shows something different: Solscan for raw transactions, GMGN for trader
+  // stats, Birdeye for portfolio analytics. Aegis cannot read the latter two
+  // (403/401), so these are how you check win rate and PnL yourself.
+  const lead = members[0];
+  if (lead?.wallet) {
+    lines.push('');
+    lines.push('🔗 <b>DIRECT INSIDER WALLET LINKS:</b>');
+    lines.push(`• 🔍 <a href="https://solscan.io/account/${esc(lead.wallet)}">Solscan Wallet</a>`);
+    lines.push(`• 🤖 <a href="https://gmgn.ai/sol/address/${esc(lead.wallet)}">GMGN Trader Profile</a>`);
+    lines.push(`• 🦅 <a href="https://birdeye.so/profile/${esc(lead.wallet)}">Birdeye Analytics</a>`);
+  }
+
   // Stated every time. A shared funder is frequently just a CEX hot wallet, and
   // coordination is not proof of inside knowledge.
+  lines.push('');
   lines.push(
-    '<i>Coordination signal, not proof of insider knowledge — shared funders are often exchange hot wallets.</i>'
+    '<i>Coordination signal, not proof of insider knowledge — shared funders are often exchange hot wallets. Win rate and PnL are not fetched (GMGN/Birdeye are gated); tap the links above to check them.</i>'
   );
 
   return lines;

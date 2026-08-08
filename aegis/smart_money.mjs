@@ -47,10 +47,27 @@ export function validateWatchlistEntry(entry) {
   return { valid: true };
 }
 
-export async function loadWatchlist(path) {
+/**
+ * Load the watchlist, merging any auto-discovered wallets.
+ *
+ * `extraPaths` exists because auto_top_whales.mjs rewrites the primary file
+ * wholesale every two hours. Anything appended there by network discovery would
+ * be erased on the next sync, so discoveries live in their own file and are
+ * merged at read time. Curated entries win on a duplicate address.
+ */
+export async function loadWatchlist(path, extraPaths = []) {
   try {
     const raw = JSON.parse(await readFile(path, 'utf8'));
     const entries = Array.isArray(raw) ? raw : (raw.wallets ?? []);
+
+    for (const extra of extraPaths) {
+      try {
+        const more = JSON.parse(await readFile(extra, 'utf8'));
+        entries.push(...(more.wallets ?? []));
+      } catch {
+        /* discovered file may not exist yet */
+      }
+    }
 
     const candidates = entries
       .map((e) => (typeof e === 'string' ? { address: e } : e))
@@ -72,6 +89,9 @@ export async function loadWatchlist(path) {
 
     const index = new Map();
     for (const w of normalised) {
+      // First writer wins: the primary file is read before extras, so a
+      // curated entry is never replaced by an auto-discovered duplicate.
+      if (index.has(w.address)) continue;
       index.set(w.address, {
         address: w.address,
         label: w.label ?? 'unlabelled',

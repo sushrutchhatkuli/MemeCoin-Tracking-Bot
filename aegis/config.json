@@ -226,6 +226,34 @@
       "routine noise. Set insiderOnly=false to restore the previous behaviour."
     ]
   },
+  "networkDiscovery": {
+    "_note": [
+      "What each named source actually contributes:",
+      "  Solscan  — API is key-gated, so origin tracing runs against Solana RPC",
+      "             directly (same data, no key). Solscan is used for links.",
+      "  Bubblemaps — no public API. Its graph is reproducible from chain:",
+      "             wallets sharing a funding origin. That is computed here.",
+      "  GMGN     — 403 Cloudflare. Win rate / PnL / trade count CANNOT be",
+      "  Birdeye  — 401 without a paid key.      fetched. Verified repeatedly.",
+      "",
+      "So discovered wallets carry deep links to GMGN and Birdeye rather than",
+      "fabricated stats. Tap through for the numbers.",
+      "",
+      "EXPANSION SAFETY — maxFunderDegree is the important one. A CEX hot wallet",
+      "funds thousands of unrelated users; without this guard the net would",
+      "enrol half of Solana in a day and every token would 'match smart money'.",
+      "Expansion also only proceeds from a cluster already containing a tracked",
+      "wallet, and results go to discovered_wallets.json — NOT smart_wallets.json,",
+      "which auto_top_whales.mjs rewrites wholesale every 2h and would erase."
+    ],
+    "enabled": true,
+    "traceTopBuyers": 10,
+    "maxFunderDegree": 6,
+    "maxAddedPerRun": 5,
+    "maxDiscoveredTotal": 200,
+    "rpcDelayMs": 150
+  },
+
   "sellSignals": {
     "_note": [
       "Positions open when a BUY alert is delivered, capturing the market cap at",

@@ -50,6 +50,7 @@ import {
 import { analyzeSocials, socialBadge } from './social_scanner.mjs';
 import { migrationStatus, MIGRATION } from './migration.mjs';
 import { detectInsiderClusters, clusterScoreBonus } from './insider_cluster.mjs';
+import { discoverNetwork, loadDiscovered, saveDiscovered, walletLinks } from './network_discovery.mjs';
 import {
   loadObservations,
   saveObservations,
@@ -181,6 +182,7 @@ async function analyzeToken({
   blacklist,
   observations,
   funderCache,
+  discoveredStore,
   now,
 }) {
   const address = pair.baseToken.address;
@@ -314,6 +316,34 @@ async function analyzeToken({
 
   if (clusters?.detected) clusters.scoreBonus = clusterScoreBonus(clusters, config);
 
+  // Network discovery reuses the funder cache the cluster pass just warmed, so
+  // it costs little extra. Gated on a cluster having fired: expanding the net
+  // from tokens with no signal is how a watchlist fills with noise.
+  if (clusters?.detected && discoveredStore && pair.chainId === 'solana') {
+    try {
+      const net = await discoverNetwork({
+        buyers,
+        watchlist,
+        rpcUrl: config.rpcUrl,
+        config,
+        funderCache,
+        discoveredStore,
+        token: pair.baseToken.symbol,
+      });
+      clusters.network = net;
+      if (net.added.length) {
+        console.log(
+          `   🕸️  Network expanded: +${net.added.length} wallet(s) from ${net.clusters.length} cluster(s)` +
+            (net.rejectedFunders?.length
+              ? ` (${net.rejectedFunders.length} exchange-scale funder(s) rejected)`
+              : '')
+        );
+      }
+    } catch (err) {
+      console.error(`   network discovery failed: ${err.message}`);
+    }
+  }
+
   const catalysts = detectCatalysts(pair, security, demand, velocity, config.thresholds, {
     smartMoney,
     deployer,
@@ -403,7 +433,9 @@ export async function runScan(args = {}) {
   const funderCachePath = join(HERE, '.state', 'funder_cache.json');
   let funderCache = {};
   try { funderCache = JSON.parse(await readFile(funderCachePath, 'utf8')); } catch { /* first run */ }
-  const watchlist = await loadWatchlist(join(HERE, config.smartMoney.watchlistFile));
+  const discoveredPath = join(HERE, 'discovered_wallets.json');
+  const discoveredStore = await loadDiscovered(discoveredPath);
+  const watchlist = await loadWatchlist(join(HERE, config.smartMoney.watchlistFile), [discoveredPath]);
   const blacklist = await loadBlacklist(join(HERE, 'dev_blacklist.json'));
   console.log(
     `⛔ Blacklist: ${blacklist.wallets.size} deployer(s), ${blacklist.mints.size} mint(s)`
@@ -504,6 +536,7 @@ export async function runScan(args = {}) {
       blacklist,
       observations,
       funderCache,
+      discoveredStore,
       now,
     });
     const { verdictInfo, audit, demand, deployer, smartMoney, social } = result;
@@ -613,6 +646,7 @@ export async function runScan(args = {}) {
   pruneObservations(observations, now.getTime());
   await saveObservations(observationsPath, observations);
   await savePositions(positions);
+  if (discoveredStore.wallets.length) await saveDiscovered(discoveredPath, discoveredStore);
   await writeFile(funderCachePath, JSON.stringify(funderCache, null, 2), 'utf8');
   const observedWallets = Object.keys(observations.wallets).length;
   if (observedWallets) console.log(`🐋 Elite ledger: ${observedWallets} wallet(s) under observation`);

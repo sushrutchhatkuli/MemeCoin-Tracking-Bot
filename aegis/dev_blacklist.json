@@ -2230,6 +2230,24 @@
       "reason": "Post-mortem: $PISSINU fell -80% within 3.47h",
       "added": "2026-08-08",
       "source": "post-mortem"
+    },
+    {
+      "address": "8ZSWiYzeMesSUKXL39bXZ9iBGCgaVyaRxXshiUeRxm1N",
+      "reason": "Post-mortem: $Frohorse fell -81.8% within 5.66h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
+    },
+    {
+      "address": "3g5pq69FtayA1aEgcuNWBo5dPtU5jV1wjQ1PCXVw6ygq",
+      "reason": "Post-mortem: $Alycia fell -95.2% within 1.06h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
+    },
+    {
+      "address": "FASSyU1sWMgHnXiuVWbhp9AKLrEnbG96QeUkp3E79bv1",
+      "reason": "Post-mortem: $KODY fell -68.5% within 1.05h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
     }
   ],
   "mints": [
