@@ -96,6 +96,27 @@ export function tradeUrl(address, tradeLink, chain = 'solana') {
   return template.replace('{chain}', chain).replace('{address}', address);
 }
 
+/**
+ * Dual one-tap execution links.
+ *
+ * Two destinations because they fail differently: FOMO is the mobile app you
+ * actually trade in, Jupiter is a web router that works even if a token is not
+ * listed in FOMO yet — which is common for a launch minutes old, exactly when
+ * these alerts fire.
+ *
+ * Jupiter is Solana-only, so EVM alerts carry the FOMO link alone rather than a
+ * link that would 404.
+ */
+export function executionLinks(address, chain, tradeLink) {
+  const links = [
+    `📲 <a href="${esc(tradeUrl(address, tradeLink, chain))}">[ Open in FOMO App ]</a>`,
+  ];
+  if (chain === 'solana') {
+    links.push(`⚡ <a href="https://jup.ag/swap/SOL-${esc(address)}">[ Swap on Jupiter ]</a>`);
+  }
+  return links;
+}
+
 const usdShort = (n) => {
   if (n === null || n === undefined || Number.isNaN(n)) return '?';
   if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
@@ -164,9 +185,13 @@ export function buildSellMessage({
   lines.push('💡 <b>RECOMMENDED ACTION:</b>');
   lines.push(esc(action));
 
-  const url = tradeUrl(position.address, tradeLink, position.chain);
   lines.push('');
-  lines.push(`📲 <a href="${esc(url)}">[ Open FOMO App to Sell ]</a>`);
+  lines.push(
+    `📲 <a href="${esc(tradeUrl(position.address, tradeLink, position.chain))}">[ Open FOMO App to Sell ]</a>`
+  );
+  if (position.chain === 'solana') {
+    lines.push(`⚡ <a href="https://jup.ag/swap/SOL-${esc(position.address)}">[ Swap out on Jupiter ]</a>`);
+  }
   lines.push('');
   lines.push(
     '<i>Percentages are movement from the alert market cap, not your P&amp;L — Aegis does not know your entry or size. Not financial advice.</i>'
@@ -383,7 +408,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     '',
     `<code>${esc(address)}</code>`,
     '',
-    `📲 <a href="${esc(tradeUrl(address, tradeLink, pair.chainId))}">[ Open in FOMO App ]</a>`,
+    ...executionLinks(address, pair.chainId, tradeLink),
     `📈 <a href="https://dexscreener.com/${esc(pair.chainId)}/${esc(address)}">DexScreener</a>`,
     // Token contract on Solscan — distinct from the wallet links above, which
     // point at /account/. This is /token/ and resolves the mint itself.

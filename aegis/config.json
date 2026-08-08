@@ -238,16 +238,13 @@
     "sendScanDigest": false,
     "requireLiveReaudit": false,
     "insiderOnly": true,
-    "insiderMinScore": 75,
+    "insiderMinScore": 68,
     "_insiderMinScoreNote": [
-      "Raised 0 -> 75 on 2026-08-08. This is a large change in volume, not a",
-      "small tightening: of the 10 alerts the loop sent overnight, exactly ONE",
-      "($BUBBLES, 76) clears a 75 floor. The other nine scored 45-70.",
+      "Set to 68 on 2026-08-08 after measuring against the overnight run.",
+      "Of the 10 alerts sent that night, 5 clear 68 (scores 68-76) and 5 fall",
+      "below (45-67). A 75 floor left only 1. 68 targets ~3-5 alerts/day.",
       "",
-      "Expect roughly one alert per night rather than ten. That is the intent —",
-      "conviction AND insider activity — but if the phone goes silent for days,",
-      "this threshold is why, not a broken scanner. Lower to ~65 to roughly",
-      "double the flow."
+      "Raise toward 75 for near-silence, lower toward 60 to roughly double flow."
     ],
     "_silenceNote": [
       "insiderOnly=true: Telegram receives a message ONLY when a token has",

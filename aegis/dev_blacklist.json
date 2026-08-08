@@ -2500,6 +2500,30 @@
       "reason": "Post-mortem: $frogwif  fell -84.9% within 1.1h",
       "added": "2026-08-08",
       "source": "post-mortem"
+    },
+    {
+      "address": "HVu8NqgjUidm4jvuMe8Aj5tU2cbDXRjARpkLHFLpDJqy",
+      "reason": "Post-mortem: $PENGU1N fell -100% within 3.27h (pair delisted)",
+      "added": "2026-08-08",
+      "source": "post-mortem"
+    },
+    {
+      "address": "BEyZJt8xss7ASQi4wAgnLDhW4qQ8aDaqgzzjUykZoGhY",
+      "reason": "Post-mortem: $TOADLADY fell -92% within 2.2h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
+    },
+    {
+      "address": "9F3XzDjKY37QX4bfv2YUK2DWmKqRKbeLhyDDP5eF26uq",
+      "reason": "Post-mortem: $peepo fell -100% within 1.43h (pair delisted)",
+      "added": "2026-08-08",
+      "source": "post-mortem"
+    },
+    {
+      "address": "85EWFjbN2LLbU4UP8o7sS9dJK9GCneioMijENnkDBZcj",
+      "reason": "Post-mortem: $TOAD fell -86.8% within 1.35h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
     }
   ],
   "mints": [

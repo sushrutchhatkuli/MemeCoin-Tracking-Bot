@@ -490,7 +490,15 @@ export function scoreToken({
     security.totalHolders !== null &&
     security.totalHolders !== undefined &&
     security.totalHolders < (thresholds.minUniqueHolders ?? 150);
-  const safetyGateFailed = securityFailed || holderFloorFailed || Boolean(blacklistHit?.listed);
+  const depthFloorPct = thresholds.minLiqToMcapPct ?? 15;
+  const liquidityGateFailed =
+    demand.liqToMcapPct !== null &&
+    demand.liqToMcapPct !== undefined &&
+    demand.marketCap > 0 &&
+    demand.liqToMcapPct < depthFloorPct;
+
+  const safetyGateFailed =
+    securityFailed || holderFloorFailed || liquidityGateFailed || Boolean(blacklistHit?.listed);
 
   // Smart money — additive bonus, and explicitly forfeited when safety fails.
   const smartBonus =
@@ -538,6 +546,16 @@ export function scoreToken({
   const holdersKnown = uniqueHolders !== null && uniqueHolders !== undefined;
   const lowHolders = holdersKnown && uniqueHolders < holderFloor;
 
+  // Liquidity depth as a hard gate, not just a scoring input.
+  //
+  // A pool worth under 15% of market cap cannot absorb an exit: the price you
+  // see is not the price you get, and on a thin book a modest sell walks the
+  // pool down before it fills. Being right about the token does not help if
+  // leaving the position costs more than the move earned.
+  const depthFloor = thresholds.minLiqToMcapPct ?? 15;
+  const depthKnown = demand.liqToMcapPct !== null && demand.liqToMcapPct !== undefined;
+  const thinLiquidity = depthKnown && demand.marketCap > 0 && demand.liqToMcapPct < depthFloor;
+
   // --- Verdict -----------------------------------------------------
   let verdict;
   let impact;
@@ -565,6 +583,13 @@ export function scoreToken({
   } else if (audit.status === 'FAILED') {
     // Score 0, not a cap: a failed contract audit is disqualifying outright.
     verdict = 'SCAM/AVOID';
+    impact = 'NEUTRAL';
+    score = 0;
+  } else if (thinLiquidity) {
+    // Ranked above the contract audit for the same reason as the holder floor:
+    // a token you cannot exit is untradeable regardless of how clean its
+    // contract is.
+    verdict = 'THIN LIQUIDITY';
     impact = 'NEUTRAL';
     score = 0;
   } else if (lowHolders) {
@@ -614,8 +639,21 @@ export function scoreToken({
         ? audit.failures?.[0] ?? 'Contract audit failed'
         : holderFloorFailed
           ? `Only ${security?.totalHolders} holders — below the ${thresholds.minUniqueHolders ?? 150} floor`
-          : null,
+          : liquidityGateFailed
+            ? `Liquidity is ${demand.liqToMcapPct.toFixed(1)}% of market cap — below the ${depthFloorPct}% slippage floor`
+            : null,
     smartMoneyForfeited: Boolean(smartMoney?.detected && safetyGateFailed),
+    liquidityGate: {
+      floorPct: depthFloorPct,
+      actualPct: demand.liqToMcapPct ?? null,
+      passed: liquidityGateFailed ? false : true,
+      status:
+        demand.liqToMcapPct === null || demand.liqToMcapPct === undefined
+          ? 'Liquidity depth unknown'
+          : liquidityGateFailed
+            ? `${demand.liqToMcapPct.toFixed(1)}% of MCap — below ${depthFloorPct}% floor ❌`
+            : `${demand.liqToMcapPct.toFixed(1)}% of MCap — ${depthFloorPct}%+ floor passed ✅`,
+    },
     holderGate: {
       floor: holderFloor,
       holders: holdersKnown ? uniqueHolders : null,
