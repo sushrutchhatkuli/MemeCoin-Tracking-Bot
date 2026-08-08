@@ -1,0 +1,160 @@
+[33mcommit 67bd921291592ba1a4b9ba2e2ff2b5a7f09eb166[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m
+Author: Sushrut Chhatkuli <sushrutchhatkuli12@gmail.com>
+Date:   Sat Aug 8 04:19:31 2026 -0400
+
+    Add Solscan token link; audit confirms no hardcoded token fallbacks
+    
+    Audit result: there is no hardcoded $CATE or dummy mint anywhere in the
+    source. Every "CATE" hit is either the SIGNAL_CATEGORY identifier or a
+    real scanned symbol recorded in the data files ($MINICATE, $RIZZCATE,
+    $BELUGACATE). The CATE mint appears in no tracked file — it only ever
+    existed in ad-hoc test commands.
+    
+    The four base58 literals in source are all legitimate constants: wrapped
+    SOL (for SOL/USD pricing) and the system/incinerator/dead addresses in
+    the NON_HOLDER_ADDRESSES exclusion set.
+    
+    Real gap found and fixed: Telegram alerts carried no Solscan TOKEN link.
+    They had /account/ wallet links only. Alerts now include
+    solscan.io/token/{mint}, emitted for Solana only since the path does not
+    apply to EVM chains.
+    
+    Also relabelled the --test-telegram placeholder to SAMPLE-NOT-A-REAL-
+    SIGNAL. It is the one placeholder token in the codebase and is
+    unreachable from a real scan, but a delivered sample should never be
+    mistakable for a live alert.
+    
+    Verified two ways: the same formatter across three distinct mints
+    produced three correct link sets, and four notes from a live scan each
+    carried their own mint across all three link types — including a BNB
+    token correctly omitting Solscan.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+[33mcommit e7eb82fbfbb079a902cf0bb3365413d0f21e4ef1[m
+Author: Sushrut Chhatkuli <sushrutchhatkuli12@gmail.com>
+Date:   Sat Aug 8 04:10:08 2026 -0400
+
+    Add multi-insider scaling multiplier (15/25/35/50)
+    
+    Score now scales with the count of DISTINCT insider wallets:
+      1 -> +15 Insider Tracked      3 -> +35 Strong Cabal Cluster
+      2 -> +25 Dual Insider Cluster 4+ -> +50 Cabal Swarm
+    
+    Counting is of unique addresses, not list lengths. The three detection
+    sources overlap heavily — a wallet can be watchlisted AND early AND
+    co-funded — so a single wallet would otherwise have scored as three.
+    
+    FIXED A GATE LEAK found while testing: the bonus was gated on
+    safetyGateFailed, which is false for an UNVERIFIED audit, so a 4-wallet
+    swarm added +50 to a token whose contract was never verified. The
+    UNVERIFIED score cap masked it, which is precisely why it mattered — a
+    later change to that cap would have silently reopened it. The multiplier
+    now requires audit.status === PASSED affirmatively.
+    
+    Verified: PASSED+swarm = 100/BUY SIGNAL, FAILED = 0/+0, UNVERIFIED = +0,
+    sub-150 holders = 0/+0.
+    
+    Telegram: header escalates to CABAL SWARM at 4+ and MULTI-INSIDER at 2+;
+    per-insider lines carry spend, entry MC, timing and a Solscan link.
+    
+    Note the bonus is ADDITIVE, not a score floor: a swarm lands at base+50
+    clamped to 100, so a token with weak demand and thin liquidity will not
+    reach 90 on insider count alone. Four wallets buying something illiquid is
+    a reason to look, not a reason to override the market data.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+[33mcommit 546fbe8765bba20de186f806e4f0038288b52a56[m
+Author: Sushrut Chhatkuli <sushrutchhatkuli12@gmail.com>
+Date:   Sat Aug 8 03:48:30 2026 -0400
+
+    Add multi-source network discovery and direct wallet links
+    
+    network_discovery.mjs — what each named source actually contributes:
+      Solscan    API key-gated, so origin tracing runs against Solana RPC
+                 directly. Same data, no key. Solscan used for links only.
+      Bubblemaps no public API. Its graph is reproducible from chain — wallets
+                 sharing a funding origin — so the cluster logic is computed,
+                 not fetched.
+      GMGN       403 Cloudflare.  Win rate / PnL / trade count CANNOT be
+      Birdeye    401 paid key.    fetched. Verified across several attempts.
+    
+    So discovered wallets carry deep links to GMGN and Birdeye instead of
+    fabricated stats, and the alert says so. All three profile URLs 403 to
+    curl — that is anti-scraping, not a broken link; they open from a phone.
+    
+    Expansion safety, because auto-enrolling wallets is self-destructive:
+      - HIGH-DEGREE FUNDERS REJECTED. One CEX hot wallet funds thousands of
+        unrelated users; without this the net would enrol half of Solana in a
+        day and every token would "match smart money". Verified: 40 wallets
+        behind one funder yields 0 clusters and a logged rejection.
+      - Expansion only proceeds from a cluster already containing a tracked
+        wallet, so the net grows along evidence.
+      - Caps per run and total, with provenance recorded per entry.
+    
+    Discoveries write to discovered_wallets.json, NOT smart_wallets.json —
+    auto_top_whales.mjs rewrites the latter wholesale every 2h and would have
+    silently erased them. loadWatchlist now merges both, curated entries
+    winning on duplicate addresses.
+    
+    Part 2 needed no change: the 20% cap, 150-holder floor, mint/freeze/LP
+    gates and score-0 override were already in force and verified.
+    
+    Caught while wiring: two console calls landed empty via shell escaping.
+    Valid JS, so --check passed — a silent failure only visible by reading
+    the emitted code.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+[33mcommit 28f74c49ea0fdf7dd390a7da716550f2ee8d4d2d[m
+Author: Sushrut Chhatkuli <sushrutchhatkuli12@gmail.com>
+Date:   Sat Aug 8 03:07:27 2026 -0400
+
+    Add automated sell-signal notifier with three exit triggers
+    
+    Positions open when a BUY alert is delivered, capturing the market cap at
+    that moment and each insider's token balance. Taken any later the baseline
+    would already include selling, so the capture happens inline with the
+    alert.
+    
+    Triggers, each firing at most once per position:
+      1 INSIDER EXIT  insider balance down >=40% from baseline (one RPC call
+                      per wallet; verified 202ms, and a probe wallet was
+                      already at zero)
+      2 TAKE PROFIT   market cap reached 2x entry
+      3 STOP LOSS     market cap 20% below entry, OR the pair delisted
+    
+    Deliberate choices:
+      - Once-only firing, or a token sitting at -21% would re-send a stop-loss
+        every 30 seconds.
+      - TAKE_PROFIT does NOT close the position: its advice is to remove
+        initial capital and let the rest run, so the stop-loss must stay armed
+        on the remainder. STOP_LOSS and INSIDER_EXIT do close it.
+      - A delisted pair is a stop-loss, not missing data. Liquidity being
+        pulled is the most important thing to be told about, and silence would
+        be the worst response.
+      - Percentages are stated as movement from the ALERT market cap, never as
+        P&L. Aegis does not know the user's fill, size, or whether they took
+        the trade — claiming otherwise would invent a fact about their money.
+    
+    Monitor runs every scan and every loop tick, not on the maintenance
+    cadence: an insider exit or a rug is time-critical.
+    
+    Verified across 9 trigger cases including boundaries (-19% vs -25%,
+    sold 30% vs 55%) and re-fire suppression.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+[33mcommit 2f7629c9fa7f61066760c2e4efa344ec68c73269[m
+Author: Sushrut Chhatkuli <sushrutchhatkuli12@gmail.com>
+Date:   Sat Aug 8 03:01:24 2026 -0400
+
+    Add real-time insider trigger loop with strict silent filter
+    
+    loop.mjs — 30s target cadence with a non-overlap guard. A full pass
+    measures 40-55s (discovery is a fixed cost that does not shrink with
+    scanLimit), so a naive setInterval would stack concurrent scans, race on
+    the shared state files and multiply RPC load. The timer skips a tick while
+    a scan is running, counts the skips and reports them, so the real cadence
+    is visible rather than implied. Maintenance (po

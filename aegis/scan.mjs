@@ -443,7 +443,17 @@ export async function runScan(args = {}) {
   try { funderCache = JSON.parse(await readFile(funderCachePath, 'utf8')); } catch { /* first run */ }
   const discoveredPath = join(HERE, 'discovered_wallets.json');
   const discoveredStore = await loadDiscovered(discoveredPath);
-  const watchlist = await loadWatchlist(join(HERE, config.smartMoney.watchlistFile), [discoveredPath]);
+  const screenCachePath = join(HERE, '.state', 'system_account_cache.json');
+  let screenCache = {};
+  try { screenCache = JSON.parse(await readFile(screenCachePath, 'utf8')); } catch { /* first run */ }
+  const watchlist = await loadWatchlist(join(HERE, config.smartMoney.watchlistFile), [discoveredPath], {
+    rpcUrl: config.rpcUrl,
+    screenCache,
+    screening: config.smartMoney?.screening ?? {},
+  });
+  for (const ex of watchlist.excluded ?? []) {
+    console.log(`   🛑 EXCLUDED ${ex.label ? '"' + ex.label + '" ' : ''}${ex.address.slice(0, 12)}… — ${ex.reason}`);
+  }
   const blacklist = await loadBlacklist(join(HERE, 'dev_blacklist.json'));
   console.log(
     `⛔ Blacklist: ${blacklist.wallets.size} deployer(s), ${blacklist.mints.size} mint(s)`
@@ -654,6 +664,7 @@ export async function runScan(args = {}) {
   pruneObservations(observations, now.getTime());
   await saveObservations(observationsPath, observations);
   await savePositions(positions);
+  await writeFile(screenCachePath, JSON.stringify(screenCache, null, 2), 'utf8');
   if (discoveredStore.wallets.length) await saveDiscovered(discoveredPath, discoveredStore);
   await writeFile(funderCachePath, JSON.stringify(funderCache, null, 2), 'utf8');
   const observedWallets = Object.keys(observations.wallets).length;

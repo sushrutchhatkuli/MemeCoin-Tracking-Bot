@@ -2272,6 +2272,36 @@
       "reason": "Post-mortem: $@trade fell -87.1% within 1.06h",
       "added": "2026-08-08",
       "source": "post-mortem"
+    },
+    {
+      "address": "0xfeccd1d6e453e44cdf7466644bc6ae1d70c354e5",
+      "reason": "Post-mortem: $KAI fell -83.4% within 1.12h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
+    },
+    {
+      "address": "2PkPfbNytC8wiiAS8XLmNTPqHwgfqJe3yu3euVZTj9qv",
+      "reason": "Post-mortem: $DonTzu fell -83.9% within 1.05h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
+    },
+    {
+      "address": "5htGpHK2oV9g2BcDqLdRBqjCLdy8mc3fsESfR5DU73eM",
+      "reason": "Post-mortem: $cip fell -70.5% within 1.05h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
+    },
+    {
+      "address": "3KYyeyijizM1gDDz2XiwR9bNaBCTTi5dYN36z62c9Gbk",
+      "reason": "Post-mortem: $NAM fell -97.9% within 1.05h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
+    },
+    {
+      "address": "48CKHCY1S9AAxSANDfJXYgMbg3PDYLbjnQwbfz9w8hrR",
+      "reason": "Post-mortem: $Mr. Cat fell -94.9% within 1.12h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
     }
   ],
   "mints": [

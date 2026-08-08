@@ -39,7 +39,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join, extname } from 'node:path';
 
 import { loadObservations, walletStats } from './wallet_observations.mjs';
-import { validateWatchlistEntry } from './smart_money.mjs';
+import { validateWatchlistEntry, SYSTEM_ACCOUNTS, screenSystemAccount } from './smart_money.mjs';
 import { loadEnv } from './telegram.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -422,12 +422,18 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
   }
 
   // Reject malformed addresses before they can occupy a slot.
+  // Filter at WRITE time as well as read time. Without this a system account
+  // that qualified from observations would be written back every sync and only
+  // suppressed on load — the file itself would keep lying.
   const wellFormed = [];
   let rejected = 0;
+  let systemRejected = 0;
   for (const c of candidates) {
-    if (validateWatchlistEntry(c).valid) wellFormed.push(c);
-    else rejected++;
+    if (!validateWatchlistEntry(c).valid) { rejected++; continue; }
+    if (SYSTEM_ACCOUNTS.has(c.address)) { systemRejected++; continue; }
+    wellFormed.push(c);
   }
+  if (systemRejected) console.log(`   🛑 ${systemRejected} known system/DEX account(s) excluded from ranking`);
   if (rejected) console.log(`   ⚠️  ${rejected} candidate(s) rejected as invalid Solana addresses`);
 
   // Enrich everything clearing Rule 1, and only Rule 1.
@@ -441,11 +447,57 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     (c) => c.winRatePct !== null && c.winRatePct >= rules.minWinRatePct
   );
   if (!importPath && shortlist.length) {
+    const screenCache = {};
+    const clean = [];
+    let blocked = 0;
+    for (const c of shortlist) {
+      const v = await screenSystemAccount(c.address, config.rpcUrl, screenCache, config.smartMoney?.screening ?? {});
+      if (v.system) { blocked++; c.systemAccount = v.reason; continue; }
+      clean.push(c);
+    }
+    if (blocked) console.log();
+    shortlist.length = 0;
+    shortlist.push(...clean);
+  }
+
+  if (!importPath && shortlist.length) {
     console.log(`   ↳ enriching ${shortlist.length} shortlisted wallet(s) with on-chain activity…`);
     await enrichLifetimeTrades(shortlist, config.rpcUrl);
   }
 
-  const { evaluated, qualified } = applyEliteRules(wellFormed, rules);
+  // Anything flagged during screening cannot qualify, regardless of its stats.
+  const { evaluated, qualified: ranked } = applyEliteRules(wellFormed, rules);
+
+  // Screen ONLY the wallets that would actually be written, then backfill from
+  // the next-ranked candidates.
+  //
+  // Screening the whole shortlist was the obvious placement and it was wrong:
+  // hundreds of wallets at up to ~10s each pushed a sync past ten minutes. The
+  // qualified set is topN entries, so this bounds the cost to a handful of calls
+  // while still guaranteeing nothing on the final list is a pool authority.
+  const screenCache = {};
+  const qualified = [];
+  let systemBlocked = 0;
+  for (const c of ranked.length ? ranked : []) {
+    if (qualified.length >= rules.topN) break;
+    const v = await screenSystemAccount(
+      c.address,
+      config.rpcUrl,
+      screenCache,
+      config.smartMoney?.screening ?? {}
+    );
+    if (v.system) {
+      systemBlocked++;
+      console.log(`   🛑 ${c.address.slice(0, 12)}… rejected — ${v.reason}`);
+      continue;
+    }
+    qualified.push(c);
+  }
+  if (systemBlocked) {
+    console.log(
+      `   ${systemBlocked} pool authority/system account(s) kept off the elite list`
+    );
+  }
 
   // ---- reporting ---------------------------------------------------
   const failing = { sample: 0, winRate: 0, netProfit: 0, trades: 0 };

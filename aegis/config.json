@@ -116,10 +116,14 @@
       "reach 90 on insider count alone — four wallets buying something illiquid",
       "is a reason to look, not a reason to override the market data."
     ],
-    "insiderScaleTiers": { "1": 15, "2": 25, "3": 35, "4": 50 },
+    "insiderScaleTiers": {
+      "1": 15,
+      "2": 25,
+      "3": 35,
+      "4": 50
+    },
     "bonusOversized": 5
   },
-
   "discovery": {
     "_note": [
       "DexScreener has no trending endpoint (403/404 on every variant). The",
@@ -172,7 +176,18 @@
     "buyerMaxTxLookups": 25,
     "buyerRetries": 2,
     "rpcBackoffMs": 700,
-    "rpcDelayMs": 220
+    "rpcDelayMs": 220,
+    "screening": {
+      "maxWalletSol": 100000,
+      "maxTokenAccounts": 1000,
+      "_note": [
+        "Guards against system accounts masquerading as whales.",
+        "maxWalletSol catches exchange vaults (one held 10.7M SOL).",
+        "maxTokenAccounts catches DEX pool authorities, which hold trivial SOL",
+        "but own millions of token accounts — Raydium Authority V4 owns 1,416,453.",
+        "A balance check alone would wave those straight through."
+      ]
+    }
   },
   "eliteWhales": {
     "_note": [
@@ -266,7 +281,6 @@
     "maxDiscoveredTotal": 200,
     "rpcDelayMs": 150
   },
-
   "sellSignals": {
     "_note": [
       "Positions open when a BUY alert is delivered, capturing the market cap at",
@@ -293,7 +307,6 @@
     "stopLossPct": 20,
     "maxMonitorHours": 48
   },
-
   "realtime": {
     "_note": [
       "Cadence for loop.mjs. 30s is the TARGET, not the achieved rate: a full",
@@ -309,7 +322,6 @@
     "scanLimit": 8,
     "maintenanceEveryTicks": 20
   },
-
   "writeNotes": true,
   "tradeLinkTemplate": "https://fomo.family/tokens/{chain}/{address}",
   "tradeLinkLabel": "Trade on FOMO App",

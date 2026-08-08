@@ -4,7 +4,7 @@
     "the next sync. Add hand-picked wallets to a separate file instead.",
     "",
     "Source: aegis-observed",
-    "Generated: 2026-08-08T06:23:25.522Z",
+    "Generated: 2026-08-08T09:06:35.777Z",
     "Rules applied: win rate >= 75% over >= 3 graded buys,",
     "net profit rule SKIPPED (lifetime realized P&L is not derivable from observation),",
     "on-chain activity >= 100 signatures.",
@@ -12,13 +12,17 @@
     "",
     "READ THE SAMPLE SIZE. A 100% win rate over 3 graded buys is not evidence",
     "of edge — it is three trades. `graded_buys` is the number that matters",
-    "and it should grow over time; the win rate will fall as it does."
+    "and it should grow over time; the win rate will fall as it does.",
+    "",
+    "Pool authorities removed by system-account screening:",
+    "  FMVHP1xw6ZHB9zLGyrJeeAvEzCBgouH8bPzdkYqq2C5W — owns 10,839 token accounts — DEX pool authority, not a trader",
+    "  D9GYt4W7VvteKCSvTgyjzuiBJyTy94Kmr6YiC9fbxGjW — owns 68,018 token accounts — DEX pool authority, not a trader"
   ],
   "generated": {
-    "at": "2026-08-08T06:23:25.522Z",
+    "at": "2026-08-08T09:06:35.778Z",
     "source": "aegis-observed",
     "profitRuleSkipped": true,
-    "count": 5
+    "count": 3
   },
   "wallets": [
     {
@@ -46,36 +50,12 @@
       "enabled": true
     },
     {
-      "address": "FMVHP1xw6ZHB9zLGyrJeeAvEzCBgouH8bPzdkYqq2C5W",
-      "label": "Elite Whale #3 (100% WR on 3 graded)",
-      "win_rate": "100%",
-      "graded_buys": 3,
+      "address": "pxLYXbFM3KRFdoUZh74T2hFpRMpJb2zDQ7CR2zRFHuc",
+      "label": "Elite Whale #3 (75% WR on 4 graded)",
+      "win_rate": "75%",
+      "graded_buys": 4,
       "onchain_signatures": "1000+ (query cap)",
-      "solscan": "https://solscan.io/account/FMVHP1xw6ZHB9zLGyrJeeAvEzCBgouH8bPzdkYqq2C5W",
-      "source": "aegis-observed",
-      "stats_updated": "2026-08-08",
-      "metrics_basis": "observed buys graded by post-mortem (not lifetime realized P&L); lifetime activity = 1000 signatures (capped)",
-      "enabled": true
-    },
-    {
-      "address": "HFqp6ErWHY6Uzhj8rFyjYuDya2mXUpYEk8VW75K9PSiY",
-      "label": "Elite Whale #4 (80% WR on 10 graded)",
-      "win_rate": "80%",
-      "graded_buys": 10,
-      "onchain_signatures": "1000+ (query cap)",
-      "solscan": "https://solscan.io/account/HFqp6ErWHY6Uzhj8rFyjYuDya2mXUpYEk8VW75K9PSiY",
-      "source": "aegis-observed",
-      "stats_updated": "2026-08-08",
-      "metrics_basis": "observed buys graded by post-mortem (not lifetime realized P&L); lifetime activity = 1000 signatures (capped)",
-      "enabled": true
-    },
-    {
-      "address": "D9GYt4W7VvteKCSvTgyjzuiBJyTy94Kmr6YiC9fbxGjW",
-      "label": "Elite Whale #5 (80% WR on 5 graded)",
-      "win_rate": "80%",
-      "graded_buys": 5,
-      "onchain_signatures": "1000+ (query cap)",
-      "solscan": "https://solscan.io/account/D9GYt4W7VvteKCSvTgyjzuiBJyTy94Kmr6YiC9fbxGjW",
+      "solscan": "https://solscan.io/account/pxLYXbFM3KRFdoUZh74T2hFpRMpJb2zDQ7CR2zRFHuc",
       "source": "aegis-observed",
       "stats_updated": "2026-08-08",
       "metrics_basis": "observed buys graded by post-mortem (not lifetime realized P&L); lifetime activity = 1000 signatures (capped)",

@@ -33,6 +33,121 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  */
 const BASE58_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
+/**
+ * Known system, program and DEX-authority accounts that must never be treated
+ * as traders.
+ *
+ * These are not hypothetical. Two of them arrived in a real watchlist as
+ * "Alpha Whale #1" and "Alpha Whale #2":
+ *   9WzDXw… holds 10,755,444 SOL          — exchange/system scale
+ *   5Q544f… owns 1,416,453 token accounts — Raydium Authority V4
+ *
+ * A pool authority appears as a "holder" of essentially every token routed
+ * through its AMM, so leaving one on a watchlist makes almost every scan report
+ * smart-money activity. That is worse than having no watchlist at all: it
+ * manufactures confidence rather than merely lacking it.
+ */
+export const SYSTEM_ACCOUNTS = new Map([
+  ['9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM', 'system/exchange vault (10.7M SOL)'],
+  ['5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', 'Raydium Authority V4 (1.4M token accounts)'],
+  ['675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', 'Raydium Liquidity Pool V4 program'],
+  ['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 'Pump.fun program'],
+  ['pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 'PumpSwap AMM program'],
+  ['whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 'Orca Whirlpool program'],
+  ['9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP', 'Orca Token Swap V2'],
+  ['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'SPL Token program'],
+  ['11111111111111111111111111111111', 'System program'],
+  // Jito tip accounts — bundle payments land here, so they co-occur with every
+  // bundled buy and would otherwise look like a wallet buying everything.
+  ['96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5', 'Jito tip account'],
+  ['HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe', 'Jito tip account'],
+  ['Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY', 'Jito tip account'],
+  ['ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49', 'Jito tip account'],
+  ['DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh', 'Jito tip account'],
+  ['ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt', 'Jito tip account'],
+  ['DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL', 'Jito tip account'],
+  ['3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT', 'Jito tip account'],
+]);
+
+/**
+ * Screen a wallet for system-account characteristics that a static list cannot
+ * anticipate.
+ *
+ * Two independent tests, because they catch different things:
+ *   - SOL balance:        exchange vaults hold enormous SOL (10.7M in the case
+ *                         above) but few token accounts.
+ *   - Token-account count: pool authorities hold trivial SOL (35) but own
+ *                         millions of token accounts. A balance check alone
+ *                         would have waved Raydium Authority straight through.
+ *
+ * The count query uses dataSlice length 0 so the response stays small — without
+ * it, querying a pool authority returns hundreds of megabytes and crashes the
+ * JSON parse outright.
+ *
+ * Verdicts are cached because this is slow (≈10s for a pool authority) and a
+ * wallet's nature does not change.
+ */
+export async function screenSystemAccount(address, rpcUrl, cache = {}, cfg = {}) {
+  const known = SYSTEM_ACCOUNTS.get(address);
+  if (known) return { system: true, reason: known, source: 'known-list' };
+  if (cache[address]) return cache[address];
+  if (!rpcUrl) return { system: false, reason: 'no RPC configured — screening skipped' };
+
+  const maxSol = cfg.maxWalletSol ?? 100000;
+  const maxTokenAccounts = cfg.maxTokenAccounts ?? 1000;
+
+  const call = async (method, params) => {
+    try {
+      const res = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        signal: AbortSignal.timeout(30000),
+      });
+      const body = await res.json().catch(() => ({}));
+      return body.error ? { error: body.error.message } : { result: body.result };
+    } catch (err) {
+      return { error: err.message };
+    }
+  };
+
+  const info = await call('getAccountInfo', [address, { encoding: 'jsonParsed' }]);
+  if (info.error) return { system: false, reason: `screening failed: ${info.error}` };
+
+  const v = info.result?.value;
+  if (v?.executable) {
+    return (cache[address] = { system: true, reason: 'on-chain program, not a wallet', source: 'rpc' });
+  }
+  const sol = (v?.lamports ?? 0) / 1e9;
+  if (sol > maxSol) {
+    return (cache[address] = {
+      system: true,
+      reason: `holds ${Math.round(sol).toLocaleString('en-US')} SOL (limit ${maxSol.toLocaleString('en-US')})`,
+      source: 'rpc',
+    });
+  }
+
+  const accts = await call('getTokenAccountsByOwner', [
+    address,
+    { programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' },
+    { encoding: 'base64', dataSlice: { offset: 0, length: 0 } },
+  ]);
+  if (!accts.error) {
+    const n = (accts.result?.value ?? []).length;
+    if (n > maxTokenAccounts) {
+      return (cache[address] = {
+        system: true,
+        reason: `owns ${n.toLocaleString('en-US')} token accounts — DEX pool authority, not a trader`,
+        source: 'rpc',
+        tokenAccounts: n,
+      });
+    }
+    return (cache[address] = { system: false, solBalance: sol, tokenAccounts: n, source: 'rpc' });
+  }
+
+  return (cache[address] = { system: false, solBalance: sol, source: 'rpc-partial' });
+}
+
 export function validateWatchlistEntry(entry) {
   const address = String(entry?.address ?? '');
   if (!BASE58_ADDRESS.test(address)) {
@@ -55,7 +170,7 @@ export function validateWatchlistEntry(entry) {
  * be erased on the next sync, so discoveries live in their own file and are
  * merged at read time. Curated entries win on a duplicate address.
  */
-export async function loadWatchlist(path, extraPaths = []) {
+export async function loadWatchlist(path, extraPaths = [], opts = {}) {
   try {
     const raw = JSON.parse(await readFile(path, 'utf8'));
     const entries = Array.isArray(raw) ? raw : (raw.wallets ?? []);
@@ -78,7 +193,7 @@ export async function loadWatchlist(path, extraPaths = []) {
       );
 
     const invalid = [];
-    const normalised = candidates.filter((w) => {
+    const wellFormed = candidates.filter((w) => {
       const check = validateWatchlistEntry(w);
       if (!check.valid) {
         invalid.push({ address: w.address, label: w.label ?? null, reason: check.reason });
@@ -86,6 +201,25 @@ export async function loadWatchlist(path, extraPaths = []) {
       }
       return true;
     });
+
+    // Drop system / DEX-authority accounts before any matching happens. A pool
+    // authority left on the list would "hold" nearly every token and report
+    // smart-money activity on almost every scan.
+    const excluded = [];
+    const normalised = [];
+    for (const w of wellFormed) {
+      const verdict = await screenSystemAccount(
+        w.address,
+        opts.rpcUrl ?? null,
+        opts.screenCache ?? {},
+        opts.screening ?? {}
+      );
+      if (verdict.system) {
+        excluded.push({ address: w.address, label: w.label ?? null, reason: verdict.reason });
+        continue;
+      }
+      normalised.push(w);
+    }
 
     const index = new Map();
     for (const w of normalised) {
@@ -113,9 +247,9 @@ export async function loadWatchlist(path, extraPaths = []) {
             : null,
       });
     }
-    return { index, count: normalised.length, invalid };
+    return { index, count: normalised.length, invalid, excluded };
   } catch {
-    return { index: new Map(), count: 0, invalid: [] };
+    return { index: new Map(), count: 0, invalid: [], excluded: [] };
   }
 }
 
