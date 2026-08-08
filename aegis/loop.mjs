@@ -37,6 +37,7 @@ import { runScan } from './scan.mjs';
 import { runPostMortem, annotateNotes } from './post_mortem.mjs';
 import { syncTopWhales } from './auto_top_whales.mjs';
 import { sampleTrajectory } from './trajectory.mjs';
+import { checkOpenPositions } from './sell_notifier.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -75,6 +76,13 @@ async function onTick(config, limit, heavyEveryTicks) {
     durations.push(secs);
     if (durations.length > 20) durations.shift();
 
+    // Time-critical: checked every tick, not on the maintenance cadence.
+    let sellFired = 0;
+    try {
+      const sell = await checkOpenPositions({ config, quiet: true });
+      sellFired = sell.fired;
+    } catch { /* non-fatal */ }
+
     const sent = result?.alerts?.length ?? 0;
     alertsSent += sent;
 
@@ -82,7 +90,7 @@ async function onTick(config, limit, heavyEveryTicks) {
     // and sends nothing at all to Telegram.
     console.log(
       `[${stamp()}] tick ${tick} · ${secs.toFixed(0)}s · ` +
-        `${result?.scanned ?? 0} audited · ${sent ? `🚀 ${sent} ALERT(S)` : 'no clean insider buys'}` +
+        `${result?.scanned ?? 0} audited · ${sent ? `🚀 ${sent} BUY ALERT(S)` : 'no clean insider buys'}${sellFired ? ` · 🔴 ${sellFired} SELL SIGNAL(S)` : ''}` +
         (skipped ? ` · ${skipped} tick(s) skipped while busy` : '')
     );
 

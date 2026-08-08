@@ -226,6 +226,33 @@
       "routine noise. Set insiderOnly=false to restore the previous behaviour."
     ]
   },
+  "sellSignals": {
+    "_note": [
+      "Positions open when a BUY alert is delivered, capturing the market cap at",
+      "that moment and each insider's token balance. Those baselines are what the",
+      "triggers measure against.",
+      "",
+      "Each trigger fires AT MOST ONCE per position — otherwise a token sitting",
+      "at -21% would re-send a stop-loss every 30 seconds.",
+      "",
+      "STOP_LOSS and INSIDER_EXIT close the position. TAKE_PROFIT does NOT: its",
+      "advice is to remove initial capital and let the rest run, so the stop-loss",
+      "must stay armed on the remainder.",
+      "",
+      "A delisted pair counts as a stop-loss, not missing data. Liquidity being",
+      "pulled is the most important thing to be told about.",
+      "",
+      "IMPORTANT: percentages are movement from the ALERT market cap, not your",
+      "P&L. Aegis does not know your fill, your size, or whether you took the",
+      "trade at all."
+    ],
+    "enabled": true,
+    "insiderExitPct": 40,
+    "takeProfitMultiple": 2,
+    "stopLossPct": 20,
+    "maxMonitorHours": 48
+  },
+
   "realtime": {
     "_note": [
       "Cadence for loop.mjs. 30s is the TARGET, not the achieved rate: a full",

@@ -2224,6 +2224,12 @@
       "reason": "Post-mortem: $RAX fell -80% within 2.67h",
       "added": "2026-08-08",
       "source": "post-mortem"
+    },
+    {
+      "address": "FTuqW6J148wdknkPvm2EVSJ1EFt4aDhjAYzv6rdjuCRi",
+      "reason": "Post-mortem: $PISSINU fell -80% within 3.47h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
     }
   ],
   "mints": [

@@ -20,6 +20,7 @@ import { runScan, parseArgs } from './scan.mjs';
 import { runPostMortem, annotateNotes } from './post_mortem.mjs';
 import { syncTopWhales } from './auto_top_whales.mjs';
 import { sampleTrajectory } from './trajectory.mjs';
+import { checkOpenPositions } from './sell_notifier.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -87,6 +88,16 @@ async function once(args) {
         await maybeSyncWhales();
       } catch (err) {
         console.error(`⚠️  Whale sync failed (scan results kept): ${err.message}`);
+      }
+
+      // Sell monitor runs every pass: an insider exit or a rug is time-critical
+      // and must not wait for a maintenance cycle.
+      try {
+        const config = JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'));
+        const sell = await checkOpenPositions({ config });
+        if (sell.fired) console.log(`🔴 ${sell.fired} sell signal(s) fired across ${sell.checked} open position(s)`);
+      } catch (err) {
+        console.error(`⚠️  Sell monitor failed: ${err.message}`);
       }
 
       // Hourly trajectory sample. Cheap, append-only, and survives reboots

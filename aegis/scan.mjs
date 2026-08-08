@@ -57,6 +57,12 @@ import {
   pruneObservations,
 } from './wallet_observations.mjs';
 import { loadBlacklist, checkBlacklist } from './blacklist.mjs';
+import {
+  loadPositions,
+  savePositions,
+  openPosition,
+  walletTokenBalance,
+} from './sell_notifier.mjs';
 
 /**
  * Environment overrides, so a cloud deploy can be reconfigured from the Render
@@ -393,6 +399,7 @@ export async function runScan(args = {}) {
   const alertLog = await loadAlertLog(alertLogPath);
   const observationsPath = join(HERE, '.state', 'wallet_observations.json');
   const observations = await loadObservations(observationsPath);
+  const positions = await loadPositions();
   const funderCachePath = join(HERE, '.state', 'funder_cache.json');
   let funderCache = {};
   try { funderCache = JSON.parse(await readFile(funderCachePath, 'utf8')); } catch { /* first run */ }
@@ -576,8 +583,17 @@ export async function runScan(args = {}) {
       now: now.getTime(),
     });
     if (alert.status === 'sent') {
-      console.log(`   📲 Telegram alert sent for $${symbol}`);
+      console.log(`   📲 Telegram alert sent for ${symbol}`);
       alerts.push(symbol);
+      // Capture entry market cap and each insider's CURRENT balance. Taken
+      // later, the baseline would already include any selling.
+      const balances = {};
+      for (const m of result.clusters?.clusterBuying?.members ?? result.clusters?.watchlisted ?? []) {
+        balances[m.wallet] = await walletTokenBalance(config.rpcUrl, m.wallet, pair.baseToken.address);
+      }
+      if (openPosition(positions, { pair, demand, clusters: result.clusters, rpcBalances: balances })) {
+        console.log(`   📌 Position opened for ${symbol} at ${Math.round(demand.marketCap).toLocaleString('en-US')} — sell triggers armed`);
+      }
     } else if (alert.status === 'failed') {
       console.log(`   ⚠️  Telegram alert FAILED for $${symbol}: ${alert.error}`);
     } else if (alert.status === 'no-credentials') {
@@ -596,6 +612,7 @@ export async function runScan(args = {}) {
   await saveAlertLog(alertLogPath, alertLog);
   pruneObservations(observations, now.getTime());
   await saveObservations(observationsPath, observations);
+  await savePositions(positions);
   await writeFile(funderCachePath, JSON.stringify(funderCache, null, 2), 'utf8');
   const observedWallets = Object.keys(observations.wallets).length;
   if (observedWallets) console.log(`🐋 Elite ledger: ${observedWallets} wallet(s) under observation`);

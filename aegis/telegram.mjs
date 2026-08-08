@@ -104,6 +104,78 @@ const usdShort = (n) => {
 };
 
 /**
+ * SELL signal message.
+ *
+ * Percentages are stated as movement "from the alert market cap", never as your
+ * P&L — Aegis does not know your fill, your size, or whether you took the trade
+ * at all. Saying "you are up 100%" would be inventing a fact about someone
+ * else's money.
+ */
+export function buildSellMessage({
+  position,
+  currentMcap,
+  headline,
+  reason,
+  action,
+  wallet,
+  label,
+  solscan,
+  soldPct,
+  tradeLink,
+}) {
+  const usd = (n) =>
+    n === null || n === undefined ? 'unavailable' : `$${Math.round(n).toLocaleString('en-US')}`;
+
+  const entry = position.entryMarketCap;
+  const movePct =
+    currentMcap !== null && entry > 0 ? ((currentMcap - entry) / entry) * 100 : null;
+  const peakPct =
+    position.peakMarketCap && entry > 0
+      ? ((position.peakMarketCap - entry) / entry) * 100
+      : null;
+
+  const lines = [
+    `🔴 <b>SELL SIGNAL: $${esc(position.symbol)}</b> 🔴`,
+    `<i>Status: EXIT RECOMMENDED</i>`,
+    '',
+    `<b>Reason: ${esc(headline)}</b>`,
+    `• ${esc(reason)}`,
+  ];
+
+  if (wallet) {
+    const short = `${wallet.slice(0, 6)}…${wallet.slice(-4)}`;
+    lines.push(`• Insider Wallet: <a href="${esc(solscan)}">${esc(short)}</a> (${esc(label)})`);
+    if (soldPct !== undefined && soldPct !== null) {
+      lines.push(`• Action: sold ${soldPct.toFixed(0)}% of their holdings on-chain`);
+    }
+  }
+
+  lines.push('');
+  lines.push(`• Alert Market Cap: ${usd(entry)}`);
+  lines.push(
+    `• Current Market Cap: ${usd(currentMcap)}` +
+      (movePct !== null ? ` (${movePct >= 0 ? '+' : ''}${movePct.toFixed(0)}% from alert)` : '')
+  );
+  if (peakPct !== null && peakPct > 0) {
+    lines.push(`• Peak since alert: ${usd(position.peakMarketCap)} (+${peakPct.toFixed(0)}%)`);
+  }
+
+  lines.push('');
+  lines.push('💡 <b>RECOMMENDED ACTION:</b>');
+  lines.push(esc(action));
+
+  const url = tradeUrl(position.address, tradeLink, position.chain);
+  lines.push('');
+  lines.push(`📲 <a href="${esc(url)}">[ Open FOMO App to Sell ]</a>`);
+  lines.push('');
+  lines.push(
+    '<i>Percentages are movement from the alert market cap, not your P&amp;L — Aegis does not know your entry or size. Not financial advice.</i>'
+  );
+
+  return lines.join('\n');
+}
+
+/**
  * Insider cluster block. Only ever reached on a token that cleared every safety
  * gate — coordinated buying of a rug is still a rug, so this never appears on a
  * blocked token.
