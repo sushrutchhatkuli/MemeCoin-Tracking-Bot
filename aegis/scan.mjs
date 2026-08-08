@@ -119,10 +119,18 @@ async function testTelegram(config) {
     process.exit(1);
   }
 
+  // The ONLY placeholder token in the codebase, and it is unreachable from a
+  // real scan — this function runs solely under `--test-telegram`. Labelled
+  // explicitly so a delivered sample can never be mistaken for a live signal.
+  // Every other alert builds its links from the scanned pair's own mint.
   const text = buildMessage({
     pair: {
       chainId: 'solana',
-      baseToken: { symbol: 'TESTCOIN', address: 'So11111111111111111111111111111111111111112' },
+      baseToken: {
+        symbol: 'SAMPLE-NOT-A-REAL-SIGNAL',
+        // Wrapped SOL, used purely so the links resolve to something valid.
+        address: 'So11111111111111111111111111111111111111112',
+      },
     },
     demand: {
       marketCap: 65000,

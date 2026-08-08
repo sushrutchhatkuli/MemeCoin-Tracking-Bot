@@ -385,6 +385,11 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     '',
     `📲 <a href="${esc(tradeUrl(address, tradeLink, pair.chainId))}">[ Open in FOMO App ]</a>`,
     `📈 <a href="https://dexscreener.com/${esc(pair.chainId)}/${esc(address)}">DexScreener</a>`,
+    // Token contract on Solscan — distinct from the wallet links above, which
+    // point at /account/. This is /token/ and resolves the mint itself.
+    ...(pair.chainId === 'solana'
+      ? [`🔍 <a href="https://solscan.io/token/${esc(address)}">Solscan Token</a>`]
+      : []),
     '',
     '<i>Automated on-chain analysis, not financial advice.</i>',
   ].join('\n');
