@@ -373,6 +373,8 @@ async function writeNote({ pair, result, notesDir, config, now }) {
 }
 
 export async function runScan(args = {}) {
+  // Real-time mode is silent by construction: no digest, ever.
+  const realtime = args.realtime === true;
   const config = applyEnvOverrides(
     JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'))
   );
@@ -405,7 +407,11 @@ export async function runScan(args = {}) {
 
   console.log(
     credentials.botToken && credentials.chatId
-      ? `📲 Telegram: configured (alerts at BUY SIGNAL, score ≥ ${config.telegram.minScore})`
+      ? `📲 Telegram: configured — ${
+          config.telegram.insiderOnly !== false
+            ? 'SILENT unless insider activity AND all safety gates pass'
+            : `alerts at BUY SIGNAL, score ≥ ${config.telegram.minScore}`
+        }`
       : '📲 Telegram: no credentials (copy .env.example to .env — alerts disabled)'
   );
 
@@ -507,6 +513,7 @@ export async function runScan(args = {}) {
     const actionable =
       args.all || args.token || verdictInfo.verdict !== 'WATCH' || verdictInfo.score >= config.thresholds.watchScore;
 
+    const quiet = realtime;
     const icon = verdictInfo.blacklisted
       ? '⛔'
       : verdictInfo.serialRugger
@@ -526,8 +533,8 @@ export async function runScan(args = {}) {
           ? ' ⚡SCALP'
           : '';
     const holders = verdictInfo.holderGate?.holders;
-    console.log(
-      `${icon} $${symbol.padEnd(12)} ${String(verdictInfo.score).padStart(3)}/100  ${verdictInfo.verdict.padEnd(24)} ` +
+    if (!quiet) console.log(
+      `${icon} ${symbol.padEnd(12)} ${String(verdictInfo.score).padStart(3)}/100  ${verdictInfo.verdict.padEnd(24)} ` +
         `sec:${audit.status.padEnd(11)} hodl:${String(holders ?? '?').padStart(5)} ` +
         `5m ${demand.m5.buys}/${demand.m5.sells}  liq ${demand.liqToMcapPct.toFixed(0)}%` +
         `${devTag}${smTag}${catTag}${socialBadge(social)}`
@@ -600,7 +607,7 @@ export async function runScan(args = {}) {
   }
   // The digest is what makes a headless deploy usable: it delivers the console
   // view — every verdict, not just BUY SIGNAL — to wherever you actually are.
-  if (config.telegram.sendScanDigest && credentials.botToken && credentials.chatId) {
+  if (!realtime && config.telegram.sendScanDigest && credentials.botToken && credentials.chatId) {
     const sent = await sendTelegram({
       ...credentials,
       text: buildDigest({
@@ -621,7 +628,7 @@ export async function runScan(args = {}) {
     if (skipped.length > 12) console.log(`   … and ${skipped.length - 12} more`);
   }
 
-  return { written, alerts, skipped };
+  return { written, alerts, skipped, scanned: digestRows.length };
 }
 
 // Direct invocation (`node scan.mjs …`) still works; index.mjs is the entry

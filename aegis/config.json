@@ -207,9 +207,41 @@
     "enabled": true,
     "minScore": 80,
     "cooldownHours": 6,
-    "sendScanDigest": true,
-    "requireLiveReaudit": false
+    "sendScanDigest": false,
+    "requireLiveReaudit": false,
+    "insiderOnly": true,
+    "insiderMinScore": 0,
+    "_silenceNote": [
+      "insiderOnly=true: Telegram receives a message ONLY when a token has",
+      "insider/cluster activity AND clears every safety gate. No digests, no",
+      "scam lists, no empty-scan summaries — a tick that finds nothing sends",
+      "nothing.",
+      "",
+      "This REPLACES the old BUY SIGNAL + minScore rule rather than adding to",
+      "it. Real insider entries frequently sit at WATCH because the 5m demand",
+      "ratio is under 2x at the moment of entry; requiring both would filter",
+      "out exactly the early buys this mode exists to catch.",
+      "",
+      "sendScanDigest forced to false — it was the only remaining source of",
+      "routine noise. Set insiderOnly=false to restore the previous behaviour."
+    ]
   },
+  "realtime": {
+    "_note": [
+      "Cadence for loop.mjs. 30s is the TARGET, not the achieved rate: a full",
+      "pass measured 40-55s, and discovery is a fixed cost that does not shrink",
+      "with scanLimit. The loop skips a tick when the previous scan is still",
+      "running, so the real cadence tracks scan duration and skipped ticks are",
+      "reported rather than hidden.",
+      "",
+      "To get closer to 30s: lower scanLimit and trim discovery.searchQueries.",
+      "RPC BUDGET: this runs ~2000 scans/day vs ~120 on the 12-minute task."
+    ],
+    "intervalSeconds": 30,
+    "scanLimit": 8,
+    "maintenanceEveryTicks": 20
+  },
+
   "writeNotes": true,
   "tradeLinkTemplate": "https://fomo.family/tokens/{chain}/{address}",
   "tradeLinkLabel": "Trade on FOMO App",

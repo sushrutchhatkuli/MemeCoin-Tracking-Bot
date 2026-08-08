@@ -233,7 +233,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     // Signal type leads, because it determines how the trade should be held —
     // that decision matters more than the score.
     clusters?.detected
-      ? '🚀 <b>INSIDER CLUSTER ALERT</b> 🚀'
+      ? '🚀 <b>REAL-TIME INSIDER BUY ALERT</b> 🚀'
       : signalCategory?.category === 'LONG-TERM GEM'
       ? '💎 <b>LONG-TERM INVESTMENT GEM SIGNAL</b> 💎'
       : signalCategory?.category === 'FAST SCALP'
@@ -460,8 +460,26 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
   }
   if (audit.status !== 'PASSED') return { status: 'blocked-audit-not-passed' };
 
-  if (verdictInfo.verdict !== 'BUY SIGNAL') return { status: 'not-a-signal' };
-  if (verdictInfo.score < config.telegram.minScore) return { status: 'below-score-floor' };
+  // ---- Strict insider-only filter ---------------------------------
+  //
+  // Alert IF AND ONLY IF insider activity was detected AND every safety gate
+  // passed. Both conditions, no exceptions — the audit check above already
+  // guarantees the second, so this adds the first.
+  //
+  // Note this REPLACES the old BUY SIGNAL + score-floor rule rather than
+  // stacking on top of it: a token can carry genuine cluster activity while
+  // sitting at WATCH (demand ratio under 2x), and requiring both would filter
+  // out most real insider entries — which is the opposite of the intent.
+  if (config.telegram.insiderOnly !== false) {
+    if (!result.clusters?.detected) return { status: 'no-insider-activity' };
+    // Kept as an explicit floor, defaulting to 0 so the rule above stands
+    // alone. Raise `telegram.insiderMinScore` to require conviction as well.
+    const floor = config.telegram.insiderMinScore ?? 0;
+    if (verdictInfo.score < floor) return { status: 'below-insider-score-floor' };
+  } else {
+    if (verdictInfo.verdict !== 'BUY SIGNAL') return { status: 'not-a-signal' };
+    if (verdictInfo.score < config.telegram.minScore) return { status: 'below-score-floor' };
+  }
 
   const key = `${pair.chainId}:${pair.baseToken.address}`;
   if (!shouldAlert(alertLog, key, config.telegram.cooldownHours, now)) {
