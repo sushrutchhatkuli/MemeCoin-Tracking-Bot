@@ -30,7 +30,12 @@ import {
 } from './audit.mjs';
 import { renderNote, noteFilename } from './note.mjs';
 import { loadState, saveState, computeVelocity, recordSnapshot } from './state.mjs';
-import { loadWatchlist, matchSmartMoney, fetchRecentBuyers } from './smart_money.mjs';
+import {
+  loadWatchlist,
+  matchSmartMoney,
+  fetchRecentBuyers,
+  SYSTEM_ACCOUNTS,
+} from './smart_money.mjs';
 import {
   auditDeployer,
   loadDeployerCache,
@@ -191,6 +196,7 @@ async function analyzeToken({
   observations,
   funderCache,
   discoveredStore,
+  screenCache,
   now,
 }) {
   const address = pair.baseToken.address;
@@ -237,6 +243,7 @@ async function analyzeToken({
       poolAddress: pair.pairAddress,
       mint: address,
       cfg: config.smartMoney,
+      screenCache,
     });
     buyers = buyerScan.buyers ?? [];
 
@@ -250,6 +257,7 @@ async function analyzeToken({
         symbol: pair.baseToken.symbol,
         marketCap: demand.marketCap,
         now: now.getTime(),
+        systemFilter: (w) => SYSTEM_ACCOUNTS.has(w) || screenCache[w]?.system === true,
       });
     }
   }
@@ -555,6 +563,7 @@ export async function runScan(args = {}) {
       observations,
       funderCache,
       discoveredStore,
+      screenCache,
       now,
     });
     const { verdictInfo, audit, demand, deployer, smartMoney, social } = result;

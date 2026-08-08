@@ -397,7 +397,7 @@ export function extractBuys(txResult, { mint, poolAddress }) {
  * This is the most RPC-expensive call in the pipeline (one getTransaction per
  * signature), so callers should only invoke it when a watchlist actually exists.
  */
-export async function fetchRecentBuyers({ rpcUrl, poolAddress, mint, cfg }) {
+export async function fetchRecentBuyers({ rpcUrl, poolAddress, mint, cfg, screenCache = {} }) {
   if (!poolAddress || !mint) return { ok: false, error: 'missing pool or mint', buyers: [] };
 
   const sigs = await rpc(rpcUrl, 'getSignaturesForAddress', [
@@ -446,9 +446,29 @@ export async function fetchRecentBuyers({ rpcUrl, poolAddress, mint, cfg }) {
     await sleep(cfg.rpcDelayMs);
   }
 
+  // Screen at the source, so system accounts never enter the observation ledger.
+  //
+  // Only the FREE checks run here — the static list and any cached verdict. The
+  // RPC screen costs up to ~10s per novel wallet and the replay sees dozens per
+  // scan, so running it inline would stall every pass. Novel wallets are instead
+  // verified later by `node smart_money.mjs --purge-system`, which screens the
+  // small set that has become suspicious.
+  const filtered = [];
+  const systemFiltered = [];
+  for (const b of buyers.values()) {
+    const known = SYSTEM_ACCOUNTS.get(b.wallet);
+    const cached = screenCache[b.wallet];
+    if (known || cached?.system) {
+      systemFiltered.push({ wallet: b.wallet, reason: known ?? cached.reason });
+      continue;
+    }
+    filtered.push(b);
+  }
+
   return {
     ok: true,
-    buyers: [...buyers.values()],
+    buyers: filtered,
+    systemFiltered,
     inspected,
     requested: target.length,
     throttled,

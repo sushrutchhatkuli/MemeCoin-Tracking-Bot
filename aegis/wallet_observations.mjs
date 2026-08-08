@@ -36,10 +36,19 @@ export async function saveObservations(path, store) {
  * Record that these wallets bought this token, with the economics of the buy
  * where they could be attributed. Outcome is filled in later by the post-mortem.
  */
-export function recordBuys(store, { buyers, token, chain, symbol, marketCap, now }) {
+export function recordBuys(store, { buyers, token, chain, symbol, marketCap, now, systemFilter }) {
   let added = 0;
+  let blocked = 0;
   for (const b of buyers ?? []) {
     if (!b?.wallet) continue;
+
+    // Second line of defence. fetchRecentBuyers already filters, but recordBuys
+    // is also reachable from other paths, and a pool authority that slips into
+    // the ledger poisons every downstream ranking it feeds.
+    if (systemFilter?.(b.wallet)) {
+      blocked++;
+      continue;
+    }
     const entry = (store.wallets[b.wallet] ??= { buys: [] });
 
     // One record per wallet per token — a wallet accumulating across several
@@ -59,7 +68,7 @@ export function recordBuys(store, { buyers, token, chain, symbol, marketCap, now
     });
     added++;
   }
-  return added;
+  return { added, blocked };
 }
 
 /** Attach post-mortem verdicts to any observed buy of the same token. */
