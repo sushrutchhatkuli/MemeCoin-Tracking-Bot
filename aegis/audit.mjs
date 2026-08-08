@@ -504,9 +504,16 @@ export function scoreToken({
   // safety failure like every other bonus.
   const categoryBonus = safetyGateFailed ? 0 : (signalCategory?.scoreBoost ?? 0);
 
-  // Insider-cluster bonus. Forfeited on a safety failure like every other
-  // bonus: coordinated buying of a rug is still a rug.
-  const clusterBonus = safetyGateFailed ? 0 : (clusters?.scoreBonus ?? 0);
+  // Insider-cluster multiplier. Requires the audit to have AFFIRMATIVELY
+  // PASSED — not merely "not failed".
+  //
+  // UNVERIFIED means the gates could not be checked (provider had no data), and
+  // "could not verify" is not "passed". Gating this on `safetyGateFailed` alone
+  // let a 4-wallet swarm add +50 to a token whose contract was never verified.
+  // The score cap on UNVERIFIED hid the effect, which is exactly why it needed
+  // fixing: a later change to that cap would have silently reopened it.
+  const gatesFullyPassed = audit.status === 'PASSED' && !safetyGateFailed;
+  const clusterBonus = gatesFullyPassed ? (clusters?.scoreBonus ?? 0) : 0;
 
   let score = Math.round(
     demandScore +

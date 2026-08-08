@@ -266,8 +266,23 @@ export async function detectInsiderClusters({
     watchlistedAny.length > 0 ||
     oversized.length > 0;
 
+  // Single authoritative roster of DISTINCT insider wallets. The three sources
+  // overlap heavily — a watchlisted wallet that also bought early and shares a
+  // funder appears in all of them — so the scaling multiplier must count unique
+  // addresses, not list lengths, or one wallet would score as three.
+  const insiderRoster = new Map();
+  for (const a of watchlistedAny) insiderRoster.set(a.wallet, a);
+  for (const a of clusterMembers) if (!insiderRoster.has(a.wallet)) insiderRoster.set(a.wallet, a);
+  for (const n of networks) {
+    for (const a of n.members) if (!insiderRoster.has(a.wallet)) insiderRoster.set(a.wallet, a);
+  }
+  const uniqueInsiders = [...insiderRoster.values()].sort(
+    (a, b) => (b.solSpent ?? 0) - (a.solSpent ?? 0)
+  );
+
   let label = null;
-  if (clusterBuying && networks.length) label = 'CABAL BUNDLE NETWORK';
+  if (uniqueInsiders.length >= 4) label = 'CABAL SWARM';
+  else if (clusterBuying && networks.length) label = 'CABAL BUNDLE NETWORK';
   else if (clusterBuying) label = 'INSIDER CLUSTER';
   else if (networks.length) label = 'SHARED FUNDER NETWORK';
   else if (watchlistedAny.length) label = 'INSIDER TRACKED';
@@ -280,21 +295,62 @@ export async function detectInsiderClusters({
     oversized,
     networks,
     watchlisted: watchlistedAny,
+    uniqueInsiders,
+    insiderCount: uniqueInsiders.length,
     tracedWallets: traced,
     buyersSeen: annotated.length,
   };
 }
 
 /**
- * Score contribution. Deliberately conservative and capped: coordination is
- * suggestive, not proof, and it must never outweigh the safety gates.
+ * Multi-insider scaling multiplier.
+ *
+ * Scales with the count of DISTINCT insider wallets, because several
+ * independent wallets converging on one token in the launch window is far
+ * stronger evidence than one wallet doing something unusual:
+ *
+ *   1 wallet   +15   Insider Tracked
+ *   2 wallets  +25   Dual Insider Cluster
+ *   3 wallets  +35   Strong Cabal Cluster
+ *   4+ wallets +50   Cabal Swarm
+ *
+ * Applied ONLY when every safety gate passed — enforced by the caller in
+ * audit.mjs, which zeroes this on any gate failure. That ordering is the whole
+ * point: without it, a cabal buying its own rug would score higher than a clean
+ * token, which is precisely the manipulation the shield exists to defeat.
+ *
+ * A note on the score that results: this is ADDITIVE to the fundamentals, so a
+ * swarm lands at (base + 50) clamped to 100. A token with weak demand and thin
+ * liquidity will NOT reach 90 on insider count alone, and that is deliberate —
+ * four wallets buying an illiquid token is a reason to look, not a reason to
+ * override what the market data says.
  */
 export function clusterScoreBonus(clusters, config) {
   if (!clusters?.detected) return 0;
   const cfg = config.insiderCluster ?? {};
-  let bonus = 0;
-  if (clusters.clusterBuying) bonus += cfg.bonusCluster ?? 10;
-  if (clusters.networks.length) bonus += cfg.bonusFunderNetwork ?? 8;
-  if (clusters.oversized.length) bonus += cfg.bonusOversized ?? 5;
-  return Math.min(bonus, cfg.bonusCap ?? 20);
+  const tiers = cfg.insiderScaleTiers ?? { 1: 15, 2: 25, 3: 35, 4: 50 };
+
+  const count = clusters.insiderCount ?? 0;
+  if (count >= 1) {
+    const keys = Object.keys(tiers)
+      .map(Number)
+      .sort((a, b) => a - b);
+    let bonus = 0;
+    for (const k of keys) if (count >= k) bonus = tiers[k];
+    return bonus;
+  }
+
+  // No identified insider wallets, but a non-routine buy size still counts —
+  // it is Pillar 2 standing alone.
+  if (clusters.oversized?.length) return cfg.bonusOversized ?? 5;
+  return 0;
+}
+
+/** Human-readable tier name for the alert header. */
+export function insiderTierLabel(count) {
+  if (count >= 4) return 'CABAL SWARM';
+  if (count === 3) return 'STRONG CABAL CLUSTER';
+  if (count === 2) return 'DUAL INSIDER CLUSTER';
+  if (count === 1) return 'INSIDER TRACKED';
+  return null;
 }

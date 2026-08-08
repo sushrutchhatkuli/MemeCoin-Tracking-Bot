@@ -2248,6 +2248,30 @@
       "reason": "Post-mortem: $KODY fell -68.5% within 1.05h",
       "added": "2026-08-08",
       "source": "post-mortem"
+    },
+    {
+      "address": "Kv74VerUxQLgVTd44RXD4kg9Mycin4xRzWna2RBy4bo",
+      "reason": "Post-mortem: $SOW fell -100% within 5.86h (pair delisted)",
+      "added": "2026-08-08",
+      "source": "post-mortem"
+    },
+    {
+      "address": "69XFj6pkAvTQYc4RC3tqsNNLCK5MpJDbjDa6KLJSWmiT",
+      "reason": "Post-mortem: $CATEBANK fell -78.6% within 1.26h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
+    },
+    {
+      "address": "7WmZJMU65vNEzaHCuPSURii7LrA9Hos8z7gBp7Z7TUmZ",
+      "reason": "Post-mortem: $MEOWERS fell -75.8% within 1.18h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
+    },
+    {
+      "address": "AcvNbEVLX1nFBATUTKjj1B6VUs6P7PCumw3iLs6rttJA",
+      "reason": "Post-mortem: $@trade fell -87.1% within 1.06h",
+      "added": "2026-08-08",
+      "source": "post-mortem"
     }
   ],
   "mints": [

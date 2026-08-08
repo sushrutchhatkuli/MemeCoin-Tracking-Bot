@@ -183,18 +183,33 @@ export function buildSellMessage({
 function renderClusters(clusters) {
   if (!clusters?.detected) return [];
 
-  const lines = ['', '🕵️ <b>CLUSTER &amp; INSIDER ACTIVITY:</b>'];
+  const count = clusters.insiderCount ?? 0;
+  const multi = count >= 2;
+
+  // Header scales with the count, because "4 unique wallets bought this" is the
+  // headline fact — more decision-relevant than any single wallet's detail.
+  const lines = multi
+    ? [
+        '',
+        `🔥 <b>MULTIPLE INSIDERS DETECTED (${count} Unique Wallets Bought Same Coin!)</b>`,
+      ]
+    : ['', '🕵️ <b>CLUSTER &amp; INSIDER ACTIVITY:</b>'];
 
   const bits = [];
   if (clusters.clusterBuying) bits.push(`${clusters.clusterBuying.size} wallets in launch window`);
   if (clusters.networks.length) bits.push('same funder network');
   if (clusters.oversized.length) bits.push(`${clusters.oversized.length} oversized buy(s)`);
-  lines.push(`• Cluster Detected: ${esc(bits.join(' + '))} ✅`);
+  if (bits.length) lines.push(`• Signals: ${esc(bits.join(' + '))} ✅`);
 
-  // Individual wallets, largest first.
+  // The deduplicated roster, largest spend first. Falls back to the older lists
+  // if an upstream caller has not populated it.
   const members = (
-    clusters.clusterBuying?.members ?? clusters.watchlisted ?? []
-  ).slice(0, 5);
+    clusters.uniqueInsiders ??
+    clusters.clusterBuying?.members ??
+    clusters.watchlisted ??
+    []
+  ).slice(0, 6);
+
   members.forEach((m, i) => {
     const spend =
       m.solSpent !== null && m.solSpent !== undefined
@@ -206,8 +221,8 @@ function renderClusters(clusters) {
         ? ` (${m.secondsAfterLaunch < 60 ? `${Math.round(m.secondsAfterLaunch)}s` : `${Math.round(m.secondsAfterLaunch / 60)}m`} after launch)`
         : '';
     lines.push(
-      `• Wallet ${i + 1}: <a href="${esc(m.solscan)}">${esc(m.short)}</a>` +
-        `${m.label ? ` (${esc(m.label)})` : ''} — ${esc(spend + mc + timing)}`
+      `• <b>Insider #${i + 1}</b> (${esc(m.short)}): ${esc(spend + mc + timing)} | ` +
+        `🔗 <a href="${esc(m.solscan)}">Solscan</a>`
     );
   });
 
@@ -330,8 +345,12 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
   return [
     // Signal type leads, because it determines how the trade should be held —
     // that decision matters more than the score.
-    clusters?.detected
-      ? '🚀 <b>REAL-TIME INSIDER BUY ALERT</b> 🚀'
+    (clusters?.insiderCount ?? 0) >= 4
+      ? '🚀 <b>CABAL SWARM BUY ALERT</b> 🚀'
+      : (clusters?.insiderCount ?? 0) >= 2
+        ? '🚀 <b>MULTI-INSIDER BUY ALERT</b> 🚀'
+        : clusters?.detected
+          ? '🚀 <b>REAL-TIME INSIDER BUY ALERT</b> 🚀'
       : signalCategory?.category === 'LONG-TERM GEM'
       ? '💎 <b>LONG-TERM INVESTMENT GEM SIGNAL</b> 💎'
       : signalCategory?.category === 'FAST SCALP'

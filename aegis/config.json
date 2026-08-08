@@ -101,10 +101,23 @@
     "unusualBuySol": 5,
     "unusualBuyLpPct": 5,
     "traceTopBuyers": 8,
-    "bonusCluster": 10,
-    "bonusFunderNetwork": 8,
-    "bonusOversized": 5,
-    "bonusCap": 20
+    "_scalingNote": [
+      "Multi-insider scaling multiplier, keyed on the count of DISTINCT insider",
+      "wallets. The three detection sources overlap heavily — one wallet can be",
+      "watchlisted AND early AND co-funded — so the count is of unique addresses,",
+      "not list lengths, or a single wallet would score as three.",
+      "",
+      "Applied ONLY after every safety gate passes. audit.mjs zeroes this on any",
+      "gate failure, so a cabal buying its own rug can never outscore a clean",
+      "token.",
+      "",
+      "ADDITIVE to the fundamentals, not a floor: a swarm lands at base+50",
+      "clamped to 100. A token with weak demand and thin liquidity will not",
+      "reach 90 on insider count alone — four wallets buying something illiquid",
+      "is a reason to look, not a reason to override the market data."
+    ],
+    "insiderScaleTiers": { "1": 15, "2": 25, "3": 35, "4": 50 },
+    "bonusOversized": 5
   },
 
   "discovery": {
