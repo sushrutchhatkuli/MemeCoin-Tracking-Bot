@@ -198,10 +198,13 @@ export function evaluateTriggers(position, currentMcap, insiderStates, cfg) {
   if (!fired.has(TRIGGER.TAKE_PROFIT) && currentMcap !== null && entry > 0) {
     if (currentMcap >= entry * tpMultiple) {
       const gainPct = ((currentMcap - entry) / entry) * 100;
+      const targetPct = Math.round((tpMultiple - 1) * 100);
       out.push({
         trigger: TRIGGER.TAKE_PROFIT,
-        headline: '💰 TAKE-PROFIT TARGET HIT',
-        reason: `Token is up +${gainPct.toFixed(0)}% from the alert market cap`,
+        // Headline states the configured target and the actual move, so the
+        // message stays correct if the multiple is retuned again.
+        headline: `💰 TAKE PROFIT: Up +${gainPct.toFixed(0)}%! Lock in gains now!`,
+        reason: `Token passed the +${targetPct}% target — now +${gainPct.toFixed(0)}% from the alert market cap`,
         action:
           'Consider taking out your initial capital so the remainder rides risk-free.',
         // Deliberately does not close: the stop-loss must keep protecting the

@@ -58,7 +58,20 @@ let skipped = 0;
 let alertsSent = 0;
 const durations = [];
 
-async function onTick(config, limit, heavyEveryTicks) {
+async function onTick(bootConfig, limit, heavyEveryTicks) {
+  // Re-read config every tick rather than using the startup snapshot.
+  //
+  // A long-running loop that caches config silently ignores every change until
+  // it is restarted — so retuning takeProfitMultiple or insiderMinScore would
+  // appear to do nothing while the process kept using the old values. Falls
+  // back to the boot snapshot if the file is mid-write.
+  let config = bootConfig;
+  try {
+    config = JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'));
+  } catch {
+    /* keep the last good config */
+  }
+
   // Non-overlap guard. Two concurrent scans would race on snapshots.json,
   // wallet_observations.json and the alert log — the last writer would silently
   // discard the other's work.

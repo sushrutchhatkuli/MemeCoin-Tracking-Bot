@@ -238,7 +238,17 @@
     "sendScanDigest": false,
     "requireLiveReaudit": false,
     "insiderOnly": true,
-    "insiderMinScore": 0,
+    "insiderMinScore": 75,
+    "_insiderMinScoreNote": [
+      "Raised 0 -> 75 on 2026-08-08. This is a large change in volume, not a",
+      "small tightening: of the 10 alerts the loop sent overnight, exactly ONE",
+      "($BUBBLES, 76) clears a 75 floor. The other nine scored 45-70.",
+      "",
+      "Expect roughly one alert per night rather than ten. That is the intent —",
+      "conviction AND insider activity — but if the phone goes silent for days,",
+      "this threshold is why, not a broken scanner. Lower to ~65 to roughly",
+      "double the flow."
+    ],
     "_silenceNote": [
       "insiderOnly=true: Telegram receives a message ONLY when a token has",
       "insider/cluster activity AND clears every safety gate. No digests, no",
@@ -303,9 +313,16 @@
     ],
     "enabled": true,
     "insiderExitPct": 40,
-    "takeProfitMultiple": 2,
+    "takeProfitMultiple": 1.5,
     "stopLossPct": 20,
-    "maxMonitorHours": 48
+    "maxMonitorHours": 48,
+    "_takeProfitNote": [
+      "Lowered 2.0 -> 1.5 on 2026-08-08 from measured behaviour, not preference.",
+      "Across 10 overnight positions: 8 hit STOP_LOSS, 0 hit TAKE_PROFIT, median",
+      "peak +56%. Five peaked between +56% and +99% and then round-tripped past",
+      "-20%. $NEEGY peaked at +99% — one point short of the 2x trigger.",
+      "At 1.5x those same five fire near their highs: 5/10 instead of 0/10."
+    ]
   },
   "realtime": {
     "_note": [
