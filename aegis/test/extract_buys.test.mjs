@@ -40,6 +40,9 @@ import { walletScorecard } from '../wallet_observations.mjs';
 import { detectJitoBundles } from '../insider_cluster.mjs';
 import { recommendSize, formatSizeLine } from '../position_sizer.mjs';
 import { pollOnce, pollerIsLive, pruneWatchState } from '../liquidity_watch.mjs';
+import { parseMultiplierRecap } from '../telegram_listener.mjs';
+import { awardAlphaPoints, scoreForwardTrade, applyOutcomes, pruneObservations } from '../wallet_observations.mjs';
+import { filterLaunchWindow } from '../multiplier_engine.mjs';
 import { pruneCooldown, isOnCooldown, cooldownKey } from '../scan.mjs';
 import { capEnrichmentShortlist } from '../auto_top_whales.mjs';
 import { extractMints, channelMatches, SeenCache } from '../telegram_listener.mjs';
@@ -1019,6 +1022,181 @@ test('a missing or malformed baseline never fires', () => {
     detectLiquidityDrain(pos(100, 45), 50, { liquidityDrain: { enabled: false } }, NOW2),
     null
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * Multiplier recap parsing
+ * ------------------------------------------------------------------ */
+
+const MINT_A = 'mNzssXQ9hU1ASJ1CVuu4JjrFBrfeVdR2JzirKS3pump';
+const MINT_B = '7jFpDComUfCZnFrG65CR9wyDesFtA5oJPvUMdfuopump';
+
+test('a recap post yields one row per token with its own multiplier', () => {
+  const post = [
+    '🏆 TODAY\'S CALLS 🏆',
+    `$TOAD 42X — ${MINT_A}`,
+    `$JEFF 31x | ${MINT_B}`,
+    'Join the VIP for more!',
+  ].join('\n');
+
+  const { rows } = parseMultiplierRecap(post);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(
+    rows.map((r) => [r.symbol, r.multiplier, r.address]),
+    [['TOAD', 42, MINT_A], ['JEFF', 31, MINT_B]]
+  );
+});
+
+test('a multiplier on a line without a contract is NOT guessed at', () => {
+  // The single most dangerous failure in this parser: pairing 42X with the
+  // wrong contract awards alpha to the wrong wallets and marks them protected.
+  const post = ['$TOAD did 42X today!', `contract: ${MINT_A}`].join('\n');
+  const { rows, unpaired } = parseMultiplierRecap(post);
+  assert.equal(rows.length, 0, 'address on the next line must not be paired');
+  assert.equal(unpaired, 1, 'and the skip is counted, not silent');
+});
+
+test('a line with two contracts is ambiguous and skipped', () => {
+  const { rows, unpaired } = parseMultiplierRecap(`30X ${MINT_A} ${MINT_B}`);
+  assert.equal(rows.length, 0);
+  assert.equal(unpaired, 1);
+});
+
+test('multipliers below the floor are ignored', () => {
+  const post = `$TOAD 1.5X ${MINT_A}\n$JEFF 10X ${MINT_B}`;
+  const { rows } = parseMultiplierRecap(post, { minMultiplier: 2 });
+  assert.deepEqual(rows.map((r) => r.multiplier), [10]);
+});
+
+test('decimals parse and a repeated contract is credited once', () => {
+  assert.equal(parseMultiplierRecap(`$T 12.5x ${MINT_A}`).rows[0].multiplier, 12.5);
+  const dupe = parseMultiplierRecap(`$T 12x ${MINT_A}\n$T 40x ${MINT_A}`);
+  assert.equal(dupe.rows.length, 1, 'first mention wins; no double credit');
+});
+
+test('bare prose and hex-ish noise produce nothing', () => {
+  assert.deepEqual(parseMultiplierRecap('we are 100x bullish on solana today').rows, []);
+  assert.deepEqual(parseMultiplierRecap('').rows, []);
+  assert.deepEqual(parseMultiplierRecap(null).rows, []);
+  // "0x..." style tokens must not read as a multiplier of 0.
+  assert.deepEqual(parseMultiplierRecap(`0xAbCd 5xyz ${MINT_A}`).rows, []);
+});
+
+/* ------------------------------------------------------------------ *
+ * Alpha points, protection and forward scoring
+ * ------------------------------------------------------------------ */
+
+const alphaCfg = {
+  multiplierEngine: {
+    pointsPerMultiplier: 2.5, protectAboveMultiplier: 10,
+    forwardWinPoints: 5, forwardLossPoints: 8, alphaFloor: -50,
+  },
+};
+
+test('launch buyers are credited multiplier-weighted points', () => {
+  const store = { wallets: {} };
+  const r = awardAlphaPoints(store, {
+    wallets: ['W1', 'W2'], token: MINT_A, symbol: 'TOAD', multiplier: 42, config: alphaCfg,
+  });
+  assert.equal(r.credited, 2);
+  assert.equal(store.wallets.W1.alpha.points, 105, '42 x 2.5');
+  assert.equal(store.wallets.W1.megaWinProtected, true);
+  assert.match(store.wallets.W1.megaWinReason, /\$TOAD \(42x\)/);
+});
+
+test('a reposted recap cannot compound the same win', () => {
+  const store = { wallets: {} };
+  const opts = { wallets: ['W1'], token: MINT_A, symbol: 'TOAD', multiplier: 42, config: alphaCfg };
+  awardAlphaPoints(store, opts);
+  const second = awardAlphaPoints(store, opts);
+  assert.equal(second.credited, 0);
+  assert.equal(second.skipped, 1);
+  assert.equal(store.wallets.W1.alpha.points, 105, 'unchanged on the repost');
+});
+
+test('a win below the protection threshold credits but does not protect', () => {
+  const store = { wallets: {} };
+  awardAlphaPoints(store, { wallets: ['W1'], token: MINT_B, multiplier: 6, config: alphaCfg });
+  assert.equal(store.wallets.W1.alpha.points, 15);
+  assert.notEqual(store.wallets.W1.megaWinProtected, true);
+});
+
+test('protected wallets survive pruning; unprotected ones do not', () => {
+  // Past MAX_AGE_MS (90 days) — checked against the constant, not guessed.
+  const old = Date.now() - 100 * 86_400_000;
+  const store = {
+    wallets: {
+      PROTECTED: { buys: [{ token: 't', ts: old }], megaWinProtected: true, alpha: { points: 105 } },
+      ORDINARY: { buys: [{ token: 't', ts: old }] },
+    },
+  };
+  pruneObservations(store, Date.now());
+  assert.ok(store.wallets.PROTECTED, 'kept even with zero surviving buys');
+  assert.equal(store.wallets.PROTECTED.alpha.points, 105, 'score survives too');
+  assert.equal(store.wallets.PROTECTED.buys.length, 0, 'but its buy history still ages');
+  assert.equal(store.wallets.ORDINARY, undefined);
+});
+
+test('forward trades award on wins and deduct more on losses', () => {
+  const entry = { buys: [], alpha: { points: 100, awarded: {} } };
+  assert.equal(scoreForwardTrade(entry, { outcome: 'WIN', config: alphaCfg }).after, 105);
+  assert.equal(scoreForwardTrade(entry, { outcome: 'FAIL', config: alphaCfg }).after, 97);
+  assert.deepEqual(entry.alpha.forward, { wins: 1, losses: 1 });
+  // Asymmetric on purpose: the base rate is ~77% rugged, so symmetric scoring
+  // would drift upward on noise alone.
+  assert.equal(alphaCfg.multiplierEngine.forwardLossPoints > alphaCfg.multiplierEngine.forwardWinPoints, true);
+});
+
+test('a lucky wallet that keeps buying rugs decays back down', () => {
+  const entry = { buys: [], alpha: { points: 105, awarded: {} } };
+  for (let i = 0; i < 20; i++) scoreForwardTrade(entry, { outcome: 'FAIL', config: alphaCfg });
+  assert.equal(entry.alpha.points, -50, 'clamped at the floor, not unbounded');
+  assert.equal(entry.alpha.forward.losses, 20);
+});
+
+test('ungraded and NEUTRAL outcomes move nothing', () => {
+  const entry = { buys: [], alpha: { points: 10, awarded: {} } };
+  for (const outcome of ['NEUTRAL', null, undefined, 'PENDING']) {
+    assert.equal(scoreForwardTrade(entry, { outcome, config: alphaCfg }), null, String(outcome));
+  }
+  assert.equal(entry.alpha.points, 10);
+});
+
+test('forward scoring only touches wallets that carry an alpha record', () => {
+  // Scoring the whole 30,000-entry ledger would just re-derive the win rate
+  // walletStats already computes.
+  const store = {
+    wallets: {
+      TRACKED: { buys: [{ token: 'T1', ts: Date.now() }], alpha: { points: 50, awarded: {} } },
+      PLAIN: { buys: [{ token: 'T1', ts: Date.now() }] },
+    },
+  };
+  const res = applyOutcomes(store, [{ address: 'T1', verdict: 'FAIL', changePct: -90 }], { config: alphaCfg });
+  assert.equal(res.graded, 2, 'both buys are graded');
+  assert.equal(res.scored, 1, 'only the tracked wallet is scored');
+  assert.equal(res.demoted, 1);
+  assert.equal(store.wallets.TRACKED.alpha.points, 42);
+  assert.equal(store.wallets.PLAIN.alpha, undefined);
+});
+
+/* ------------------------------------------------------------------ *
+ * Launch-window filtering
+ * ------------------------------------------------------------------ */
+
+test('only buyers with a KNOWN entry inside the window are credited', () => {
+  const buyers = [
+    { wallet: 'IN1', entryMarketCapUsd: 45_000 },
+    { wallet: 'IN2', entryMarketCapUsd: 99_000 },
+    { wallet: 'LOW', entryMarketCapUsd: 12_000 },
+    { wallet: 'HIGH', entryMarketCapUsd: 400_000 },
+    { wallet: 'UNKNOWN', entryMarketCapUsd: null },
+  ];
+  const r = filterLaunchWindow(buyers, { minMcapUsd: 30_000, maxMcapUsd: 100_000 });
+  assert.deepEqual(r.inWindow.map((b) => b.wallet), ['IN1', 'IN2']);
+  assert.equal(r.outside, 2);
+  // An unattributable entry must not be credited as a launch entry — that is
+  // how a wallet that bought the top gets recorded as having bought the bottom.
+  assert.equal(r.noEntryPrice, 1);
 });
 
 /* ------------------------------------------------------------------ *

@@ -397,6 +397,104 @@ export function extractBuys(txResult, { mint, poolAddress }) {
  * This is the most RPC-expensive call in the pipeline (one getTransaction per
  * signature), so callers should only invoke it when a watchlist actually exists.
  */
+/**
+ * Page backwards to the OLDEST signatures on a pool, then replay them.
+ *
+ * fetchRecentBuyers reads the newest page and stops, which is right for a live
+ * scan. Finding who bought a 42x at its launch needs the opposite end of the
+ * history, and getSignaturesForAddress only walks backwards via `before` — so
+ * reaching genesis means paging through everything in between.
+ *
+ * ── THE COST, AND WHY IT IS CAPPED ──────────────────────────────────────────
+ * A token that ran 42x has a busy pool. At 1,000 signatures per page, tens of
+ * thousands of transactions is tens of pages just to REACH the start, before
+ * any transaction is fetched. maxPages bounds that walk.
+ *
+ * If the cap is hit the oldest page reached is NOT the launch, and the result
+ * says so with `reachedGenesis: false`. That distinction matters: buyers found
+ * in a truncated walk are early-ish, not early, and treating them as launch
+ * buyers would award mega-win alpha points to people who arrived late.
+ */
+export async function fetchEarliestBuyers({ rpcUrl, poolAddress, mint, cfg = {}, solUsd = null }) {
+  if (!poolAddress || !mint) return { ok: false, error: 'missing pool or mint', buyers: [] };
+
+  const maxPages = cfg.genesisMaxPages ?? 25;
+  const perPage = cfg.genesisPageSize ?? 1000;
+  const replayCount = cfg.genesisReplayTxs ?? 40;
+  const delayMs = cfg.rpcDelayMs ?? 220;
+
+  let before = null;
+  let oldest = [];
+  let pages = 0;
+  let reachedGenesis = false;
+
+  while (pages < maxPages) {
+    const page = await rpc(rpcUrl, 'getSignaturesForAddress', [
+      poolAddress,
+      before ? { limit: perPage, before } : { limit: perPage },
+    ]);
+    if (page.error) break;
+    const list = page.result ?? [];
+    if (!list.length) {
+      reachedGenesis = true;
+      break;
+    }
+    oldest = list;
+    before = list[list.length - 1].signature;
+    pages++;
+    if (list.length < perPage) {
+      // A short page means there is nothing older — this IS the launch.
+      reachedGenesis = true;
+      break;
+    }
+    await sleep(delayMs);
+  }
+
+  if (!oldest.length) return { ok: false, error: 'no pool history', buyers: [], pages };
+
+  // Oldest-first, then replay the first handful — the launch window.
+  const launchSigs = [...oldest].reverse().slice(0, replayCount);
+  const buyers = new Map();
+  let inspected = 0;
+
+  for (const sig of launchSigs) {
+    const tx = await rpc(rpcUrl, 'getTransaction', [
+      sig.signature,
+      { maxSupportedTransactionVersion: 0, encoding: 'jsonParsed' },
+    ]);
+    if (tx.error) break;
+    inspected++;
+    if (tx.result?.meta?.err) {
+      await sleep(delayMs);
+      continue;
+    }
+    for (const b of extractBuys(tx.result, { mint, poolAddress })) {
+      if (buyers.has(b.wallet)) continue;
+      buyers.set(b.wallet, {
+        ...b,
+        blockTime: sig.blockTime ?? 0,
+        slot: sig.slot ?? null,
+        signature: sig.signature,
+        usdSpent: b.solSpent && solUsd ? b.solSpent * solUsd : null,
+      });
+    }
+    await sleep(delayMs);
+  }
+
+  return {
+    ok: true,
+    buyers: [...buyers.values()],
+    pages,
+    inspected,
+    reachedGenesis,
+    // Stated so the caller can refuse to award launch-buyer credit on a walk
+    // that never reached the launch.
+    note: reachedGenesis
+      ? `walked ${pages} page(s) to pool genesis`
+      : `stopped at the ${maxPages}-page cap — these are the oldest REACHED, not the first buyers`,
+  };
+}
+
 export async function fetchRecentBuyers({ rpcUrl, poolAddress, mint, cfg, screenCache = {} }) {
   if (!poolAddress || !mint) return { ok: false, error: 'missing pool or mint', buyers: [] };
 

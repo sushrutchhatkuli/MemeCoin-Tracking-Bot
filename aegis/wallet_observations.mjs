@@ -72,9 +72,12 @@ export function recordBuys(store, { buyers, token, chain, symbol, marketCap, now
 }
 
 /** Attach post-mortem verdicts to any observed buy of the same token. */
-export function applyOutcomes(store, results) {
+export function applyOutcomes(store, results, { config = {} } = {}) {
   const byToken = new Map((results ?? []).map((r) => [r.address, r]));
   let graded = 0;
+  let scored = 0;
+  let promoted = 0;
+  let demoted = 0;
 
   for (const entry of Object.values(store.wallets)) {
     for (const buy of entry.buys) {
@@ -84,9 +87,27 @@ export function applyOutcomes(store, results) {
       buy.outcome = r.verdict;
       buy.changePct = r.changePct;
       graded++;
+
+      // Forward scoring. Applied ONLY to wallets already carrying an alpha
+      // record — the point is to test wallets that a multiplier recap
+      // surfaced, by watching what they do afterwards. Scoring every wallet in
+      // a 30,000-entry ledger would just re-derive the win rate that
+      // walletStats already computes.
+      if (entry.alpha) {
+        const moved = scoreForwardTrade(entry, {
+          outcome: r.verdict,
+          changePct: r.changePct,
+          config,
+        });
+        if (moved) {
+          scored++;
+          if (moved.delta > 0) promoted++;
+          else demoted++;
+        }
+      }
     }
   }
-  return graded;
+  return { graded, scored, promoted, demoted };
 }
 
 /** Drop stale records so the ledger stays bounded. */
@@ -94,8 +115,102 @@ export function pruneObservations(store, now = Date.now()) {
   const floor = now - MAX_AGE_MS;
   for (const [wallet, entry] of Object.entries(store.wallets)) {
     entry.buys = entry.buys.filter((b) => b.ts >= floor).slice(-MAX_BUYS_PER_WALLET);
-    if (!entry.buys.length) delete store.wallets[wallet];
+
+    // mega_win_protected wallets survive pruning even with zero surviving buys.
+    // They were identified as launch buyers of a large winner, which is the
+    // scarcest evidence the ledger holds — and the whole point of tracking them
+    // is what they do NEXT, which can be months away. Ageing them out would
+    // discard the record precisely while waiting for the thing it exists for.
+    //
+    // Their buy history still ages normally; only the wallet row is kept, along
+    // with its alpha score and provenance.
+    if (!entry.buys.length && !entry.megaWinProtected) delete store.wallets[wallet];
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Multiplier-weighted alpha points
+ * ------------------------------------------------------------------ */
+
+/**
+ * Credit launch buyers of a large winner.
+ *
+ * ── THE STATISTICAL HEALTH WARNING THAT BELONGS HERE ────────────────────────
+ * These wallets are selected BECAUSE they were in a token that won. That is
+ * selection on the outcome, and on its own it establishes nothing about skill:
+ * every buyer of a 42x looks brilliant in hindsight, including the ones who
+ * bought a hundred rugs the same week and are never in a recap post. Recap
+ * channels publish winners and omit losers, so the sample is doubly biased.
+ *
+ * So an alpha score here is a REASON TO WATCH a wallet, not evidence about it.
+ * What converts it into evidence is the forward record — post_mortem grading
+ * their subsequent buys, awarding on winners and deducting on rugs. Until a
+ * wallet has forward history, treat a high alpha score as "was present at one
+ * good outcome", which is exactly what it measures.
+ *
+ * `awarded` is keyed by token so a channel reposting the same recap cannot
+ * compound the same win into an ever-growing score.
+ */
+export function awardAlphaPoints(store, { wallets, token, symbol, multiplier, config = {}, now = Date.now() }) {
+  const cfg = config.multiplierEngine ?? {};
+  const perX = cfg.pointsPerMultiplier ?? 2.5;
+  const protectFrom = cfg.protectAboveMultiplier ?? 10;
+
+  let credited = 0;
+  let skipped = 0;
+
+  for (const wallet of wallets ?? []) {
+    if (!wallet) continue;
+    const entry = (store.wallets[wallet] ??= { buys: [] });
+    entry.alpha ??= { points: 0, awarded: {} };
+
+    // One award per wallet per token, however many times the recap is posted.
+    if (entry.alpha.awarded[token]) {
+      skipped++;
+      continue;
+    }
+
+    const points = multiplier * perX;
+    entry.alpha.points = Number((entry.alpha.points + points).toFixed(2));
+    entry.alpha.awarded[token] = { multiplier, points, symbol: symbol ?? null, at: now };
+
+    if (multiplier >= protectFrom) {
+      entry.megaWinProtected = true;
+      entry.megaWinReason = `launch buyer of ${symbol ? `$${symbol}` : token.slice(0, 8)} (${multiplier}x)`;
+    }
+    credited++;
+  }
+  return { credited, skipped };
+}
+
+/**
+ * Move a wallet's alpha score on a graded forward trade.
+ *
+ * Awards on a WIN and DEDUCTS on a FAIL, so a wallet that got lucky once and
+ * then bought ten rugs decays back down instead of sitting on a permanent
+ * credential earned in a single token. The floor stops a score going
+ * arbitrarily negative — past zero the wallet is simply not interesting, and
+ * further subtraction carries no extra information.
+ */
+export function scoreForwardTrade(entry, { outcome, changePct = null, config = {} }) {
+  const cfg = config.multiplierEngine ?? {};
+  const win = cfg.forwardWinPoints ?? 5;
+  const loss = cfg.forwardLossPoints ?? 8;
+  const floor = cfg.alphaFloor ?? -50;
+
+  if (!entry || (outcome !== 'WIN' && outcome !== 'FAIL')) return null;
+  entry.alpha ??= { points: 0, awarded: {} };
+
+  // A rug costs more than a win pays. The base rate is ~77% rugged, so
+  // symmetric scoring would drift upward on noise alone.
+  const delta = outcome === 'WIN' ? win : -loss;
+  const before = entry.alpha.points;
+  entry.alpha.points = Number(Math.max(floor, before + delta).toFixed(2));
+  entry.alpha.forward ??= { wins: 0, losses: 0 };
+  if (outcome === 'WIN') entry.alpha.forward.wins++;
+  else entry.alpha.forward.losses++;
+
+  return { before, after: entry.alpha.points, delta, changePct };
 }
 
 /**

@@ -114,6 +114,78 @@ export function extractMints(text) {
   return [...seen];
 }
 
+/* ------------------------------------------------------------------ *
+ * Multiplier recap parsing
+ * ------------------------------------------------------------------ */
+
+const MULTIPLIER_RE = /(\d+(?:\.\d+)?)\s*[xX](?![a-zA-Z0-9])/;
+const TICKER_RE = /\$([A-Za-z][A-Za-z0-9_]{1,14})\b/;
+
+/**
+ * Pull {multiplier, address, symbol} rows out of a channel recap post.
+ *
+ * ── WHY ASSOCIATION IS LINE-SCOPED ──────────────────────────────────────────
+ * A recap lists several tokens with several multipliers. The only thing that
+ * ties a given "42X" to a given contract is layout, so a multiplier and an
+ * address are paired ONLY when they appear in the same line.
+ *
+ * That is deliberately strict, and it is the single most important decision in
+ * this parser. A greedy pairing — nearest address, or first address after the
+ * number — silently mis-attributes when a channel puts the address on the line
+ * below, and a mis-attribution here is not cosmetic: it awards alpha points
+ * worth `multiplier * 2.5` to the early buyers of the WRONG token, and marks
+ * them permanently protected. A missed row costs nothing by comparison, so
+ * unpaired multipliers are counted and reported rather than guessed at.
+ *
+ * ── AND WHY THE NUMBERS DESERVE SUSPICION ───────────────────────────────────
+ * Recap posts are marketing. Channels publish their winners and quietly omit
+ * their losers, so a multiplier scraped from one is a claim by an interested
+ * party, not a measurement. Nothing downstream should treat it as verified —
+ * the multiplier is applied to WEIGHTING, never to a safety gate, and the
+ * forward-scoring in post_mortem is what eventually tests whether the wallets
+ * it surfaced are actually any good.
+ */
+export function parseMultiplierRecap(text, { minMultiplier = 2 } = {}) {
+  if (!text || typeof text !== 'string') return { rows: [], unpaired: 0, lines: 0 };
+
+  const rows = [];
+  const seen = new Set();
+  let unpaired = 0;
+  let lines = 0;
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    lines++;
+
+    const m = line.match(MULTIPLIER_RE);
+    if (!m) continue;
+    const multiplier = Number(m[1]);
+    if (!Number.isFinite(multiplier) || multiplier < minMultiplier) continue;
+
+    const addresses = extractMints(line);
+    if (addresses.length !== 1) {
+      // Zero addresses: the contract is elsewhere and pairing would be a guess.
+      // Several: which one earned the 42X is genuinely unknowable from layout.
+      unpaired++;
+      continue;
+    }
+
+    const address = addresses[0];
+    if (seen.has(address)) continue;
+    seen.add(address);
+
+    rows.push({
+      multiplier,
+      address,
+      symbol: (line.match(TICKER_RE) ?? [])[1] ?? null,
+      line: line.slice(0, 120),
+    });
+  }
+
+  return { rows, unpaired, lines };
+}
+
 /**
  * Rolling de-duplicator.
  *
@@ -179,7 +251,7 @@ export function channelMatches(chat, configured) {
  * Imported lazily so `--login` and the pure-function tests do not drag in the
  * whole scanner (and its state files) just to parse a string.
  */
-async function auditAddress(address, { source, dryRun }) {
+async function auditAddress(address, { source, recap = null, dryRun }) {
   const when = new Date().toISOString().slice(11, 19);
   console.log(`[${when}] 📡 ${source} → ${address}${dryRun ? '  [dry run, not audited]' : ''}`);
   if (dryRun) return;
@@ -193,6 +265,22 @@ async function auditAddress(address, { source, dryRun }) {
     if (alerts) console.log(`[${when}]    🚀 ${alerts} alert(s) sent for ${address}`);
   } catch (err) {
     console.error(`[${when}]    audit failed for ${address}: ${err.message}`);
+  }
+
+  // A recap token is history, not a trade: its run already happened. What it is
+  // worth is the roster of wallets that were in it at launch, so that pass runs
+  // separately from the audit and is gated on the multiplier being large enough
+  // to justify walking the pool back to genesis.
+  if (recap) {
+    try {
+      const { harvestLaunchBuyers } = await import('./multiplier_engine.mjs');
+      const h = await harvestLaunchBuyers({ address, recap });
+      console.log(
+        `[${when}]    🏆 ${recap.multiplier}x recap: ${h.summary}`
+      );
+    } catch (err) {
+      console.error(`[${when}]    launch-buyer harvest failed: ${err.message}`);
+    }
   }
 }
 
@@ -214,7 +302,7 @@ export class AuditQueue {
     this.dropped = 0;
   }
 
-  push(address, source) {
+  push(address, source, recap = null) {
     if (this.items.length >= this.maxLength) {
       // Dropping the newest keeps the queue's head — the earliest sightings,
       // which are the ones with any timing edge left — rather than discarding
@@ -222,7 +310,7 @@ export class AuditQueue {
       this.dropped++;
       return false;
     }
-    this.items.push({ address, source });
+    this.items.push({ address, source, recap });
     this.drain();
     return true;
   }
@@ -232,8 +320,8 @@ export class AuditQueue {
     this.draining = true;
     try {
       while (this.items.length) {
-        const { address, source } = this.items.shift();
-        await auditAddress(address, { source, dryRun: this.dryRun });
+        const { address, source, recap } = this.items.shift();
+        await auditAddress(address, { source, recap, dryRun: this.dryRun });
         if (this.items.length) await new Promise((r) => setTimeout(r, this.minGapMs));
       }
     } finally {
@@ -398,6 +486,7 @@ async function listen({ dryRun }) {
 
   let messages = 0;
   let extracted = 0;
+  let recaps = 0;
 
   client.addEventHandler(async (update) => {
     const msg = update?.message;
@@ -416,10 +505,27 @@ async function listen({ dryRun }) {
     messages++;
     const source = chat?.title ?? chat?.username ?? 'unknown channel';
 
+    // Recap posts first: a line pairing a multiplier with a contract carries
+    // strictly more information than the bare address, and the multiplier
+    // decides whether the launch-buyer replay is worth its RPC cost.
+    const recap = parseMultiplierRecap(text, {
+      minMultiplier: cfg.minRecapMultiplier ?? 2,
+    });
+    const withMultiplier = new Map(recap.rows.map((r) => [r.address, r]));
+
+    if (recap.rows.length) {
+      recaps++;
+      console.log(
+        `[${new Date().toISOString().slice(11, 19)}] 🏆 ${source}: recap with ${recap.rows.length} token(s) — ` +
+          recap.rows.map((r) => `${r.symbol ? `$${r.symbol}` : r.address.slice(0, 6)} ${r.multiplier}x`).join(', ') +
+          (recap.unpaired ? `  (${recap.unpaired} multiplier(s) unpaired, skipped)` : '')
+      );
+    }
+
     for (const address of extractMints(text)) {
       if (!seen.admit(address)) continue;
       extracted++;
-      queue.push(address, source);
+      queue.push(address, source, withMultiplier.get(address) ?? null);
     }
   }, new NewMessage({}));
 

@@ -158,10 +158,16 @@ export async function runPostMortem({ dryRun = false, config } = {}) {
     // sightings into a wallet track record.
     const obsPath = join(HERE, '.state', 'wallet_observations.json');
     const observations = await loadObservations(obsPath);
-    const graded = applyOutcomes(observations, results);
+    const { graded, scored, promoted, demoted } = applyOutcomes(observations, results, { config });
     if (graded) {
       await saveObservations(obsPath, observations);
       console.log(`🐋 Elite ledger: graded ${graded} observed buy(s) against these outcomes`);
+      if (scored) {
+        console.log(
+          `   ⚖️  Alpha scoring: ${scored} forward trade(s) by tracked wallets — ` +
+            `${promoted} awarded, ${demoted} penalised`
+        );
+      }
     }
   }
 
