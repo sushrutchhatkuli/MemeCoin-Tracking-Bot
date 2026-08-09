@@ -93,7 +93,7 @@ export function recommendSize({ score, clusters = null, demand = null, config = 
 /** The alert line, exactly as specified, plus pool context when it is known. */
 export function formatSizeLine(size) {
   if (!size) return null;
-  const base = `⚖️ RECOMMENDED BUY SIZE: ${size.sol.toFixed(2)} SOL (${size.label})`;
+  const base = `RECOMMENDED BUY SIZE: ${size.sol.toFixed(2)} SOL (${size.label})`;
   if (size.poolSharePct === null) return base;
   return `${base} — ${size.poolSharePct.toFixed(2)}% of the pool`;
 }
@@ -127,7 +127,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
     });
     console.log(
       `  score ${String(c.score).padStart(3)} · pool ${String(c.poolSol).padStart(4)} SOL  ->  ` +
-        (s ? formatSizeLine(s) + (s.thinPool ? '   ⚠️ thin' : '') : 'no recommendation (below the ladder)')
+        (s ? formatSizeLine(s) + (s.thinPool ? '   thin' : '') : 'no recommendation (below the ladder)')
     );
   }
 }

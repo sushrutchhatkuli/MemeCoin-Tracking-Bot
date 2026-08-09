@@ -103,7 +103,7 @@ async function onTick(bootConfig, limit, heavyEveryTicks) {
     // and sends nothing at all to Telegram.
     console.log(
       `[${stamp()}] tick ${tick} · ${secs.toFixed(0)}s · ` +
-        `${result?.scanned ?? 0} audited · ${sent ? `🚀 ${sent} BUY ALERT(S)` : 'no clean insider buys'}${sellFired ? ` · 🔴 ${sellFired} SELL SIGNAL(S)` : ''}` +
+        `${result?.scanned ?? 0} audited · ${sent ? `${sent} BUY ALERT(S)` : 'no clean insider buys'}${sellFired ? ` · 🔴 ${sellFired} SELL SIGNAL(S)` : ''}` +
         (skipped ? ` · ${skipped} tick(s) skipped while busy` : '')
     );
 

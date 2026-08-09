@@ -74,7 +74,7 @@ console.log(`\n─── Top 10 wallets ───`);
 for (const [i, h] of dist.topHolders.entries()) {
   console.log(
     `  ${String(i + 1).padStart(2)}. ${pad(h.owner, 44)} ${pct(h.pct)} of total  ${pct(h.pctCirculating)} of circ` +
-      `${h.accounts > 1 ? `  (${h.accounts} accounts merged)` : ''}${h.insider ? '  ⚠️ insider' : ''}`
+      `${h.accounts > 1 ? `  (${h.accounts} accounts merged)` : ''}${h.insider ? '  insider' : ''}`
   );
 }
 

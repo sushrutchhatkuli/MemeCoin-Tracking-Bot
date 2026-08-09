@@ -258,7 +258,7 @@ test('callout shows spend and entry market cap when a trade was replayed', () =>
   assert.match(line, /Alpha Whale #1/);
   assert.match(line, /84% WR \| \+\$145k Profit/);
   assert.match(line, /Bought 7\.50 SOL \(\$1k\) at \$18k MC/);
-  assert.match(line, /2m after launch ⚡/);
+  assert.match(line, /2m after launch /);
 });
 
 test('callout reports position instead of inventing a spend when unattributable', () => {
@@ -426,17 +426,17 @@ const insiderConfig = {
       minLiquidityUsd: 100_000,
       minHolders: 1_000,
       scoreBoost: 10,
-      label: '💎 ESTABLISHED INSIDER GEM',
+      label: 'ESTABLISHED INSIDER GEM',
       advice: 'established insider advice',
-      alertHeader: '💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎',
+      alertHeader: 'ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) ',
     },
     insiderEarly: {
       minMarketCapUsd: 30_000,
       maxMarketCapUsd: 500_000,
       scoreBoost: 0,
-      label: '⚡ EARLY-STAGE INSIDER SCALP',
+      label: 'EARLY-STAGE INSIDER SCALP',
       advice: 'early insider advice',
-      alertHeader: '🚀 EARLY INSIDER SCALP ALERT ($30k–$500k MC) 🚀',
+      alertHeader: 'EARLY INSIDER SCALP ALERT ($30k–$500k MC) ',
     },
   },
 };
@@ -667,14 +667,14 @@ test('the absolute-depth waiver applies to the established tier and nothing else
 
 test('the tier header leads the Telegram alert', () => {
   const early = alertHeaderLines({
-    signalCategory: { alertHeader: '🚀 EARLY INSIDER SCALP ALERT ($30k–$500k MC) 🚀' },
+    signalCategory: { alertHeader: 'EARLY INSIDER SCALP ALERT ($30k–$500k MC) ' },
     clusters: insiders(1),
   });
   assert.match(early[0], /EARLY INSIDER SCALP ALERT/);
   assert.equal(early.length, 1, 'a single insider adds no swarm line');
 
   const swarm = alertHeaderLines({
-    signalCategory: { alertHeader: '💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎' },
+    signalCategory: { alertHeader: 'ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) ' },
     clusters: insiders(4),
   });
   assert.match(swarm[0], /ESTABLISHED INSIDER GEM ALERT/);
@@ -846,7 +846,7 @@ test('a serial rugger cannot be laundered by a takeover', () => {
   const r = evaluateCommunityTakeover({
     demand: ctoDemand,
     security: cleanSecurity({ totalHolders: 8_856 }),
-    deployer: { status: 'SERIAL RUGGER 🔴' },
+    deployer: { status: 'SERIAL RUGGER' },
     devExit: { balancePct: 0 },
     config: ctoConfig,
   });
@@ -961,9 +961,9 @@ test('pool share is computed and flags a thin pool', () => {
 
 test('the alert line matches the specified format', () => {
   const line = formatSizeLine(recommendSize({ score: 82, config: sizerCfg }));
-  assert.equal(line, '⚖️ RECOMMENDED BUY SIZE: 0.75 SOL (Standard Entry)');
+  assert.equal(line, 'RECOMMENDED BUY SIZE: 0.75 SOL (Standard Entry)');
   const withPool = formatSizeLine(recommendSize({ score: 82, demand: { liquiditySol: 800 }, config: sizerCfg }));
-  assert.match(withPool, /^⚖️ RECOMMENDED BUY SIZE: 0\.75 SOL \(Standard Entry\) — 0\.09% of the pool$/);
+  assert.match(withPool, /^RECOMMENDED BUY SIZE: 0\.75 SOL \(Standard Entry\) — 0\.09% of the pool$/);
   assert.equal(formatSizeLine(null), null);
 });
 
@@ -1094,7 +1094,7 @@ const MINT_B = '7jFpDComUfCZnFrG65CR9wyDesFtA5oJPvUMdfuopump';
 
 test('a recap post yields one row per token with its own multiplier', () => {
   const post = [
-    '🏆 TODAY\'S CALLS 🏆',
+    'TODAY\'S CALLS ',
     `$TOAD 42X — ${MINT_A}`,
     `$JEFF 31x | ${MINT_B}`,
     'Join the VIP for more!',
@@ -2143,19 +2143,19 @@ test('the mega-runner boost is forfeited unless the audit affirmatively PASSED',
 
 test('the viral banner leads the alert but does not replace the tier header', () => {
   const lines = alertHeaderLines({
-    signalCategory: { alertHeader: '💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎' },
+    signalCategory: { alertHeader: 'ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) ' },
     clusters: insiders(1),
     megaRunner: { detected: true },
-    megaRunnerHeader: '🔥 380x MEGA-RUNNER VIRAL ALERT ($50k+ Vol & High Demand!) 🔥',
+    megaRunnerHeader: '380x MEGA-RUNNER VIRAL ALERT ($50k+ Vol & High Demand!) ',
   });
   assert.match(lines[0], /MEGA-RUNNER VIRAL ALERT/);
   assert.match(lines[1], /ESTABLISHED INSIDER GEM/, 'holding style must survive');
 
   const quiet = alertHeaderLines({
-    signalCategory: { alertHeader: '💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎' },
+    signalCategory: { alertHeader: 'ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) ' },
     clusters: insiders(1),
     megaRunner: { detected: false },
-    megaRunnerHeader: '🔥 380x MEGA-RUNNER VIRAL ALERT 🔥',
+    megaRunnerHeader: '380x MEGA-RUNNER VIRAL ALERT ',
   });
   assert.match(quiet[0], /ESTABLISHED INSIDER GEM/, 'no banner when it did not fire');
 });
@@ -2261,7 +2261,7 @@ const REAL_MINT = 'mNzssXQ9hU1ASJ1CVuu4JjrFBrfeVdR2JzirKS3pump';
 
 test('extracts Solana mints from realistic channel spam', () => {
   const msg = [
-    '🚀🚀 NEW GEM ALERT 🚀🚀',
+    'NEW GEM ALERT ',
     '$RAVECAT is PUMPING! 100x incoming!!',
     `CA: ${REAL_MINT}`,
     'Chart: https://dexscreener.com/solana/whatever',

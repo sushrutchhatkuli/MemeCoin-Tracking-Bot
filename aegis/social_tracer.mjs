@@ -7,9 +7,9 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * WHAT IS REACHABLE, measured:
  *
- *   CoinGecko /search/trending      200 ✅  open, no key, 15 coins
- *   CoinGecko /coins/{id}           200 ✅  open, gives per-chain contracts
- *   Twitter/X API v2                401 ❌  paid bearer token required
+ *   CoinGecko /search/trending      200 open, no key, 15 coins
+ *   CoinGecko /coins/{id}           200 open, gives per-chain contracts
+ *   Twitter/X API v2                401 paid bearer token required
  *
  * So SEARCH SPIKE is real and MENTION VELOCITY is not. Twitter support is
  * written and stays inert until TWITTER_BEARER_TOKEN is set; without it the
@@ -342,7 +342,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
   console.log('Fetching CoinGecko trending and resolving contracts…\n');
   const t = await fetchTrending({ config, force: true, apiKey: env.coingeckoKey });
   if (!t.ok) {
-    console.error(`❌ trending unavailable: ${t.error}`);
+    console.error(`trending unavailable: ${t.error}`);
     process.exit(1);
   }
 

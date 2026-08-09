@@ -147,11 +147,11 @@ export function executionLinks(address, chain, tradeLink, size = null) {
   const suffix = sol ? ` ${sol.toFixed(2)} SOL` : '';
 
   const links = [
-    `📲 <a href="${esc(tradeUrl(address, tradeLink, chain))}${esc(q)}">[ Open in FOMO App${esc(suffix)} ]</a>`,
+    `<a href="${esc(tradeUrl(address, tradeLink, chain))}${esc(q)}">[ Open in FOMO App${esc(suffix)} ]</a>`,
   ];
   if (chain === 'solana') {
     links.push(
-      `⚡ <a href="https://jup.ag/swap/SOL-${esc(address)}${esc(q)}">[ Swap on Jupiter${esc(suffix)} ]</a>`
+      `<a href="https://jup.ag/swap/SOL-${esc(address)}${esc(q)}">[ Swap on Jupiter${esc(suffix)} ]</a>`
     );
   }
   return links;
@@ -222,15 +222,15 @@ export function buildSellMessage({
   }
 
   lines.push('');
-  lines.push('💡 <b>RECOMMENDED ACTION:</b>');
+  lines.push('<b>RECOMMENDED ACTION:</b>');
   lines.push(esc(action));
 
   lines.push('');
   lines.push(
-    `📲 <a href="${esc(tradeUrl(position.address, tradeLink, position.chain))}">[ Open FOMO App to Sell ]</a>`
+    `<a href="${esc(tradeUrl(position.address, tradeLink, position.chain))}">[ Open FOMO App to Sell ]</a>`
   );
   if (position.chain === 'solana') {
-    lines.push(`⚡ <a href="https://jup.ag/swap/SOL-${esc(position.address)}">[ Swap out on Jupiter ]</a>`);
+    lines.push(`<a href="https://jup.ag/swap/SOL-${esc(position.address)}">[ Swap out on Jupiter ]</a>`);
   }
   lines.push('');
   lines.push(
@@ -304,19 +304,19 @@ function renderClusters(clusters) {
   const lines = multi
     ? [
         '',
-        `🔥 <b>MULTIPLE INSIDERS DETECTED (${count} Unique Wallets Bought Same Coin!)</b>`,
+        `<b>MULTIPLE INSIDERS DETECTED (${count} Unique Wallets Bought Same Coin!)</b>`,
       ]
-    : ['', '🕵️ <b>CLUSTER &amp; INSIDER ACTIVITY:</b>'];
+    : ['', '<b>CLUSTER &amp; INSIDER ACTIVITY:</b>'];
 
   const bits = [];
   if (clusters.clusterBuying) bits.push(`${clusters.clusterBuying.size} wallets in launch window`);
   if (clusters.networks.length) bits.push('same funder network');
   if (clusters.oversized.length) bits.push(`${clusters.oversized.length} oversized buy(s)`);
   if (clusters.jito?.detected) bits.push(`${clusters.jito.size} wallets in one slot`);
-  if (bits.length) lines.push(`• Signals: ${esc(bits.join(' + '))} ✅`);
+  if (bits.length) lines.push(`• Signals: ${esc(bits.join(' + '))} `);
 
   if (clusters.jito?.detected) {
-    lines.push(`• 📦 <b>Bundle:</b> ${esc(clusters.jito.detail)}`);
+    lines.push(`• <b>Bundle:</b> ${esc(clusters.jito.detail)}`);
     lines.push(
       clusters.jito.confirmed
         ? '<i>Confirmed against Jito’s bundle API — these buys were submitted for atomic execution together.</i>'
@@ -345,7 +345,7 @@ function renderClusters(clusters) {
         : '';
     lines.push(
       `• <b>Insider #${i + 1}</b> (${esc(m.short)}): ${esc(spend + mc + timing)} | ` +
-        `🔗 <a href="${esc(m.solscan)}">Solscan</a>`
+        `<a href="${esc(m.solscan)}">Solscan</a>`
     );
     for (const row of scorecardLines(m.scorecard)) lines.push(row);
   });
@@ -357,7 +357,7 @@ function renderClusters(clusters) {
   }
 
   for (const o of clusters.oversized.slice(0, 2)) {
-    lines.push(`• ⚠️ Non-routine size: ${esc(o.short)} — ${esc(o.reason)}`);
+    lines.push(`• Non-routine size: ${esc(o.short)} — ${esc(o.reason)}`);
   }
 
   // Named cluster, when network discovery corroborated the funder graph.
@@ -379,10 +379,10 @@ function renderClusters(clusters) {
   const lead = members[0];
   if (lead?.wallet) {
     lines.push('');
-    lines.push('🔗 <b>DIRECT INSIDER WALLET LINKS:</b>');
-    lines.push(`• 🔍 <a href="https://solscan.io/account/${esc(lead.wallet)}">Solscan Wallet</a>`);
-    lines.push(`• 🤖 <a href="https://gmgn.ai/sol/address/${esc(lead.wallet)}">GMGN Trader Profile</a>`);
-    lines.push(`• 🦅 <a href="https://birdeye.so/profile/${esc(lead.wallet)}">Birdeye Analytics</a>`);
+    lines.push('<b>DIRECT INSIDER WALLET LINKS:</b>');
+    lines.push(`• <a href="https://solscan.io/account/${esc(lead.wallet)}">Solscan Wallet</a>`);
+    lines.push(`• <a href="https://gmgn.ai/sol/address/${esc(lead.wallet)}">GMGN Trader Profile</a>`);
+    lines.push(`• <a href="https://birdeye.so/profile/${esc(lead.wallet)}">Birdeye Analytics</a>`);
   }
 
   // Stated every time. A shared funder is frequently just a CEX hot wallet, and
@@ -401,14 +401,14 @@ function renderWhales(smartMoney) {
 
   const lines = [
     '',
-    '🐋 <b>INSIDER / SMART MONEY ACTIVITY:</b>',
-    `• Smart Money Detected: ${smartMoney.count} Elite Whale${smartMoney.count === 1 ? '' : 's'} ✅`,
+    '<b>INSIDER / SMART MONEY ACTIVITY:</b>',
+    `• Smart Money Detected: ${smartMoney.count} Elite Whale${smartMoney.count === 1 ? '' : 's'} `,
   ];
 
   for (const w of smartMoney.matches) {
     const shortAddr = `${w.address.slice(0, 6)}…${w.address.slice(-4)}`;
     lines.push(`• Wallet: <code>${esc(shortAddr)}</code> (${esc(w.displayLabel)})`);
-    lines.push(`• Whale Profile: 🔗 <a href="${esc(w.solscanUrl)}">solscan.io/account/${esc(shortAddr)}</a>`);
+    lines.push(`• Whale Profile: <a href="${esc(w.solscanUrl)}">solscan.io/account/${esc(shortAddr)}</a>`);
 
     if (w.usdSpent && w.solSpent) {
       const atMcap = w.entryMarketCapUsd ? ` at ${usdShort(w.entryMarketCapUsd)} Market Cap` : '';
@@ -422,7 +422,7 @@ function renderWhales(smartMoney) {
     if (w.entryMinutesAfterLaunch !== null && w.entryMinutesAfterLaunch !== undefined) {
       const m = w.entryMinutesAfterLaunch;
       lines.push(
-        `• Timing: Entered ${m < 1 ? '<1 min' : `${m.toFixed(0)} mins`} after launch${m <= 10 ? ' ⚡' : ''}`
+        `• Timing: Entered ${m < 1 ? '<1 min' : `${m.toFixed(0)} mins`} after launch${m <= 10 ? ' ' : ''}`
       );
     } else {
       lines.push('• Timing: <i>entry time not recovered</i>');
@@ -470,7 +470,7 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
   // most wants to see before deciding whether this is a cabal entry.
   const bundle = clusters?.jito?.detected
     ? [
-        `<b>📦 ${esc(clusters.jito.confirmed ? 'JITO BLOCK #0 CABAL BUNDLE DETECTED' : 'SAME-SLOT CABAL BUNDLE DETECTED')} 📦</b>`,
+        `<b>${esc(clusters.jito.confirmed ? 'JITO BLOCK #0 CABAL BUNDLE DETECTED' : 'SAME-SLOT CABAL BUNDLE DETECTED')} </b>`,
       ]
     : [];
 
@@ -478,16 +478,16 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
   // context before anything else, in both directions — it explains the move,
   // and it is the signature of an opportunistic launch.
   const newsBanner = news?.matched
-    ? [`<b>📰 ${esc(`BREAKING NEWS CATALYST ALERT (News Matched: ${news.keywords.join(' / ')}!)`)} 📰</b>`]
+    ? [`<b>${esc(`BREAKING NEWS CATALYST ALERT (News Matched: ${news.keywords.join(' / ')}!)`)} </b>`]
     : [];
   const socialBanner = social?.detected
-    ? [`<b>📈 ${esc(`SOCIAL HYPE SPIKE (${social.matchType === 'contract' ? 'trending, contract verified' : social.matchType === 'symbol' ? 'ticker match only — unverified' : 'mention velocity'})`)} 📈</b>`]
+    ? [`<b>${esc(`SOCIAL HYPE SPIKE (${social.matchType === 'contract' ? 'trending, contract verified' : social.matchType === 'symbol' ? 'ticker match only — unverified' : 'mention velocity'})`)} </b>`]
     : [];
 
   if (tierHeader) {
     const lines = [...newsBanner, ...bundle, ...viral, ...socialBanner, `<b>${esc(tierHeader)}</b>`];
-    if (count >= 4) lines.push(`🔥 <b>CABAL SWARM — ${count} unique insider wallets</b>`);
-    else if (count >= 2) lines.push(`🔥 <b>MULTI-INSIDER — ${count} unique wallets</b>`);
+    if (count >= 4) lines.push(`<b>CABAL SWARM — ${count} unique insider wallets</b>`);
+    else if (count >= 2) lines.push(`<b>MULTI-INSIDER — ${count} unique wallets</b>`);
     return lines;
   }
 
@@ -499,18 +499,18 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
     ...viral,
     ...socialBanner,
     count >= 4
-      ? '🚀 <b>CABAL SWARM BUY ALERT</b> 🚀'
+      ? '<b>CABAL SWARM BUY ALERT</b> '
       : count >= 2
-        ? '🚀 <b>MULTI-INSIDER BUY ALERT</b> 🚀'
+        ? '<b>MULTI-INSIDER BUY ALERT</b> '
         : clusters?.detected
-          ? '🚀 <b>REAL-TIME INSIDER BUY ALERT</b> 🚀'
+          ? '<b>REAL-TIME INSIDER BUY ALERT</b> '
           : signalCategory?.category === 'LONG-TERM GEM'
-            ? '💎 <b>LONG-TERM INVESTMENT GEM SIGNAL</b> 💎'
+            ? '<b>LONG-TERM INVESTMENT GEM SIGNAL</b> '
             : signalCategory?.category === 'FAST SCALP'
-              ? '⚡ <b>FAST MOMENTUM SCALP SIGNAL</b> ⚡'
+              ? '<b>FAST MOMENTUM SCALP SIGNAL</b> '
               : smartMoney?.detected
-                ? '🚀 <b>HIGH PROBABILITY SIGNAL</b> 🚀'
-                : '🚀 <b>BUY SIGNAL</b> 🚀',
+                ? '<b>HIGH PROBABILITY SIGNAL</b> '
+                : '<b>BUY SIGNAL</b> ',
   ];
 }
 
@@ -521,9 +521,9 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
  */
 function renderCto(cto) {
   if (!cto?.detected) return [];
-  const lines = ['', '🚀 <b>COMMUNITY TAKEOVER CONFIRMED:</b>'];
+  const lines = ['', '<b>COMMUNITY TAKEOVER CONFIRMED:</b>'];
   for (const c of cto.checks) {
-    lines.push(`• ${esc(c.label)}: ${esc(c.detail)} ✅`);
+    lines.push(`• ${esc(c.label)}: ${esc(c.detail)} `);
   }
   lines.push(
     '<i>The developer is gone, so there is nobody to rug — and nobody to build. Community momentum is the whole thesis; if it fades there is no team to carry it.</i>'
@@ -534,9 +534,9 @@ function renderCto(cto) {
 /** The six mandatory gates, itemised. Only reached on a token that passed. */
 function renderShield(shield) {
   if (!shield?.checks?.length) return [];
-  const lines = ['', '🛡️ <b>ANTI-RUGPULL SHIELD:</b>'];
+  const lines = ['', '<b>ANTI-RUGPULL SHIELD:</b>'];
   for (const c of shield.checks) {
-    lines.push(`• ${esc(c.label)}: ${esc(c.detail)} ${c.passed ? '✅' : '❌'}`);
+    lines.push(`• ${esc(c.label)}: ${esc(c.detail)} ${c.passed ? '' : ''}`);
   }
   if (shield.ctoDepthWaiver) {
     lines.push(
@@ -557,7 +557,7 @@ function renderNewsAndSocial(news, social) {
   const lines = [];
 
   if (news?.matched) {
-    lines.push('', `📰 <b>NEWS CATALYST:</b> ${esc(news.keywords.join(', '))}`);
+    lines.push('', `<b>NEWS CATALYST:</b> ${esc(news.keywords.join(', '))}`);
     for (const h of news.headlines ?? []) {
       const age = h.ageMinutes === null ? '' : ` (${h.ageMinutes.toFixed(0)}m ago)`;
       lines.push(
@@ -565,16 +565,16 @@ function renderNewsAndSocial(news, social) {
       );
     }
     lines.push(
-      '<i>⚠️ A token named after a breaking story is the signature of an opportunistic launch as often as a real one. This adds no score; every safety gate still applied.</i>'
+      '<i>A token named after a breaking story is the signature of an opportunistic launch as often as a real one. This adds no score; every safety gate still applied.</i>'
     );
   }
 
   if (social?.detected) {
-    lines.push('', '📈 <b>SOCIAL HYPE:</b>');
-    for (const r of social.reasons ?? []) lines.push(`• ${esc(r)} ✅`);
+    lines.push('', '<b>SOCIAL HYPE:</b>');
+    for (const r of social.reasons ?? []) lines.push(`• ${esc(r)} `);
     if (social.matchType === 'symbol') {
       lines.push(
-        '<i>⚠️ Matched on TICKER only — the contract was not verified against the trending coin. Solana tickers are unrestricted, so this may be an impersonator.</i>'
+        '<i>Matched on TICKER only — the contract was not verified against the trending coin. Solana tickers are unrestricted, so this may be an impersonator.</i>'
       );
     }
     if (!social.mentionsAvailable) {
@@ -590,8 +590,8 @@ function renderMegaRunner(megaRunner) {
   if (!megaRunner?.detected) return [];
   return [
     '',
-    '🔥 <b>MEGA-RUNNER VIRAL VOLUME:</b>',
-    ...megaRunner.reasons.map((r) => `• ${esc(r)} ✅`),
+    '<b>MEGA-RUNNER VIRAL VOLUME:</b>',
+    ...megaRunner.reasons.map((r) => `• ${esc(r)} `),
     '<i>Volume and buy/sell counts can both be manufactured — a wash trader cycling SOL between their own wallets produces this exact signature, deliberately, because it is what scanners look for.</i>',
   ];
 }
@@ -605,17 +605,17 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
       : `$${Math.round(n).toLocaleString('en-US')}`;
 
   const smartLine = !smartMoney?.configured
-    ? '⚪ Watchlist not configured'
+    ? 'Watchlist not configured'
     : smartMoney.detected
-      ? `✅ ${smartMoney.count} tracked wallet(s)${smartMoney.earlyBuyers ? ` — ${smartMoney.earlyBuyers} bought early` : ''}`
-      : '⚪ None detected';
+      ? `${smartMoney.count} tracked wallet(s)${smartMoney.earlyBuyers ? ` — ${smartMoney.earlyBuyers} bought early` : ''}`
+      : 'None detected';
 
   const devLine =
-    deployer?.status === 'GOOD DEV ✅'
-      ? `✅ Proven (${deployer.successfulLaunches} past $100k+ launches)`
-      : deployer?.status === 'SERIAL RUGGER 🔴'
+    deployer?.status === 'GOOD DEV'
+      ? `Proven (${deployer.successfulLaunches} past $100k+ launches)`
+      : deployer?.status === 'SERIAL RUGGER'
         ? '🔴 SERIAL RUGGER'
-        : '⚪ Unknown / new deployer';
+        : 'Unknown / new deployer';
 
   const ratio =
     demand.m5.sells > 0 ? (demand.m5.buys / demand.m5.sells).toFixed(1) : '∞';
@@ -629,7 +629,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
         `<b>${esc(formatSizeLine(size))}</b>`,
         ...(size.thinPool
           ? [
-              `<i>⚠️ That is ${size.poolSharePct.toFixed(2)}% of the whole pool — expect slippage on entry AND on exit. The ladder keys on score only; it does not know pool depth, your bankroll or your open exposure.</i>`,
+              `<i>That is ${size.poolSharePct.toFixed(2)}% of the whole pool — expect slippage on entry AND on exit. The ladder keys on score only; it does not know pool depth, your bankroll or your open exposure.</i>`,
             ]
           : []),
       ]
@@ -655,22 +655,22 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
       evaluateSecurityShield({ security, demand, thresholds: thresholds ?? {}, cto, holderFloorOverride: verdictInfo?.holderGate?.floor ?? null })
     ),
     '',
-    '🔒 <b>SAFETY &amp; DENSITY AUDIT:</b>',
+    '<b>SAFETY &amp; DENSITY AUDIT:</b>',
     ...(signalCategory?.insiderRequirements
       ? [
-          `• Insider Tier Gate: ${signalCategory.insiderRequirements.checks.filter((c) => c.passed).length}/${signalCategory.insiderRequirements.checks.length} mandatory requirements met ${signalCategory.insiderRequirements.passed ? '✅' : '❌'}`,
+          `• Insider Tier Gate: ${signalCategory.insiderRequirements.checks.filter((c) => c.passed).length}/${signalCategory.insiderRequirements.checks.length} mandatory requirements met ${signalCategory.insiderRequirements.passed ? '' : ''}`,
         ]
       : []),
-    `• Holders: ${security?.totalHolders ?? '?'} Wallets (${verdictInfo.holderGate?.passed ? `Passed ${verdictInfo.holderGate.floor}+ Floor ✅` : 'Floor NOT passed ❌'})`,
+    `• Holders: ${security?.totalHolders ?? '?'} Wallets (${verdictInfo.holderGate?.passed ? `Passed ${verdictInfo.holderGate.floor}+ Floor ` : 'Floor NOT passed '})`,
     // Cap read from the live thresholds, not hardcoded. It used to say 25 while
     // the configured cap was 20, which put two different numbers for the same
     // limit in one message once the shield block began printing alongside it.
-    `• Top 10 Concentration: ${security?.top10Pct === null || security?.top10Pct === undefined ? '?' : `${security.top10Pct.toFixed(1)}%`}${reaudit?.ran ? ` (re-checked live: ${reaudit.now?.toFixed(1)}%, cap ${reaudit.cap}% ✅)` : ` (cap ${esc(String(concentrationCapFor(demand?.ageHours ?? null, thresholds ?? {}, tractionFrom(security, demand)).cap))}% ✅)`}`,
-    `• Holder Data: ${security?.distributionSource === 'rpc-live' ? 'live on-chain ✅' : 'cached indexer ⚠️'}${reaudit?.ran ? '' : reaudit?.reason ? ` · re-audit skipped (${esc(String(reaudit.reason).slice(0, 60))})` : ''}`,
-    `• Security Status: ${verdictInfo.securityStatus === 'PASSED' ? 'PASSED ALL AUDITS ✅' : esc(verdictInfo.securityStatus ?? '?')}`,
+    `• Top 10 Concentration: ${security?.top10Pct === null || security?.top10Pct === undefined ? '?' : `${security.top10Pct.toFixed(1)}%`}${reaudit?.ran ? ` (re-checked live: ${reaudit.now?.toFixed(1)}%, cap ${reaudit.cap}% )` : ` (cap ${esc(String(concentrationCapFor(demand?.ageHours ?? null, thresholds ?? {}, tractionFrom(security, demand)).cap))}% )`}`,
+    `• Holder Data: ${security?.distributionSource === 'rpc-live' ? 'live on-chain ' : 'cached indexer '}${reaudit?.ran ? '' : reaudit?.reason ? ` · re-audit skipped (${esc(String(reaudit.reason).slice(0, 60))})` : ''}`,
+    `• Security Status: ${verdictInfo.securityStatus === 'PASSED' ? 'PASSED ALL AUDITS ' : esc(verdictInfo.securityStatus ?? '?')}`,
     `• Deployer: ${esc(devLine)}`,
     '',
-    '📊 <b>MARKET:</b>',
+    '<b>MARKET:</b>',
     `• Market Cap: ${usd(demand.marketCap)} | Liquidity: ${usd(demand.liquidityUsd)} (${demand.liqToMcapPct.toFixed(0)}%)`,
     `• 5m Buys/Sells: ${demand.m5.buys} / ${demand.m5.sells} (${ratio}x)`,
     `• Smart Money: ${esc(smartLine)}`,
@@ -678,11 +678,11 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     `<code>${esc(address)}</code>`,
     '',
     ...executionLinks(address, pair.chainId, tradeLink, size),
-    `📈 <a href="https://dexscreener.com/${esc(pair.chainId)}/${esc(address)}">DexScreener</a>`,
+    `<a href="https://dexscreener.com/${esc(pair.chainId)}/${esc(address)}">DexScreener</a>`,
     // Token contract on Solscan — distinct from the wallet links above, which
     // point at /account/. This is /token/ and resolves the mint itself.
     ...(pair.chainId === 'solana'
-      ? [`🔍 <a href="https://solscan.io/token/${esc(address)}">Solscan Token</a>`]
+      ? [`<a href="https://solscan.io/token/${esc(address)}">Solscan Token</a>`]
       : []),
     '',
     '<i>Automated on-chain analysis, not financial advice.</i>',
@@ -697,10 +697,10 @@ const TELEGRAM_MAX_CHARS = 4096;
 
 const VERDICT_ORDER = ['BUY SIGNAL', 'CRASH WARNING', 'SCAM/AVOID', 'WATCH'];
 const VERDICT_ICON = {
-  'BUY SIGNAL': '🚀',
+  'BUY SIGNAL': '',
   'CRASH WARNING': '🔴',
-  'SCAM/AVOID': '☠️',
-  WATCH: '👀',
+  'SCAM/AVOID': '',
+  WATCH: '',
 };
 
 const short = (n) => {
@@ -723,7 +723,7 @@ export function buildDigest({ rows, scanned, noteCount, startedAt, tradeLink }) 
   }
 
   const lines = [
-    `📊 <b>Aegis Scan</b> — ${when} UTC`,
+    `<b>Aegis Scan</b> — ${when} UTC`,
     `<i>${scanned} audited · ${noteCount} note(s) written</i>`,
   ];
 
@@ -743,13 +743,13 @@ export function buildDigest({ rows, scanned, noteCount, startedAt, tradeLink }) 
           `5m ${r.buys}/${r.sells}`,
           `liq ${r.liqPct.toFixed(0)}%`,
         ];
-        if (r.smartMoney) extras.push(`🐋x${r.smartMoney}`);
-        if (r.category === 'COMMUNITY TAKEOVER GEM') extras.push('🚀CTO');
-        else if (r.category === 'ESTABLISHED INSIDER GEM') extras.push('💎INSIDER-GEM');
-        else if (r.category === 'EARLY-STAGE INSIDER SCALP') extras.push('⚡INSIDER-SCALP');
-        else if (r.category === 'LONG-TERM GEM') extras.push('💎GEM');
-        else if (r.category === 'FAST SCALP') extras.push('⚡SCALP');
-        if (r.devStatus === 'GOOD DEV ✅') extras.push('dev✅');
+        if (r.smartMoney) extras.push(`x${r.smartMoney}`);
+        if (r.category === 'COMMUNITY TAKEOVER GEM') extras.push('CTO');
+        else if (r.category === 'ESTABLISHED INSIDER GEM') extras.push('INSIDER-GEM');
+        else if (r.category === 'EARLY-STAGE INSIDER SCALP') extras.push('INSIDER-SCALP');
+        else if (r.category === 'LONG-TERM GEM') extras.push('GEM');
+        else if (r.category === 'FAST SCALP') extras.push('SCALP');
+        if (r.devStatus === 'GOOD DEV') extras.push('dev');
         lines.push(`${head} — ${esc(extras.join(' · '))}`);
 
         // Dedicated smart-money callout beneath the token line. Only reached on
@@ -761,7 +761,7 @@ export function buildDigest({ rows, scanned, noteCount, startedAt, tradeLink }) 
         }
 
         if (verdict === 'BUY SIGNAL') {
-          lines.push(`     📲 <a href="${esc(tradeUrl(r.address, tradeLink, r.chain))}">Trade</a> · <code>${esc(r.address)}</code>`);
+          lines.push(`     <a href="${esc(tradeUrl(r.address, tradeLink, r.chain))}">Trade</a> · <code>${esc(r.address)}</code>`);
         }
       }
     }
@@ -800,7 +800,7 @@ export function buildDigest({ rows, scanned, noteCount, startedAt, tradeLink }) 
  */
 
 const HELP_TEXT = [
-  '🛡 <b>AEGIS COMMANDS</b>',
+  '<b>AEGIS COMMANDS</b>',
   '',
   '<code>/audit &lt;contract&gt;</code> — full security + score report for one token',
   '<code>/insiders &lt;contract&gt;</code> — cluster, funder network and bundle detail',
@@ -832,7 +832,7 @@ function statusReport({ config, positions, watchlist, observations, alertLog }) 
     .slice(0, 3);
 
   const lines = [
-    '🛡 <b>AEGIS STATUS</b>',
+    '<b>AEGIS STATUS</b>',
     '',
     `• Open positions: <b>${open.length}</b>`,
   ];
@@ -868,7 +868,7 @@ function auditReport({ pair, result }) {
   const usd = (n) => (n === null || n === undefined ? '?' : `$${Math.round(n).toLocaleString('en-US')}`);
 
   const lines = [
-    `🛡 <b>AUDIT: $${esc(pair.baseToken?.symbol ?? '?')}</b>`,
+    `<b>AUDIT: $${esc(pair.baseToken?.symbol ?? '?')}</b>`,
     `<i>${esc(verdictInfo.verdict)} · ${verdictInfo.score}/100 · security ${esc(audit.status)}</i>`,
   ];
   if (signalCategory?.category && signalCategory.category !== 'UNCLASSIFIED') {
@@ -879,7 +879,7 @@ function auditReport({ pair, result }) {
 
   lines.push(
     '',
-    '📊 <b>MARKET</b>',
+    '<b>MARKET</b>',
     `• MCap ${usd(demand.marketCap)} · Liquidity ${usd(demand.liquidityUsd)} (${demand.liqToMcapPct.toFixed(0)}%)`,
     `• 5m ${demand.m5.buys}/${demand.m5.sells} · 1h vol ${usd(demand.volume.h1)}`,
     `• Holders ${security?.totalHolders ?? '?'} · Top10 ${security?.top10Pct === null || security?.top10Pct === undefined ? '?' : `${security.top10Pct.toFixed(1)}%`}`,
@@ -887,14 +887,14 @@ function auditReport({ pair, result }) {
   );
 
   if (verdictInfo.safetyGateFailed) {
-    lines.push('', `🛑 <b>BLOCKED:</b> ${esc(verdictInfo.safetyGateReason ?? 'safety gate')}`);
+    lines.push('', `<b>BLOCKED:</b> ${esc(verdictInfo.safetyGateReason ?? 'safety gate')}`);
   }
   if (audit.failures?.length) {
-    lines.push('', '❌ <b>Failed checks</b>');
+    lines.push('', '<b>Failed checks</b>');
     for (const f of audit.failures.slice(0, 4)) lines.push(`• ${esc(f)}`);
   }
   if (audit.unknowns?.length) {
-    lines.push('', '⚠️ <b>Unverified</b>');
+    lines.push('', '<b>Unverified</b>');
     for (const u of audit.unknowns.slice(0, 3)) lines.push(`• ${esc(u)}`);
   }
 
@@ -903,19 +903,19 @@ function auditReport({ pair, result }) {
     cto?.detected ? 'community takeover' : null,
     megaRunner?.detected ? 'mega-runner volume' : null,
   ].filter(Boolean);
-  if (flags.length) lines.push('', `🔎 ${esc(flags.join(' · '))}`);
+  if (flags.length) lines.push('', `${esc(flags.join(' · '))}`);
 
   lines.push(
     '',
     `<code>${esc(pair.baseToken.address)}</code>`,
-    `📈 <a href="https://dexscreener.com/${esc(pair.chainId)}/${esc(pair.baseToken.address)}">DexScreener</a>`
+    `<a href="https://dexscreener.com/${esc(pair.chainId)}/${esc(pair.baseToken.address)}">DexScreener</a>`
   );
   return lines.join('\n');
 }
 
 function insiderReport({ pair, result }) {
   const c = result.clusters;
-  const head = `🕵️ <b>INSIDERS: $${esc(pair.baseToken?.symbol ?? '?')}</b>`;
+  const head = `<b>INSIDERS: $${esc(pair.baseToken?.symbol ?? '?')}</b>`;
   if (!c?.detected) {
     return [head, '', '<i>No cluster, funder network, oversized buy or same-slot bundle found.</i>',
       c?.buyersSeen ? `<i>${c.buyersSeen} buyer(s) replayed.</i>` : '',
@@ -925,12 +925,12 @@ function insiderReport({ pair, result }) {
 
   const lines = [head, `<b>${esc(c.label ?? 'INSIDER ACTIVITY')}</b> — ${c.insiderCount ?? 0} distinct wallet(s)`];
   if (c.clusterBuying) lines.push(`• ${c.clusterBuying.size} wallets bought within ${c.clusterBuying.windowSec}s of launch`);
-  if (c.jito?.detected) lines.push(`• 📦 ${esc(c.jito.detail)}`);
+  if (c.jito?.detected) lines.push(`• ${esc(c.jito.detail)}`);
   for (const n of (c.networks ?? []).slice(0, 2)) {
     lines.push(`• Funder: ${n.size} wallets from <a href="${esc(n.funderSolscan)}">${esc(n.funderShort)}</a>`);
   }
   for (const o of (c.oversized ?? []).slice(0, 2)) {
-    lines.push(`• ⚠️ ${esc(o.short)} — ${esc(o.reason)}`);
+    lines.push(`• ${esc(o.short)} — ${esc(o.reason)}`);
   }
 
   const members = (c.uniqueInsiders ?? c.watchlisted ?? []).slice(0, 5);
@@ -969,9 +969,9 @@ export async function handleCommand({ command, args, deps = {} }) {
     case 'insiders': {
       const address = args[0];
       if (!address) return `Usage: <code>/${command} &lt;contract address&gt;</code>`;
-      if (!MINT_RE.test(address)) return '❌ That does not look like a Solana contract address.';
+      if (!MINT_RE.test(address)) return 'That does not look like a Solana contract address.';
       const res = await loaders.auditOnce(address);
-      if (!res.ok) return `❌ ${esc(res.error)}`;
+      if (!res.ok) return `${esc(res.error)}`;
       return command === 'audit' ? auditReport(res) : insiderReport(res);
     }
 
@@ -992,7 +992,7 @@ export async function runCommandBot({ credentials, deps, log = console.log, sign
   const authorised = String(credentials.chatId);
   let offset = 0;
 
-  log(`🤖 Aegis command bot listening (authorised chat ${authorised}). /help for commands.`);
+  log(`Aegis command bot listening (authorised chat ${authorised}). /help for commands.`);
 
   while (!signal?.aborted) {
     try {
@@ -1016,7 +1016,7 @@ export async function runCommandBot({ credentials, deps, log = console.log, sign
         try {
           reply = await handleCommand({ ...parsed, deps });
         } catch (err) {
-          reply = `❌ ${esc(`Command failed: ${err.message}`.slice(0, 300))}`;
+          reply = `${esc(`Command failed: ${err.message}`.slice(0, 300))}`;
         }
         await sendTelegram({ ...credentials, text: reply });
         log(`   ↳ /${parsed.command} ${parsed.args.join(' ')}`.trim());
@@ -1279,7 +1279,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
 
   const controller = new AbortController();
   const shutdown = () => {
-    console.log('\n🤖 Command bot stopped.');
+    console.log('\nCommand bot stopped.');
     controller.abort();
     process.exit(0);
   };

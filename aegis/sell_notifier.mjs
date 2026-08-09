@@ -101,7 +101,7 @@ export function detectLiquidityDrain(position, currentLiquiditySol, cfg, now = D
 
   return {
     trigger: TRIGGER.LIQUIDITY_DRAIN,
-    headline: '🚨 EMERGENCY EXIT: LIQUIDITY DRAIN DETECTED',
+    headline: 'EMERGENCY EXIT: LIQUIDITY DRAIN DETECTED',
     reason:
       `Pool SOL reserves fell ${dropPct.toFixed(1)}% in ${elapsedSec.toFixed(0)}s ` +
       `(${prev.toFixed(1)} → ${currentLiquiditySol.toFixed(1)} SOL) — dev or whale pulling liquidity`,
@@ -287,7 +287,7 @@ export function evaluateTriggers(position, currentMcap, insiderStates, cfg) {
       if (soldPct >= exitPct) {
         out.push({
           trigger: TRIGGER.INSIDER_EXIT,
-          headline: '🚨 INSIDER EXIT DETECTED!',
+          headline: 'INSIDER EXIT DETECTED!',
           reason: `${s.label} just sold ${soldPct.toFixed(0)}% of their tokens on-chain`,
           wallet: s.wallet,
           label: s.label,
@@ -322,7 +322,7 @@ export function evaluateTriggers(position, currentMcap, insiderStates, cfg) {
       trailingFired = true;
       out.push({
         trigger: TRIGGER.TRAILING_LOCK,
-        headline: '💰 TRAILING PROFIT LOCKED',
+        headline: 'TRAILING PROFIT LOCKED',
         reason:
           `Peaked at +${lock.peakGainPct.toFixed(0)}% and fell back to ${signed}, ` +
           `through the +${lock.lockGainPct}% floor armed at the +${lock.tierPeakPct}% tier`,
@@ -345,7 +345,7 @@ export function evaluateTriggers(position, currentMcap, insiderStates, cfg) {
     if (currentMcap === null) {
       out.push({
         trigger: TRIGGER.STOP_LOSS,
-        headline: '⚠️ PAIR DELISTED — LIQUIDITY PULLED',
+        headline: 'PAIR DELISTED — LIQUIDITY PULLED',
         reason: 'The trading pair has disappeared, which means liquidity was removed',
         action: 'Exit immediately if you still hold any position.',
         closes: true,
@@ -354,7 +354,7 @@ export function evaluateTriggers(position, currentMcap, insiderStates, cfg) {
       const dropPct = ((currentMcap - entry) / entry) * 100;
       out.push({
         trigger: TRIGGER.STOP_LOSS,
-        headline: '⚠️ STOP-LOSS TRIGGERED',
+        headline: 'STOP-LOSS TRIGGERED',
         reason: `Token is ${dropPct.toFixed(1)}% below the alert market cap (floor -${slPct}%)`,
         action: 'Exit the trade now to protect capital.',
         closes: true,
@@ -371,7 +371,7 @@ export function evaluateTriggers(position, currentMcap, insiderStates, cfg) {
         trigger: TRIGGER.TAKE_PROFIT,
         // Headline states the configured target and the actual move, so the
         // message stays correct if the multiple is retuned again.
-        headline: `💰 TAKE PROFIT: Up +${gainPct.toFixed(0)}%! Lock in gains now!`,
+        headline: `TAKE PROFIT: Up +${gainPct.toFixed(0)}%! Lock in gains now!`,
         reason: `Token passed the +${targetPct}% target — now +${gainPct.toFixed(0)}% from the alert market cap`,
         action:
           'Consider taking out your initial capital so the remainder rides risk-free.',
@@ -461,7 +461,7 @@ export async function checkOpenPositions({ config, dryRun = false, quiet = false
       }
       if (!quiet) {
         console.log(
-          `   🚨 $${p.symbol} closed by the liquidity watcher (-${f.dropPct?.toFixed(1)}% in ${f.elapsedSec?.toFixed(0)}s)`
+          `   $${p.symbol} closed by the liquidity watcher (-${f.dropPct?.toFixed(1)}% in ${f.elapsedSec?.toFixed(0)}s)`
         );
       }
       continue;
@@ -531,7 +531,7 @@ export async function checkOpenPositions({ config, dryRun = false, quiet = false
         console.log(
           sent.ok
             ? `🔴 SELL SIGNAL sent — $${r.position.symbol}: ${r.trigger}`
-            : `⚠️  SELL SIGNAL failed for $${r.position.symbol}: ${sent.error}`
+            : `[WARN] SELL SIGNAL failed for $${r.position.symbol}: ${sent.error}`
         );
       }
     }

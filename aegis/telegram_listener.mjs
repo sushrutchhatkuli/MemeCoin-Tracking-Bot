@@ -253,7 +253,7 @@ export function channelMatches(chat, configured) {
  */
 async function auditAddress(address, { source, recap = null, dryRun }) {
   const when = new Date().toISOString().slice(11, 19);
-  console.log(`[${when}] 📡 ${source} → ${address}${dryRun ? '  [dry run, not audited]' : ''}`);
+  console.log(`[${when}] ${source} → ${address}${dryRun ? '  [dry run, not audited]' : ''}`);
   if (dryRun) return;
 
   try {
@@ -262,7 +262,7 @@ async function auditAddress(address, { source, recap = null, dryRun }) {
     // gate — the listener must not turn a noisy channel into a noisy phone.
     const result = await runScan({ token: address, realtime: true, fromListener: true });
     const alerts = result?.alerts?.length ?? 0;
-    if (alerts) console.log(`[${when}]    🚀 ${alerts} alert(s) sent for ${address}`);
+    if (alerts) console.log(`[${when}]    ${alerts} alert(s) sent for ${address}`);
   } catch (err) {
     console.error(`[${when}]    audit failed for ${address}: ${err.message}`);
   }
@@ -276,7 +276,7 @@ async function auditAddress(address, { source, recap = null, dryRun }) {
       const { harvestLaunchBuyers } = await import('./multiplier_engine.mjs');
       const h = await harvestLaunchBuyers({ address, recap });
       console.log(
-        `[${when}]    🏆 ${recap.multiplier}x recap: ${h.summary}`
+        `[${when}]    ${recap.multiplier}x recap: ${h.summary}`
       );
     } catch (err) {
       console.error(`[${when}]    launch-buyer harvest failed: ${err.message}`);
@@ -368,7 +368,7 @@ function requireCredentials(env) {
   const apiId = Number(env.tgApiId);
   const apiHash = env.tgApiHash;
   if (!apiId || !apiHash) {
-    console.error('❌ TELEGRAM_API_ID / TELEGRAM_API_HASH are not set in aegis/.env');
+    console.error('TELEGRAM_API_ID / TELEGRAM_API_HASH are not set in aegis/.env');
     console.error('   Get them from https://my.telegram.org → API development tools.');
     process.exit(1);
   }
@@ -407,7 +407,7 @@ async function login() {
   const session = client.session.save();
   await rl.close();
 
-  console.log('\n✅ Signed in. Add this line to aegis/.env and do not share it:\n');
+  console.log('\nSigned in. Add this line to aegis/.env and do not share it:\n');
   console.log(`TELEGRAM_SESSION=${session}\n`);
   await client.disconnect();
   process.exit(0);
@@ -419,7 +419,7 @@ async function listChannels() {
   const env = await loadEnv(join(HERE, '.env'));
   const { apiId, apiHash } = requireCredentials(env);
   if (!env.tgSession) {
-    console.error('❌ TELEGRAM_SESSION not set. Run: node telegram_listener.mjs --login');
+    console.error('TELEGRAM_SESSION not set. Run: node telegram_listener.mjs --login');
     process.exit(1);
   }
 
@@ -453,7 +453,7 @@ async function listen({ dryRun }) {
   const env = await loadEnv(join(HERE, '.env'));
   const { apiId, apiHash } = requireCredentials(env);
   if (!env.tgSession) {
-    console.error('❌ TELEGRAM_SESSION not set. Run: node telegram_listener.mjs --login');
+    console.error('TELEGRAM_SESSION not set. Run: node telegram_listener.mjs --login');
     console.error('   That flow is interactive and must be run by you, not by an assistant.');
     process.exit(1);
   }
@@ -516,7 +516,7 @@ async function listen({ dryRun }) {
     if (recap.rows.length) {
       recaps++;
       console.log(
-        `[${new Date().toISOString().slice(11, 19)}] 🏆 ${source}: recap with ${recap.rows.length} token(s) — ` +
+        `[${new Date().toISOString().slice(11, 19)}] ${source}: recap with ${recap.rows.length} token(s) — ` +
           recap.rows.map((r) => `${r.symbol ? `$${r.symbol}` : r.address.slice(0, 6)} ${r.multiplier}x`).join(', ') +
           (recap.unpaired ? `  (${recap.unpaired} multiplier(s) unpaired, skipped)` : '')
       );

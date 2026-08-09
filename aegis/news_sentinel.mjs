@@ -8,11 +8,11 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * WHAT IS ACTUALLY REACHABLE, measured rather than assumed:
  *
- *   CoinDesk RSS        200 ✅   open, no key
- *   Cointelegraph RSS   200 ✅   open, no key
- *   Decrypt RSS         200 ✅   open, no key
- *   The Block RSS       200 ✅   open, no key
- *   CryptoPanic API     403 ❌   Cloudflare without an auth token
+ *   CoinDesk RSS        200 open, no key
+ *   Cointelegraph RSS   200 open, no key
+ *   Decrypt RSS         200 open, no key
+ *   The Block RSS       200 open, no key
+ *   CryptoPanic API     403 Cloudflare without an auth token
  *
  * So RSS is the backbone and CryptoPanic is an optional upgrade: set
  * CRYPTOPANIC_TOKEN in .env and it joins the pool, otherwise the sentinel runs
@@ -267,7 +267,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
   const news = await fetchBreakingNews({ config, cryptoPanicToken: env.cryptoPanicToken });
   console.log('Sources:');
   for (const s of news.sources) {
-    console.log(`  ${s.ok ? '✅' : '❌'} ${String(s.source).padEnd(14)} ${s.ok ? `${s.count} item(s)` : s.error}`);
+    console.log(`  ${s.ok ? '' : ''} ${String(s.source).padEnd(14)} ${s.ok ? `${s.count} item(s)` : s.error}`);
   }
 
   const kws = config.newsSentinel?.keywords ?? [];
@@ -279,7 +279,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
     const hits = extractKeywords(item.title, kws);
     if (hits.length) hitCount++;
     const age = item.publishedAt ? `${((Date.now() - item.publishedAt) / 60000).toFixed(0)}m` : '  ?';
-    console.log(`  ${hits.length ? '🔔' : '  '} [${age.padStart(4)}] ${item.title.slice(0, 92)}${hits.length ? `   << ${hits.join(', ')}` : ''}`);
+    console.log(`  ${hits.length ? '' : '  '} [${age.padStart(4)}] ${item.title.slice(0, 92)}${hits.length ? `   << ${hits.join(', ')}` : ''}`);
   }
   console.log(`\n${hitCount} headline(s) carry a watched keyword.`);
 

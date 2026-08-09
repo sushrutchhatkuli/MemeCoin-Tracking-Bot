@@ -64,7 +64,7 @@ export function migrationStatus(pair, security, config = {}) {
     if (nearThreshold) {
       return {
         state: MIGRATION.MIGRATING,
-        label: '⏳ RAYDIUM MIGRATION IN PROGRESS',
+        label: 'RAYDIUM MIGRATION IN PROGRESS',
         tradeable: false,
         detail:
           `Bonding curve complete at $${Math.round(mcap).toLocaleString('en-US')} but still on ${dexId} — ` +

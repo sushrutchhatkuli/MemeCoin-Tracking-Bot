@@ -407,7 +407,7 @@ export async function deriveRealizedPnl(wallet, { heliusKey, solUsd, cfg = {} })
 /** Attach derived PnL to each candidate. Mutates in place, like enrichment. */
 async function enrichRealizedPnl(candidates, { heliusKey, solUsd, cfg }) {
   if (!heliusKey) {
-    console.log('   ⚠️  No Helius API key in rpcUrl — on-chain PnL cannot be derived, netProfitUsd stays null');
+    console.log('   No Helius API key in rpcUrl — on-chain PnL cannot be derived, netProfitUsd stays null');
     return { derived: 0, failed: candidates.length };
   }
   let derived = 0;
@@ -489,7 +489,7 @@ async function enrichLifetimeTrades(candidates, rpcUrl) {
 
   if (failed) {
     console.log(
-      `   ⚠️  ${failed} of ${candidates.length} enrichment call(s) failed after a retry — ` +
+      `   ${failed} of ${candidates.length} enrichment call(s) failed after a retry — ` +
         `those wallets keep their observed count and cannot pass the trades rule this sync`
     );
   }
@@ -584,7 +584,7 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     candidates = await candidatesFromImport(resolve(importPath));
     source = `import:${importPath}`;
     totalSeen = candidates.length;
-    console.log(`📥 Imported ${candidates.length} candidate wallet(s) from ${importPath}`);
+    console.log(`Imported ${candidates.length} candidate wallet(s) from ${importPath}`);
   } else {
     const obs = await candidatesFromObservations(config);
     candidates = obs.candidates;
@@ -593,13 +593,13 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     solUsd = obs.solUsd ?? 0;
     source = 'aegis-observed';
     console.log(
-      `🔍 Observed ledger: ${totalSeen} wallet(s) seen buying scanned tokens` +
+      `Observed ledger: ${totalSeen} wallet(s) seen buying scanned tokens` +
         (obs.solUsd ? ` (SOL @ $${obs.solUsd.toFixed(2)})` : '')
     );
 
     if (maturity && !maturity.mature) {
       console.log('');
-      console.log('🛑 LEDGER NOT REPRESENTATIVE — refusing to rank.');
+      console.log('LEDGER NOT REPRESENTATIVE — refusing to rank.');
       console.log(
         `   ${maturity.gradedBuys} graded buy(s) across ${maturity.tokens} token(s); ` +
           `${maturity.decidedTokens} token(s) decided.`
@@ -638,8 +638,8 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     if (SYSTEM_ACCOUNTS.has(c.address)) { systemRejected++; continue; }
     wellFormed.push(c);
   }
-  if (systemRejected) console.log(`   🛑 ${systemRejected} known system/DEX account(s) excluded from ranking`);
-  if (rejected) console.log(`   ⚠️  ${rejected} candidate(s) rejected as invalid Solana addresses`);
+  if (systemRejected) console.log(`   ${systemRejected} known system/DEX account(s) excluded from ranking`);
+  if (rejected) console.log(`   ${rejected} candidate(s) rejected as invalid Solana addresses`);
 
   // Enrich everything clearing Rule 1, and only Rule 1.
   //
@@ -742,7 +742,7 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     );
     if (v.system) {
       systemBlocked++;
-      console.log(`   🛑 ${c.address.slice(0, 12)}… rejected — ${v.reason}`);
+      console.log(`   ${c.address.slice(0, 12)}… rejected — ${v.reason}`);
       continue;
     }
     qualified.push(c);
@@ -763,7 +763,7 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
   }
 
   console.log('');
-  console.log(`📊 Composite Elite Ranking — ${evaluated.length} candidate(s) evaluated`);
+  console.log(`Composite Elite Ranking — ${evaluated.length} candidate(s) evaluated`);
   // Reported first because it is the gate that actually disqualifies most
   // candidates. Leaving it out made Rule 2 look like the sole blocker while a
   // 100%-win-rate-on-one-trade population sat behind it.
@@ -800,7 +800,7 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
       );
       if (derived[0] < rules.minNetProfitUsd) {
         console.log(
-          `           ⚠️  the best wallet is ${money(derived[0])} against a ${money(rules.minNetProfitUsd)} floor — ` +
+          `           the best wallet is ${money(derived[0])} against a ${money(rules.minNetProfitUsd)} floor — ` +
             `no floor above ${money(derived[0])} can ever admit anyone`
         );
       }
@@ -809,7 +809,7 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     }
   }
   console.log(`   Rule 3  trades ≥ ${rules.minLifetimeTrades}         → ${evaluated.length - failing.trades} pass`);
-  console.log(`   ✅ passing all three: ${qualified.length} (writing top ${Math.min(qualified.length, rules.topN)})`);
+  console.log(`   passing all three: ${qualified.length} (writing top ${Math.min(qualified.length, rules.topN)})`);
 
   for (const [i, w] of qualified.slice(0, 10).entries()) {
     console.log(
@@ -821,7 +821,7 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
 
   if (!qualified.length) {
     console.log('');
-    console.log('⏭️  No wallet cleared all three rules — smart_wallets.json left untouched.');
+    console.log('No wallet cleared all three rules — smart_wallets.json left untouched.');
     console.log('   The rules are strict by design; an empty elite list is correct when');
     console.log('   nothing has earned a place, and is safer than a padded one.');
     if (!importPath && failing.sample === evaluated.length) {
@@ -857,7 +857,7 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
       JSON.stringify(watchlist, null, 2),
       'utf8'
     );
-    console.log(`\n💾 Wrote ${qualified.length} elite wallet(s) to ${config.smartMoney.watchlistFile}`);
+    console.log(`\nWrote ${qualified.length} elite wallet(s) to ${config.smartMoney.watchlistFile}`);
   } else {
     console.log('\n[DRY RUN] nothing written');
   }

@@ -96,10 +96,10 @@ for (const c of candidates) {
   checked++;
   if (v.system) {
     confirmed.push({ ...c, reason: v.reason });
-    console.log(`🛑 ${c.wallet.slice(0, 14)}… (${c.tokens} tokens) — ${v.reason}`);
+    console.log(`${c.wallet.slice(0, 14)}… (${c.tokens} tokens) — ${v.reason}`);
   } else {
     console.log(
-      `✅ ${c.wallet.slice(0, 14)}… (${c.tokens} tokens) — real trader, ${v.tokenAccounts ?? '?'} token accounts`
+      `${c.wallet.slice(0, 14)}… (${c.tokens} tokens) — real trader, ${v.tokenAccounts ?? '?'} token accounts`
     );
   }
   await new Promise((r) => setTimeout(r, 150));
@@ -122,6 +122,6 @@ await saveObservations(obsPath, store);
 await writeFile(cachePath, JSON.stringify(cache, null, 2), 'utf8');
 
 console.log(
-  `✅ Removed ${confirmed.length} wallet(s) and ${removedBuys} observation(s). ` +
+  `Removed ${confirmed.length} wallet(s) and ${removedBuys} observation(s). ` +
     `Ledger now ${Object.keys(store.wallets).length} wallets.`
 );

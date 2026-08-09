@@ -41,19 +41,19 @@ export function analyzeSocials(pair, config) {
 
   if (hasTwitter && hasTelegram) {
     scoreBonus = bonusFull;
-    status = `X + Telegram present ✅${hasWebsite ? ' (+ website)' : ''}`;
+    status = `X + Telegram present ${hasWebsite ? ' (+ website)' : ''}`;
     tag = 'social/full';
   } else if (hasTwitter || hasTelegram) {
     scoreBonus = bonusPartial;
-    status = `${hasTwitter ? 'X only' : 'Telegram only'} ⚠️${hasWebsite ? ' (+ website)' : ''}`;
+    status = `${hasTwitter ? 'X only' : 'Telegram only'} ${hasWebsite ? ' (+ website)' : ''}`;
     tag = 'social/partial';
   } else if (hasWebsite) {
     scoreBonus = 0;
-    status = 'Website only, no X or Telegram ⚠️';
+    status = 'Website only, no X or Telegram ';
     tag = 'social/partial';
   } else {
     scoreBonus = 0;
-    status = '⚠️ NO SOCIALS (High Abandonment Risk)';
+    status = 'NO SOCIALS (High Abandonment Risk)';
     tag = 'social/none';
   }
 
@@ -79,9 +79,9 @@ export function analyzeSocials(pair, config) {
 /** One-line summary for the console and the Telegram digest. */
 export function socialBadge(social) {
   if (!social) return '';
-  if (social.noSocials) return ' ⚠️nosocial';
-  if (social.hasTwitter && social.hasTelegram) return ' 🐦tg';
-  if (social.hasTwitter) return ' 🐦';
+  if (social.noSocials) return ' nosocial';
+  if (social.hasTwitter && social.hasTelegram) return ' tg';
+  if (social.hasTwitter) return ' ';
   if (social.hasTelegram) return ' tg';
   return '';
 }

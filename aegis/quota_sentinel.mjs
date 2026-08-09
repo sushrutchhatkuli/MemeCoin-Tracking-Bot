@@ -116,7 +116,7 @@ export function buildQuotaMessage(event) {
   const name = LABEL[event.provider] ?? event.provider;
   const exhausted = event.exhausted > 0;
   return [
-    `⚠️ <b>AEGIS API QUOTA WARNING: ${name} Key Quota Reached!</b>`,
+    `<b>AEGIS API QUOTA WARNING: ${name} Key Quota Reached!</b>`,
     '',
     `• Action: Please add a fresh free key to <code>aegis/.env</code>!`,
     '',
@@ -202,7 +202,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
     // Force past the cooldown for a deliberate test.
     await saveState({ notified: {}, history: [] });
     const res = await maybeNotifyQuota({ config });
-    console.log(res.sent.length ? `✅ Sent quota alert for: ${res.sent.join(', ')}` : '❌ Nothing sent (check Telegram credentials)');
+    console.log(res.sent.length ? `Sent quota alert for: ${res.sent.join(', ')}` : 'Nothing sent (check Telegram credentials)');
     process.exit(0);
   }
 

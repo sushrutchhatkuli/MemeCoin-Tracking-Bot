@@ -58,11 +58,11 @@ export async function runPostMortem({ dryRun = false, config } = {}) {
   }
 
   if (!candidates.length) {
-    console.log('🔬 Post-mortem: no tokens have a baseline in the 1–6h window yet.');
+    console.log('Post-mortem: no tokens have a baseline in the 1–6h window yet.');
     return { evaluated: 0, rugs: 0, wins: 0, blacklisted: 0 };
   }
 
-  console.log(`🔬 Post-mortem: re-checking ${candidates.length} token(s) scanned 1–6h ago…`);
+  console.log(`Post-mortem: re-checking ${candidates.length} token(s) scanned 1–6h ago…`);
 
   // Current market state, batched.
   const priced = await fetchPairsBatch(candidates.map((c) => c.address));
@@ -104,7 +104,7 @@ export async function runPostMortem({ dryRun = false, config } = {}) {
     };
     results.push(record);
 
-    const arrow = verdict === 'FAIL' ? '🔴' : verdict === 'WIN' ? '🚀' : '·';
+    const arrow = verdict === 'FAIL' ? '🔴' : verdict === 'WIN' ? '' : '·';
     console.log(
       `  ${arrow} $${String(record.symbol).padEnd(12)} ${String(record.changePct).padStart(7)}%  ` +
         `$${record.mcapAtScan.toLocaleString('en-US')} → $${record.mcapNow.toLocaleString('en-US')}` +
@@ -118,7 +118,7 @@ export async function runPostMortem({ dryRun = false, config } = {}) {
       });
       if (added) {
         blacklisted++;
-        console.log(`     ⛔ deployer ${c.entry.deployer.slice(0, 10)}… added to dev_blacklist.json`);
+        console.log(`     deployer ${c.entry.deployer.slice(0, 10)}… added to dev_blacklist.json`);
       }
     }
   }
@@ -161,10 +161,10 @@ export async function runPostMortem({ dryRun = false, config } = {}) {
     const { graded, scored, promoted, demoted } = applyOutcomes(observations, results, { config });
     if (graded) {
       await saveObservations(obsPath, observations);
-      console.log(`🐋 Elite ledger: graded ${graded} observed buy(s) against these outcomes`);
+      console.log(`Elite ledger: graded ${graded} observed buy(s) against these outcomes`);
       if (scored) {
         console.log(
-          `   ⚖️  Alpha scoring: ${scored} forward trade(s) by tracked wallets — ` +
+          `   Alpha scoring: ${scored} forward trade(s) by tracked wallets — ` +
             `${promoted} awarded, ${demoted} penalised`
         );
       }
@@ -172,7 +172,7 @@ export async function runPostMortem({ dryRun = false, config } = {}) {
   }
 
   console.log(
-    `🔬 Post-mortem: ${results.length} evaluated · ${rugs} rug(s) · ${wins} win(s) · ` +
+    `Post-mortem: ${results.length} evaluated · ${rugs} rug(s) · ${wins} win(s) · ` +
       `${blacklisted} deployer(s) blacklisted${dryRun ? '  [DRY RUN — nothing written]' : ''}`
   );
 
@@ -249,7 +249,7 @@ export async function annotateNotes({ config, results }) {
     const banner =
       r.verdict === 'FAIL'
         ? `🔴 POST-MORTEM: RUGPULL DETECTED (${r.changePct}% in ${r.ageHours}h)`
-        : `🚀 POST-MORTEM: WINNER (+${r.changePct}% in ${r.ageHours}h)`;
+        : `POST-MORTEM: WINNER (+${r.changePct}% in ${r.ageHours}h)`;
 
     let out = text;
     out = out.includes('post_mortem_verdict:')
@@ -261,8 +261,8 @@ export async function annotateNotes({ config, results }) {
           `post_mortem_verdict: "${r.verdict}"\npost_mortem_detail: ${JSON.stringify(banner)}\ntags:`
         );
 
-    if (!out.includes('## 🔬 Post-Mortem')) {
-      out += `\n\n---\n\n## 🔬 Post-Mortem\n> [!${r.verdict === 'FAIL' ? 'danger' : 'success'}] ${banner}\n> Market cap at scan: $${r.mcapAtScan.toLocaleString('en-US')} → now $${r.mcapNow.toLocaleString('en-US')}${r.delisted ? '\n> Pair has been delisted — liquidity pulled.' : ''}\n`;
+    if (!out.includes('## Post-Mortem')) {
+      out += `\n\n---\n\n## Post-Mortem\n> [!${r.verdict === 'FAIL' ? 'danger' : 'success'}] ${banner}\n> Market cap at scan: $${r.mcapAtScan.toLocaleString('en-US')} → now $${r.mcapNow.toLocaleString('en-US')}${r.delisted ? '\n> Pair has been delisted — liquidity pulled.' : ''}\n`;
     }
 
     if (out !== text) {
@@ -280,6 +280,6 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
   const res = await runPostMortem({ dryRun, config });
   if (!dryRun && res.results?.length && config.writeNotes !== false) {
     const n = await annotateNotes({ config, results: res.results });
-    if (n) console.log(`📝 Stamped post-mortem verdict onto ${n} note(s).`);
+    if (n) console.log(`Stamped post-mortem verdict onto ${n} note(s).`);
   }
 }

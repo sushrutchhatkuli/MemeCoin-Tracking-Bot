@@ -128,7 +128,7 @@ export function parseArgs(argv) {
 async function testTelegram(config) {
   const credentials = await loadEnv(join(HERE, '.env'));
   if (!credentials.botToken || !credentials.chatId) {
-    console.error('❌ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing.');
+    console.error('TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing.');
     console.error('   Copy aegis/.env.example to aegis/.env and fill both values.');
     process.exit(1);
   }
@@ -154,20 +154,29 @@ async function testTelegram(config) {
     },
     verdictInfo: { score: 88, securityStatus: 'PASSED' },
     smartMoney: { configured: true, detected: true, count: 2, earlyBuyers: 1 },
-    deployer: { status: 'GOOD DEV ✅', successfulLaunches: 2 },
+    deployer: { status: 'GOOD DEV', successfulLaunches: 2 },
     security: { totalHolders: 250 },
   });
 
   const res = await sendTelegram({ ...credentials, text });
-  console.log(res.ok ? '✅ Test alert delivered.' : `❌ Telegram rejected it: ${res.error}`);
+  console.log(res.ok ? 'Test alert delivered.' : `Telegram rejected it: ${res.error}`);
   process.exit(res.ok ? 0 : 1);
 }
 
+/**
+ * ASCII status tags. Fixed width so the verdict column stays aligned when the
+ * output is piped to a file or read in a terminal without emoji support —
+ * which was half the reason for removing them.
+ *
+ * 🔴 is retained on the two states that mean "money is at risk right now":
+ * a crashing token and a blocked alert. It is the only glyph left, so it
+ * carries signal instead of decoration.
+ */
 const VERDICT_ICON = {
-  'BUY SIGNAL': '🚀',
-  'CRASH WARNING': '🔴',
-  'SCAM/AVOID': '☠️',
-  WATCH: '👀',
+  'BUY SIGNAL': '[BUY]  ',
+  'CRASH WARNING': '🔴[CRASH]',
+  'SCAM/AVOID': '[SCAM] ',
+  WATCH: '[WATCH]',
 };
 
 /**
@@ -432,7 +441,7 @@ async function analyzeToken({
     cto = evaluateCommunityTakeover({ demand, security, deployer, devExit, config });
     if (cto.detected) {
       console.log(
-        `   🚀 Community takeover confirmed for ${pair.baseToken.symbol} — dev holds ${devExit.balancePct?.toFixed(2) ?? '?'}%`
+        `   Community takeover confirmed for ${pair.baseToken.symbol} — dev holds ${devExit.balancePct?.toFixed(2) ?? '?'}%`
       );
     }
   }
@@ -459,7 +468,7 @@ async function analyzeToken({
       clusters.network = net;
       if (net.added.length) {
         console.log(
-          `   🕸️  Network expanded: +${net.added.length} wallet(s) from ${net.clusters.length} cluster(s)` +
+          `   Network expanded: +${net.added.length} wallet(s) from ${net.clusters.length} cluster(s)` +
             (net.rejectedFunders?.length
               ? ` (${net.rejectedFunders.length} exchange-scale funder(s) rejected)`
               : '')
@@ -617,11 +626,11 @@ export async function runScan(args = {}) {
     screening: config.smartMoney?.screening ?? {},
   });
   for (const ex of watchlist.excluded ?? []) {
-    console.log(`   🛑 EXCLUDED ${ex.label ? '"' + ex.label + '" ' : ''}${ex.address.slice(0, 12)}… — ${ex.reason}`);
+    console.log(`   EXCLUDED ${ex.label ? '"' + ex.label + '" ' : ''}${ex.address.slice(0, 12)}… — ${ex.reason}`);
   }
   const blacklist = await loadBlacklist(join(HERE, 'dev_blacklist.json'));
   console.log(
-    `⛔ Blacklist: ${blacklist.wallets.size} deployer(s), ${blacklist.mints.size} mint(s)`
+    `Blacklist: ${blacklist.wallets.size} deployer(s), ${blacklist.mints.size} mint(s)`
   );
 
   const credentials = await loadEnv(join(HERE, '.env'));
@@ -652,11 +661,11 @@ export async function runScan(args = {}) {
       const live = newsWindow.sources.filter((s) => s.ok);
       const dead = newsWindow.sources.filter((s) => !s.ok);
       console.log(
-        `📰 News: ${newsWindow.items.length} headline(s) from ${live.length}/${newsWindow.sources.length} source(s)` +
+        `News: ${newsWindow.items.length} headline(s) from ${live.length}/${newsWindow.sources.length} source(s)` +
           (dead.length ? ` — unavailable: ${dead.map((d) => d.source).join(', ')}` : '')
       );
     } catch (err) {
-      console.error(`⚠️  News sentinel failed (scan continues): ${err.message}`);
+      console.error(`News sentinel failed (scan continues): ${err.message}`);
     }
   }
   if (config.socialTracer?.enabled !== false) {
@@ -664,34 +673,34 @@ export async function runScan(args = {}) {
       trending = await fetchTrending({ config, now: now.getTime(), apiKey: credentials.coingeckoKey });
       if (trending.ok) {
         console.log(
-          `📈 Trending: ${trending.solanaMints.size} Solana contract(s) among ${trending.coins.length} trending search(es)${trending.cached ? ' [cached]' : ''}`
+          `Trending: ${trending.solanaMints.size} Solana contract(s) among ${trending.coins.length} trending search(es)${trending.cached ? ' [cached]' : ''}`
         );
       }
     } catch (err) {
-      console.error(`⚠️  Social tracer failed (scan continues): ${err.message}`);
+      console.error(`Social tracer failed (scan continues): ${err.message}`);
     }
   }
 
   console.log(
     credentials.botToken && credentials.chatId
-      ? `📲 Telegram: configured — ${
+      ? `Telegram: configured — ${
           config.telegram.insiderOnly !== false
             ? 'SILENT unless insider activity AND all safety gates pass'
             : `alerts at BUY SIGNAL, score ≥ ${config.telegram.minScore}`
         }`
-      : '📲 Telegram: no credentials (copy .env.example to .env — alerts disabled)'
+      : 'Telegram: no credentials (copy .env.example to .env — alerts disabled)'
   );
 
   console.log(
     watchlist.count
-      ? `🐋 Smart money watchlist: ${watchlist.count} wallet(s) loaded`
-      : '🐋 Smart money watchlist: empty (module inactive — see aegis/smart_wallets.json)'
+      ? `Smart money watchlist: ${watchlist.count} wallet(s) loaded`
+      : 'Smart money watchlist: empty (module inactive — see aegis/smart_wallets.json)'
   );
   // A malformed address matches nothing, which is indistinguishable from
   // "no whales found". Say so loudly rather than let it look like it works.
   for (const bad of watchlist.invalid ?? []) {
     console.log(
-      `   ⚠️  REJECTED ${bad.label ? `"${bad.label}" ` : ''}${bad.address} — ${bad.reason}`
+      `   REJECTED ${bad.label ? `"${bad.label}" ` : ''}${bad.address} — ${bad.reason}`
     );
   }
 
@@ -699,8 +708,8 @@ export async function runScan(args = {}) {
     const harvest = await harvestLaunchFeed(deployerCache, now.getTime());
     console.log(
       harvest.ok
-        ? `👨‍💻 Deployer index: +${harvest.added} new launch(es), ${harvest.tracked} deployer(s) tracked`
-        : '👨‍💻 Deployer index: launch feed unavailable this run'
+        ? `Deployer index: +${harvest.added} new launch(es), ${harvest.tracked} deployer(s) tracked`
+        : 'Deployer index: launch feed unavailable this run'
     );
   }
 
@@ -709,7 +718,7 @@ export async function runScan(args = {}) {
   // --- Gather pairs -------------------------------------------------
   let pairs = [];
   if (args.token) {
-    console.log(`🔎 Deep-dive: ${args.token}`);
+    console.log(`Deep-dive: ${args.token}`);
     const pair = await fetchSinglePair(args.token);
     if (!pair) {
       // The listener feeds in addresses scraped from channel text, most of
@@ -719,7 +728,7 @@ export async function runScan(args = {}) {
       if (args.fromListener) {
         return { scanned: 0, written: [], alerts: [], skipped: ['no tradeable pair'] };
       }
-      console.error('❌ No DexScreener pair found for that address.');
+      console.error('No DexScreener pair found for that address.');
       process.exit(1);
     }
     pairs = [pair];
@@ -743,11 +752,11 @@ export async function runScan(args = {}) {
       candidates = surfaced.candidates;
       stats = surfaced.stats ?? { total: candidates.length, fromFeeds: '?', fromSearch: '?' };
       console.log(
-        `🔎 Candidates from discovery daemon: ${candidates.length} (${fresh.ageSec.toFixed(0)}s old, 0s discovery latency)`
+        `Candidates from discovery daemon: ${candidates.length} (${fresh.ageSec.toFixed(0)}s old, 0s discovery latency)`
       );
     } else {
       console.log(
-        `🔎 Discovering launches on: ${chains.join(', ')}` +
+        `Discovering launches on: ${chains.join(', ')}` +
           (surfaced.generatedAt
             ? ` — daemon pool ${fresh.ageSec.toFixed(0)}s old, past the ${maxAgeSec}s limit`
             : ' — no daemon pool on file')
@@ -863,7 +872,7 @@ export async function runScan(args = {}) {
   });
 
   if (!realtime && toAudit.length) {
-    console.log(`   ⚡ audited ${toAudit.length} token(s) at concurrency ${concurrency}\n`);
+    console.log(`   audited ${toAudit.length} token(s) at concurrency ${concurrency}\n`);
   }
 
   // ---- PHASE 2: side effects, sequential and ordered ---------------
@@ -895,28 +904,28 @@ export async function runScan(args = {}) {
 
     const quiet = realtime;
     const icon = verdictInfo.blacklisted
-      ? '⛔'
+      ? ''
       : verdictInfo.serialRugger
-        ? '🚨'
+        ? ''
         : (VERDICT_ICON[verdictInfo.verdict] ?? '•');
     const devTag =
       deployer?.status === DEV_STATUS.RUGGER
         ? ' dev:RUGGER🔴'
         : deployer?.status === DEV_STATUS.GOOD
-          ? ' dev:GOOD✅'
+          ? ' dev:GOOD'
           : '';
-    const smTag = smartMoney?.detected ? ` 🐋x${smartMoney.count}` : '';
+    const smTag = smartMoney?.detected ? ` x${smartMoney.count}` : '';
     const catTag =
       result.signalCategory?.category === 'COMMUNITY TAKEOVER GEM'
-        ? ' 🚀CTO'
+        ? ' CTO'
         : result.signalCategory?.category === 'ESTABLISHED INSIDER GEM'
-        ? ' 💎INSIDER-GEM'
+        ? ' INSIDER-GEM'
         : result.signalCategory?.category === 'EARLY-STAGE INSIDER SCALP'
-          ? ' ⚡INSIDER-SCALP'
+          ? ' INSIDER-SCALP'
           : result.signalCategory?.category === 'LONG-TERM GEM'
-            ? ' 💎GEM'
+            ? ' GEM'
             : result.signalCategory?.category === 'FAST SCALP'
-              ? ' ⚡SCALP'
+              ? ' SCALP'
               : '';
     const holders = verdictInfo.holderGate?.holders;
     if (!quiet) console.log(
@@ -962,7 +971,7 @@ export async function runScan(args = {}) {
       now: now.getTime(),
     });
     if (alert.status === 'sent') {
-      console.log(`   📲 Telegram alert sent for ${symbol}`);
+      console.log(`   [ALERT] sent for ${symbol}`);
       alerts.push(symbol);
       // Capture entry market cap and each insider's CURRENT balance. Taken
       // later, the baseline would already include any selling.
@@ -977,22 +986,22 @@ export async function runScan(args = {}) {
         rpcBalances: balances,
         category: result.signalCategory?.category ?? null,
       })) {
-        console.log(`   📌 Position opened for ${symbol} at ${Math.round(demand.marketCap).toLocaleString('en-US')} — sell triggers armed`);
+        console.log(`   [OPEN]  position for ${symbol} at ${Math.round(demand.marketCap).toLocaleString('en-US')} — sell triggers armed`);
       }
     } else if (alert.status === 'failed') {
-      console.log(`   ⚠️  Telegram alert FAILED for $${symbol}: ${alert.error}`);
+      console.log(`   Telegram alert FAILED for $${symbol}: ${alert.error}`);
     } else if (alert.status === 'no-credentials') {
-      console.log(`   📲 $${symbol} qualified for an alert but Telegram is not configured`);
+      console.log(`   $${symbol} qualified for an alert but Telegram is not configured`);
     } else if (alert.status === 'blocked-reaudit') {
-      console.log(`   🛑 $${symbol} alert CANCELLED at dispatch — ${alert.reason}`);
+      console.log(`   $${symbol} alert CANCELLED at dispatch — ${alert.reason}`);
     } else if (alert.status === 'blocked-safety') {
-      console.log(`   🛑 $${symbol} alert blocked by safety gate — ${alert.reason}`);
+      console.log(`   🔴 [BLOCK] ${symbol} alert blocked by safety gate — ${alert.reason}`);
     } else if (alert.status === 'blocked-insider-requirements') {
-      console.log(`   🛑 $${symbol} matched an insider band but failed a mandatory requirement — ${alert.reason}`);
+      console.log(`   $${symbol} matched an insider band but failed a mandatory requirement — ${alert.reason}`);
     } else if (alert.status === 'outside-insider-tiers') {
       // Logged rather than dropped: this is real insider activity going silent,
       // and silence with no stated reason is indistinguishable from a bug.
-      console.log(`   🔇 $${symbol} has insider activity but sits outside both tiers — ${alert.reason}`);
+      console.log(`   $${symbol} has insider activity but sits outside both tiers — ${alert.reason}`);
     }
 
     await sleep(config.requestDelayMs);
@@ -1011,10 +1020,10 @@ export async function runScan(args = {}) {
   if (discoveredStore.wallets.length) await saveDiscovered(discoveredPath, discoveredStore);
   await writeFile(funderCachePath, JSON.stringify(funderCache, null, 2), 'utf8');
   const observedWallets = Object.keys(observations.wallets).length;
-  if (observedWallets) console.log(`🐋 Elite ledger: ${observedWallets} wallet(s) under observation`);
+  if (observedWallets) console.log(`Elite ledger: ${observedWallets} wallet(s) under observation`);
 
   // --- Report -------------------------------------------------------
-  console.log(`\n📝 ${written.length} note(s) written to ${notesDir}`);
+  console.log(`\n${written.length} note(s) written to ${notesDir}`);
   for (const w of written) {
     console.log(`   ${VERDICT_ICON[w.verdict] ?? '•'} ${w.symbol} (${w.score}) → ${w.path.split(/[\\/]/).pop()}`);
   }
@@ -1031,12 +1040,12 @@ export async function runScan(args = {}) {
         tradeLink: { template: config.tradeLinkTemplate, label: config.tradeLinkLabel },
       }),
     });
-    console.log(sent.ok ? '📊 Scan digest sent to Telegram' : `⚠️  Digest failed: ${sent.error}`);
+    console.log(sent.ok ? 'Scan digest sent to Telegram' : `Digest failed: ${sent.error}`);
   }
 
-  if (alerts.length) console.log(`📲 ${alerts.length} Telegram alert(s) sent: ${alerts.join(', ')}`);
+  if (alerts.length) console.log(`${alerts.length} Telegram alert(s) sent: ${alerts.join(', ')}`);
   if (skipped.length) {
-    console.log(`\n⏭️  ${skipped.length} filtered out before audit:`);
+    console.log(`\n${skipped.length} filtered out before audit:`);
     for (const s of skipped.slice(0, 12)) console.log(`   - ${s}`);
     if (skipped.length > 12) console.log(`   … and ${skipped.length - 12} more`);
   }
@@ -1045,7 +1054,7 @@ export async function runScan(args = {}) {
   // results silently, so this is the only thing that surfaces it.
   try {
     const q = await maybeNotifyQuota({ config });
-    if (q.sent.length) console.log(`⚠️  API quota alert sent for: ${q.sent.join(', ')}`);
+    if (q.sent.length) console.log(`API quota alert sent for: ${q.sent.join(', ')}`);
   } catch { /* telemetry must never fail a scan */ }
 
   return { written, alerts, skipped, scanned: digestRows.length, rows: digestRows };

@@ -3274,6 +3274,42 @@
       "reason": "Post-mortem: $RODRI fell -82.3% within 3.87h",
       "added": "2026-08-09",
       "source": "post-mortem"
+    },
+    {
+      "address": "AjV7XzgvJRwx3aszCCUuDNP5Yr5ZvZwP9NyD3kLTaJff",
+      "reason": "Post-mortem: $toadtard fell -99.1% within 5.97h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "EuJzrdENyeYJptKM8P9oow8JkmkkV7SLDN3As9F7Jh69",
+      "reason": "Post-mortem: $Theo fell -85.1% within 5.83h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "DtJCCt3GyZuH5PUfzXx2uGXhkNMcGwmUJuL26fpYrtu2",
+      "reason": "Post-mortem: $REMUTOAD fell -99% within 1.37h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "7kyyUDsE8WqHXhW3SvgBBjtiQKhwX1Mcw57Za1dDU6Hc",
+      "reason": "Post-mortem: $Turtchair fell -86.9% within 1.31h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "9ywKHduXL7PeTdbYGUdFGWcLpSScXzY6XPmu3tcwgE35",
+      "reason": "Post-mortem: $FOMOTOAD fell -95.4% within 1.07h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "CXYSsWGodvQR4mp1SEDDWRxmr6susRnE8WvgMJ9Cd3cJ",
+      "reason": "Post-mortem: $Jar fell -84.3% within 1.05h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
     }
   ],
   "mints": [

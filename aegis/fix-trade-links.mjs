@@ -49,7 +49,7 @@ const LEGACY_LINKS = [
 const LEGACY_LABELS = /\[(?:Trade on FOMO App|Trade on Jupiter)\]/g;
 
 const files = (await readdir(notesDir)).filter((f) => f.endsWith('.md'));
-console.log(`${apply ? '✏️  APPLYING' : '🔍 DRY RUN'} — ${files.length} notes in ${notesDir}\n`);
+console.log(`${apply ? 'APPLYING' : 'DRY RUN'} — ${files.length} notes in ${notesDir}\n`);
 
 let touched = 0;
 let replacements = 0;
@@ -67,7 +67,7 @@ for (const file of files) {
   if (!slug) {
     // Never guess the chain — a wrong slug produces a link that looks valid and
     // silently points at the wrong token.
-    console.log(`  ⚠️  ${file}: unrecognised chain "${chainName ?? '(none)'}" — skipped`);
+    console.log(`  ${file}: unrecognised chain "${chainName ?? '(none)'}" — skipped`);
     skippedNoChain++;
     continue;
   }
@@ -92,7 +92,7 @@ for (const file of files) {
     if (!noBackup && !backupDir) {
       backupDir = join(HERE, '.state', `notes-backup-${Date.now()}`);
       await mkdir(backupDir, { recursive: true });
-      console.log(`📦 Backing up originals to ${backupDir}\n`);
+      console.log(`Backing up originals to ${backupDir}\n`);
     }
     if (backupDir) await copyFile(path, join(backupDir, file));
     await writeFile(path, updated, 'utf8');
@@ -108,4 +108,4 @@ for (const [slug, n] of [...byChain].sort((a, b) => b[1] - a[1])) {
 if (skippedNoChain) console.log(`skipped (unknown chain)        : ${skippedNoChain}`);
 console.log(`new link format                : ${template}`);
 if (!apply) console.log(`\nNothing was modified. Re-run with --apply to write the changes.`);
-else console.log(`\n✅ Done.${backupDir ? ` Originals preserved in ${backupDir}` : ''}`);
+else console.log(`\nDone.${backupDir ? ` Originals preserved in ${backupDir}` : ''}`);

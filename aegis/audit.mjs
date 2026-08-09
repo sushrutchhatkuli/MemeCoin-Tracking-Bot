@@ -240,7 +240,7 @@ export function runSecurityAudit(security, thresholds, { ageHours = null, tracti
  * aggregate status changes, and the added row makes the reason explicit.
  */
 export function applyDeployerVerdict(audit, deployer) {
-  if (deployer?.status !== 'SERIAL RUGGER 🔴') return audit;
+  if (deployer?.status !== 'SERIAL RUGGER') return audit;
 
   const detail = deployer.reasons?.[0] ?? 'Deployer flagged as a serial rugger';
   return {
@@ -606,7 +606,7 @@ export function evaluateCommunityTakeover({ demand, security, deployer, devExit 
   // A serial rugger is disqualifying regardless of how strong the takeover
   // looks. Checked after the criteria so the report still shows what the token
   // did and did not meet.
-  const serialRugger = deployer?.status === 'SERIAL RUGGER 🔴';
+  const serialRugger = deployer?.status === 'SERIAL RUGGER';
   if (allPassed && serialRugger) {
     return {
       detected: false,
@@ -859,11 +859,11 @@ export function evaluateInsiderRequirements({
  * Sort a qualifying token into a holding style.
  *
  * Precedence, highest first:
- *   1. 🚀 COMMUNITY TAKEOVER GEM     all four CTO criteria met
- *   2. 💎 ESTABLISHED INSIDER GEM   insider + $1M-$10M+ + deep liquidity + 1k holders
- *   3. ⚡ EARLY-STAGE INSIDER SCALP  insider + $30k-$500k
- *   4. 💎 ESTABLISHED GEM            mature and deep, no insider requirement
- *   5. ⚡ FAST MOMENTUM SCALP        young and mid-cap
+ *   1. COMMUNITY TAKEOVER GEM     all four CTO criteria met
+ *   2. ESTABLISHED INSIDER GEM   insider + $1M-$10M+ + deep liquidity + 1k holders
+ *   3. EARLY-STAGE INSIDER SCALP  insider + $30k-$500k
+ *   4. ESTABLISHED GEM            mature and deep, no insider requirement
+ *   5. FAST MOMENTUM SCALP        young and mid-cap
  *
  * CTO leads because it is the most specific and the rarest of the patterns, and
  * because it changes the risk profile rather than just the size band: there is
@@ -900,11 +900,11 @@ export function classifySignal({ demand, security, config, clusters = null, audi
     const c = config.signalCategories?.communityTakeover ?? {};
     return {
       category: SIGNAL_CATEGORY.CTO,
-      label: c.label ?? '🚀 COMMUNITY TAKEOVER GEM',
+      label: c.label ?? 'COMMUNITY TAKEOVER GEM',
       advice:
         c.advice ??
-        '🚀 Community takeover — the developer has exited and the crowd is driving. No dev to rug, and no dev to build.',
-      alertHeader: c.alertHeader ?? '🚀 COMMUNITY TAKEOVER (CTO) ALERT 🚀',
+        'Community takeover — the developer has exited and the crowd is driving. No dev to rug, and no dev to build.',
+      alertHeader: c.alertHeader ?? 'COMMUNITY TAKEOVER (CTO) ALERT ',
       scoreBoost: cto.scoreBoost ?? c.scoreBoost ?? 20,
       cto: true,
       insiderCount: clusters?.insiderCount ?? 0,
@@ -938,8 +938,8 @@ export function classifySignal({ demand, security, config, clusters = null, audi
   if (Object.values(gemChecks).every(Boolean)) {
     return {
       category: SIGNAL_CATEGORY.GEM,
-      label: g.label ?? '💎 LONG-TERM INVESTMENT GEM',
-      advice: g.advice ?? '💎 Long-term accumulation setup — suitable for holding over days/weeks.',
+      label: g.label ?? 'LONG-TERM INVESTMENT GEM',
+      advice: g.advice ?? 'Long-term accumulation setup — suitable for holding over days/weeks.',
       scoreBoost: g.scoreBoost ?? 10,
       checks: gemChecks,
     };
@@ -951,8 +951,8 @@ export function classifySignal({ demand, security, config, clusters = null, audi
   if (inScalpBand && youngEnough) {
     return {
       category: SIGNAL_CATEGORY.SCALP,
-      label: s.label ?? '⚡ FAST MOMENTUM SCALP',
-      advice: s.advice ?? '⚡ Fast momentum trade — take initial profit at +50% to +100%!',
+      label: s.label ?? 'FAST MOMENTUM SCALP',
+      advice: s.advice ?? 'Fast momentum trade — take initial profit at +50% to +100%!',
       scoreBoost: 0,
       checks: { marketCap: inScalpBand, age: youngEnough },
     };
@@ -1024,11 +1024,11 @@ function classifyInsiderTier({ demand, security, config, clusters, audit, holder
         cfg: est,
         category: SIGNAL_CATEGORY.INSIDER_ESTABLISHED,
         checks: estChecks,
-        label: est.label ?? '💎 ESTABLISHED INSIDER GEM',
+        label: est.label ?? 'ESTABLISHED INSIDER GEM',
         advice:
           est.advice ??
-          '💎 Established insider accumulation — high 90%+ survival rate & deep liquidity.',
-        alertHeader: est.alertHeader ?? '💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎',
+          'Established insider accumulation — high 90%+ survival rate & deep liquidity.',
+        alertHeader: est.alertHeader ?? 'ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) ',
         scoreBoost: est.scoreBoost ?? 10,
       }
     : Object.values(earlyChecks).every(Boolean)
@@ -1036,11 +1036,11 @@ function classifyInsiderTier({ demand, security, config, clusters, audit, holder
           cfg: early,
           category: SIGNAL_CATEGORY.INSIDER_EARLY,
           checks: earlyChecks,
-          label: early.label ?? '⚡ EARLY-STAGE INSIDER SCALP',
+          label: early.label ?? 'EARLY-STAGE INSIDER SCALP',
           advice:
             early.advice ??
-            '⚡ Early insider entry — massive upside potential. Enforce tight -15% stop-loss!',
-          alertHeader: early.alertHeader ?? '🚀 EARLY INSIDER SCALP ALERT ($30k–$500k MC) 🚀',
+            'Early insider entry — massive upside potential. Enforce tight -15% stop-loss!',
+          alertHeader: early.alertHeader ?? 'EARLY INSIDER SCALP ALERT ($30k–$500k MC) ',
           scoreBoost: early.scoreBoost ?? 0,
         }
       : null;
@@ -1114,12 +1114,12 @@ export function detectCatalysts(pair, security, demand, velocity, thresholds, ex
       `Smart money accumulation: ${smartMoney.count} tracked wallet(s) holding ${smartMoney.totalPct.toFixed(1)}%${smartMoney.provablyEarly ? ' within the early-entry window' : ''}`
     );
   }
-  if (deployer?.status === 'GOOD DEV ✅') {
+  if (deployer?.status === 'GOOD DEV') {
     bullish.push(
       `Proven deployer: ${deployer.successfulLaunches} past launch(es) above $100k market cap`
     );
   }
-  if (deployer?.status === 'SERIAL RUGGER 🔴') {
+  if (deployer?.status === 'SERIAL RUGGER') {
     bearish.push(`Serial rugger deployer: ${deployer.reasons[0]}`);
   }
 
@@ -1370,7 +1370,7 @@ export function scoreToken({
   let verdict;
   let impact;
 
-  const serialRugger = deployer?.status === 'SERIAL RUGGER 🔴';
+  const serialRugger = deployer?.status === 'SERIAL RUGGER';
 
   const crashing =
     (demand.m5.sells > demand.m5.buys * thresholds.crashSellRatio && demand.m5.sells >= 10) ||
@@ -1462,20 +1462,20 @@ export function scoreToken({
         demand.liqToMcapPct === null || demand.liqToMcapPct === undefined
           ? 'Liquidity depth unknown'
           : deepPoolWaiver
-            ? `$${Math.round(demand.liquidityUsd).toLocaleString('en-US')} pool (${demand.liqToMcapPct.toFixed(1)}% of MCap) — absolute depth floor passed ✅`
+            ? `$${Math.round(demand.liquidityUsd).toLocaleString('en-US')} pool (${demand.liqToMcapPct.toFixed(1)}% of MCap) — absolute depth floor passed `
             : liquidityGateFailed
-              ? `${demand.liqToMcapPct.toFixed(1)}% of MCap — below ${depthFloorPct}% floor ❌`
-              : `${demand.liqToMcapPct.toFixed(1)}% of MCap — ${depthFloorPct}%+ floor passed ✅`,
+              ? `${demand.liqToMcapPct.toFixed(1)}% of MCap — below ${depthFloorPct}% floor `
+              : `${demand.liqToMcapPct.toFixed(1)}% of MCap — ${depthFloorPct}%+ floor passed `,
     },
     holderGate: {
       floor: holderFloor,
       holders: holdersKnown ? uniqueHolders : null,
       passed: holdersKnown ? !lowHolders : null,
       status: !holdersKnown
-        ? 'Holder count unknown ⚠️'
+        ? 'Holder count unknown '
         : lowHolders
-          ? `Only ${uniqueHolders} holders — below ${holderFloor} floor ❌`
-          : `${uniqueHolders} holders — ${holderFloor}+ floor passed ✅`,
+          ? `Only ${uniqueHolders} holders — below ${holderFloor} floor `
+          : `${uniqueHolders} holders — ${holderFloor}+ floor passed `,
     },
     breakdown: {
       demand: Math.round(demandScore),

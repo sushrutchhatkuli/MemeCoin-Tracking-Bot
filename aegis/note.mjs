@@ -87,7 +87,7 @@ function extraTags(smartMoney, deployer, verdictInfo, social) {
   const tags = [];
   if (verdictInfo.categoryTag) tags.push(verdictInfo.categoryTag);
   if (verdictInfo.serialRugger) tags.push('dev/serial-rugger');
-  else if (deployer?.status === 'GOOD DEV ✅') tags.push('dev/good');
+  else if (deployer?.status === 'GOOD DEV') tags.push('dev/good');
   else tags.push('dev/unknown');
   if (smartMoney?.detected) tags.push('smart-money/detected');
   if (social?.tag) tags.push(social.tag);
@@ -128,14 +128,14 @@ function insiderActionSummary(clusters) {
 /** Tri-state: true = passed, false = failed, null = provider had no data. */
 function checkRow(check) {
   const box = check.passed === true ? '- [x]' : '- [ ]';
-  const icon = check.passed === true ? '✅' : check.passed === false ? '❌' : '⚠️';
+  const icon = check.passed === true ? '' : check.passed === false ? '' : '';
   return `${box} **${check.label}**: ${check.detail} ${icon}`;
 }
 
 const SECURITY_LABEL = {
-  PASSED: 'PASSED ✅',
-  FAILED: 'FAILED ❌',
-  UNVERIFIED: 'UNVERIFIED ⚠️',
+  PASSED: 'PASSED ',
+  FAILED: 'FAILED ',
+  UNVERIFIED: 'UNVERIFIED ',
 };
 
 export function renderNote({
@@ -178,7 +178,7 @@ export function renderNote({
     : '(baseline snapshot — velocity available on next scan)';
 
   const demandTone =
-    demand.m5.ratio >= 2 ? 'High Demand 🔥' : demand.m5.ratio >= 1 ? 'Balanced' : 'Sell Pressure 🔻';
+    demand.m5.ratio >= 2 ? 'High Demand ' : demand.m5.ratio >= 1 ? 'Balanced' : 'Sell Pressure ';
 
   const frontmatter = [
     '---',
@@ -273,13 +273,13 @@ export function renderNote({
 
   const directionLine =
     verdictInfo.impact === 'SKYROCKET'
-      ? '`SKYROCKET 🚀`'
+      ? '`SKYROCKET `'
       : verdictInfo.impact === 'CRASH WARNING'
         ? '`CRASH 🔴`'
-        : '`NEUTRAL ⚪`';
+        : '`NEUTRAL `';
 
   const triggerEvents = catalysts.bullish.length
-    ? catalysts.bullish.map((c) => `  - 🚀 ${c}`).join('\n')
+    ? catalysts.bullish.map((c) => `  - ${c}`).join('\n')
     : '  - _No bullish catalyst detected in on-chain data_';
 
   const riskEvents = catalysts.bearish.length
@@ -295,13 +295,13 @@ export function renderNote({
 
   return `${frontmatter}
 
-# 🧠 Intelligence Report: ${ticker}
+# Intelligence Report: ${ticker}
 
-> [!${verdictInfo.verdict === 'SCAM/AVOID' ? 'danger' : audit.status === 'UNVERIFIED' || verdictInfo.verdict === 'CRASH WARNING' || verdictInfo.verdict === 'UNVERIFIED / LOW HOLDERS' ? 'warning' : 'info'}] Verdict: ${verdictInfo.blacklisted ? '⛔ BLACKLISTED DEPLOYER' : verdictInfo.serialRugger ? '🔴 AVOID / SERIAL RUGGER' : verdictInfo.verdict}
+> [!${verdictInfo.verdict === 'SCAM/AVOID' ? 'danger' : audit.status === 'UNVERIFIED' || verdictInfo.verdict === 'CRASH WARNING' || verdictInfo.verdict === 'UNVERIFIED / LOW HOLDERS' ? 'warning' : 'info'}] Verdict: ${verdictInfo.blacklisted ? 'BLACKLISTED DEPLOYER' : verdictInfo.serialRugger ? '🔴 AVOID / SERIAL RUGGER' : verdictInfo.verdict}
 > Confidence \`${verdictInfo.score}/100\` · Security \`${audit.status}\` · Deployer \`${deployer?.status ?? 'UNKNOWN / NEW'}\` · Direction ${directionLine}
 ${migration?.label ? `\n> [!warning] ${migration.label}\n> ${migration.detail}` : ''}${signalCategory && signalCategory.category !== 'UNCLASSIFIED' ? `\n> [!tip] ${signalCategory.label}\n> ${signalCategory.advice}` : ''}
 
-## 📊 Summary & Key Metrics
+## Summary & Key Metrics
 - **Chain**: \`${chainLabel}\` (\`${pair.dexId ?? 'unknown dex'}\`)
 - **Contract**: \`${address}\`
 - **Market Cap**: \`${usd(demand.marketCap)}\` | **Liquidity**: \`${usd(demand.liquidityUsd)}\` (\`${pctStr(demand.liqToMcapPct)}\` of MCap)
@@ -318,7 +318,7 @@ ${migration?.label ? `\n> [!warning] ${migration.label}\n> ${migration.detail}` 
 
 ---
 
-## 🛡️ Security Audit Checklist
+## Security Audit Checklist
 ${securityRows}
 
 **Result: ${SECURITY_LABEL[audit.status]}**${failureCallout}${unknownCallout}
@@ -337,7 +337,7 @@ ${deployerSection}
 
 ---
 
-## 📰 News & Catalyst Sentiment Analysis
+## News & Catalyst Sentiment Analysis
 - **Bullish Triggers**:
 ${triggerEvents}
 - **Bearish Triggers**:
@@ -347,7 +347,7 @@ ${riskEvents}
 
 ---
 
-## 🧮 Score Breakdown
+## Score Breakdown
 | Component | Points | Max |
 | --- | ---: | ---: |
 | Net demand (5m + 1h) | ${b.demand} | 30 |
@@ -363,11 +363,11 @@ ${riskEvents}
 
 ---
 
-## ⚡ Direct Execution Links
-- 📲 [${tradeLabel}](${fomoUrl})
-- 📊 [View Chart on DexScreener](${dexUrl})
-${chainId === 'solana' ? `- 🛡️ [RugCheck Report](https://rugcheck.xyz/tokens/${address})\n- 🔍 [Solscan](https://solscan.io/token/${address})` : `- 🛡️ [GoPlus Security](https://gopluslabs.io/token-security/${chainId}/${address})`}
-${(pair.info?.socials ?? []).map((s) => `- 🔗 [${s.type}](${s.url})`).join('\n')}
+## Direct Execution Links
+- [${tradeLabel}](${fomoUrl})
+- [View Chart on DexScreener](${dexUrl})
+${chainId === 'solana' ? `- [RugCheck Report](https://rugcheck.xyz/tokens/${address})\n- [Solscan](https://solscan.io/token/${address})` : `- [GoPlus Security](https://gopluslabs.io/token-security/${chainId}/${address})`}
+${(pair.info?.socials ?? []).map((s) => `- [${s.type}](${s.url})`).join('\n')}
 
 ---
 
@@ -383,7 +383,7 @@ function replayLine(scan) {
   if (!scan) return '`Not run (holder matching only)`';
   if (!scan.ok) return `\`Unavailable — ${scan.error}\``;
   const coverage = `${scan.inspected}/${scan.requested} pool transactions`;
-  const flag = scan.throttled ? ' ⚠️ RPC throttled' : '';
+  const flag = scan.throttled ? ' RPC throttled' : '';
   return `\`${scan.buyers.length} distinct buyer(s) from ${coverage}${flag}\``;
 }
 
@@ -401,26 +401,26 @@ function replayCaveat(scan) {
 function renderGates(verdictInfo, social, blacklistHit) {
   const gate = verdictInfo.holderGate ?? {};
   const box = (ok) => (ok === true ? '- [x]' : '- [ ]');
-  const icon = (ok) => (ok === true ? '✅' : ok === false ? '❌' : '⚠️');
+  const icon = (ok) => (ok === true ? '' : ok === false ? '' : '');
 
   const concentrationOk =
     verdictInfo.breakdown?.distribution > 0 ? true : null;
 
   const links = social?.links ?? {};
   const linkRows = [
-    links.twitter && `  - 🐦 [X / Twitter](${links.twitter})`,
-    links.telegram && `  - 💬 [Telegram](${links.telegram})`,
-    links.website && `  - 🌐 [Website](${links.website})`,
-    links.discord && `  - 🎮 [Discord](${links.discord})`,
+    links.twitter && `  - [X / Twitter](${links.twitter})`,
+    links.telegram && `  - [Telegram](${links.telegram})`,
+    links.website && `  - [Website](${links.website})`,
+    links.discord && `  - [Discord](${links.discord})`,
   ]
     .filter(Boolean)
     .join('\n');
 
   const blacklistBanner = blacklistHit?.listed
-    ? `\n\n> [!danger] ⛔ BLACKLISTED ${blacklistHit.kind === 'mint' ? 'TOKEN' : 'DEPLOYER'}\n> ${blacklistHit.entry?.reason ?? 'Permanently blocked'}\n> Score forced to 0 regardless of current market data.`
+    ? `\n\n> [!danger] BLACKLISTED ${blacklistHit.kind === 'mint' ? 'TOKEN' : 'DEPLOYER'}\n> ${blacklistHit.entry?.reason ?? 'Permanently blocked'}\n> Score forced to 0 regardless of current market data.`
     : '';
 
-  return `## 🚦 Safety Gates
+  return `## Safety Gates
 
 **Dual gate — both must pass:**
 ${box(concentrationOk)} **Top 10 concentration** below limit ${icon(concentrationOk)}
@@ -432,7 +432,7 @@ ${box(gate.passed)} **Holder floor** — ${gate.status ?? 'unknown'} ${icon(gate
 > other side of your exit. A sub-${gate.floor ?? 150}-holder token is capped at
 > ${verdictInfo.score <= 45 ? verdictInfo.score : 45}/100 no matter how clean its contract looks.
 
-## 📡 Social Presence
+## Social Presence
 - **Status**: \`${social?.status ?? 'Unknown'}\`
 - **Declared links**: ${social?.totalLinks ?? 0}
 ${linkRows || '  - _none declared_'}
@@ -449,7 +449,7 @@ function renderSmartMoney(sm, security) {
   const insider = describeInsider(security);
 
   if (!sm?.configured) {
-    return `## 🐋 Smart Money & Insider Wallet Tracking
+    return `## Smart Money & Insider Wallet Tracking
 - **Smart Money Buying**: \`Module inactive — no watchlist configured\`
 - **Tracked Wallets**: \`—\`
 - **Insider Accumulation**: \`${insider}\`
@@ -462,7 +462,7 @@ function renderSmartMoney(sm, security) {
   }
 
   if (!sm.detected) {
-    return `## 🐋 Smart Money & Insider Wallet Tracking
+    return `## Smart Money & Insider Wallet Tracking
 - **Smart Money Buying**: \`No tracked wallets detected\`
 - **Tracked Wallets**: \`—\`
 - **Buyer Replay**: ${replayLine(sm.buyerScan)}
@@ -481,7 +481,7 @@ function renderSmartMoney(sm, security) {
 
   const rows = sm.matches
     .map((m) => {
-      const parts = [`### 🐋 ${m.displayLabel}`];
+      const parts = [`### ${m.displayLabel}`];
       parts.push(`- **Wallet**: \`${m.address}\``);
       parts.push(`- **Profile**: [Inspect on Solscan](${m.solscanUrl})`);
 
@@ -499,13 +499,13 @@ function renderSmartMoney(sm, security) {
       if (m.entryMinutesAfterLaunch !== null && m.entryMinutesAfterLaunch !== undefined) {
         const mins = m.entryMinutesAfterLaunch;
         parts.push(
-          `- **Timing**: Entered \`${mins < 1 ? '<1 min' : `${mins.toFixed(0)} mins`}\` after launch${mins <= 10 ? ' ⚡' : ''}`
+          `- **Timing**: Entered \`${mins < 1 ? '<1 min' : `${mins.toFixed(0)} mins`}\` after launch${mins <= 10 ? ' ' : ''}`
         );
       } else {
         parts.push('- **Timing**: _entry time not recovered_');
       }
 
-      parts.push(`- **Current position**: \`${m.pct.toFixed(2)}%\` of supply${m.insider ? ' ⚠️ flagged insider' : ''}`);
+      parts.push(`- **Current position**: \`${m.pct.toFixed(2)}%\` of supply${m.insider ? ' flagged insider' : ''}`);
 
       if (m.stats) {
         const bits = [
@@ -528,10 +528,10 @@ function renderSmartMoney(sm, security) {
 
   const scanLine = replayLine(sm.buyerScan);
 
-  return `## 🐋 Smart Money & Insider Wallet Tracking
-- **Smart Money Buying**: \`${sm.count} Known Whale${sm.count === 1 ? '' : 's'} Detected ✅\`
+  return `## Smart Money & Insider Wallet Tracking
+- **Smart Money Buying**: \`${sm.count} Known Whale${sm.count === 1 ? '' : 's'} Detected \`
 - **Combined Position**: \`${sm.totalPct.toFixed(2)}% of supply\`
-- **Entry Timing**: \`${sm.earlyBuyers ? `${sm.earlyBuyers} confirmed early buy(s) ✅` : sm.provablyEarly ? 'Within early-accumulation window ✅' : 'Not established'}\`
+- **Entry Timing**: \`${sm.earlyBuyers ? `${sm.earlyBuyers} confirmed early buy(s) ` : sm.provablyEarly ? 'Within early-accumulation window ' : 'Not established'}\`
 - **Buyer Replay**: ${scanLine}
 - **Insider Accumulation**: \`${insider}\`
 
@@ -544,7 +544,7 @@ function renderDeployer(dev, security) {
   const addr = dev?.address ?? security?.creator ?? null;
 
   if (!dev?.available) {
-    return `## 👨‍💻 Serial Dev Reputation Audit
+    return `## Serial Dev Reputation Audit
 - **Deployer Address**: \`${addr ?? 'Unknown'}\`
 - **Dev Status**: \`UNKNOWN / NEW\`
 - **Dev History Check**: \`Not completed\`
@@ -558,16 +558,16 @@ function renderDeployer(dev, security) {
     : null;
 
   const callout =
-    dev.status === 'SERIAL RUGGER 🔴'
+    dev.status === 'SERIAL RUGGER'
       ? `\n\n> [!danger] 🔴 AVOID / SERIAL RUGGER\n> ${dev.reasons.join('\n> ')}\n> This overrides the contract audit: a serial rugger's next token is always\n> freshly deployed with clean authorities, so the contract looking safe is\n> expected and proves nothing.`
-      : dev.status === 'GOOD DEV ✅'
+      : dev.status === 'GOOD DEV'
         ? `\n\n> [!success] Established deployer\n> ${dev.reasons.join('\n> ')}`
         : `\n\n> [!note] ${dev.reasons.join(' ')}`;
 
-  return `## 👨‍💻 Serial Dev Reputation Audit
+  return `## Serial Dev Reputation Audit
 - **Deployer Address**: \`${addr}\`
 - **Dev Status**: \`${dev.status}\`
-- **Dev History Check**: \`${dev.status === DEV_UNKNOWN ? 'Inconclusive' : dev.status === 'GOOD DEV ✅' ? 'Passed' : 'FAILED'}\`
+- **Dev History Check**: \`${dev.status === DEV_UNKNOWN ? 'Inconclusive' : dev.status === 'GOOD DEV' ? 'Passed' : 'FAILED'}\`
 - **Mints Found in Window**: \`${dev.totalMintsFound}\` (${dev.deploys48h} in last 48h)
 - **Matured Prior Launches**: \`${dev.maturePriorLaunches}\` → \`${dev.successfulLaunches}\` above $100k, \`${dev.deadLaunches}\` dead
 ${dev.rapidFire ? `- **Burst Deployment**: \`${dev.totalMintsFound} mints within ${dev.burstWindowSec}s\` 🔴\n` : ''}${notable ? `- **Notable Past Launches**:\n${notable}\n` : ''}${dev.fromCache ? '- **Source**: `cached deployer profile`\n' : ''}${callout}`;

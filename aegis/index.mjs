@@ -51,7 +51,7 @@ async function maybeSyncWhales() {
 
   if (Date.now() - last < everyMs) return;
 
-  console.log(`\n🐋 Elite whale sync (every ${intervalHours}h)…`);
+  console.log(`\nElite whale sync (every ${intervalHours}h)…`);
   await syncTopWhales({});
   const { writeFile: wf, mkdir: mk } = await import('node:fs/promises');
   await mk(dirname(WHALE_SYNC_MARKER), { recursive: true });
@@ -74,11 +74,11 @@ async function once(args) {
           const pm = await runPostMortem({ config });
           if (pm.results?.length && config.writeNotes !== false) {
             const n = await annotateNotes({ config, results: pm.results });
-            if (n) console.log(`📝 Post-mortem verdict stamped onto ${n} note(s).`);
+            if (n) console.log(`Post-mortem verdict stamped onto ${n} note(s).`);
           }
         }
       } catch (err) {
-        console.error(`⚠️  Post-mortem failed (scan results kept): ${err.message}`);
+        console.error(`Post-mortem failed (scan results kept): ${err.message}`);
       }
 
       // Elite whale sync, rate-limited to once every 24h. Runs inside the
@@ -87,7 +87,7 @@ async function once(args) {
       try {
         await maybeSyncWhales();
       } catch (err) {
-        console.error(`⚠️  Whale sync failed (scan results kept): ${err.message}`);
+        console.error(`Whale sync failed (scan results kept): ${err.message}`);
       }
 
       // Sell monitor runs every pass: an insider exit or a rug is time-critical
@@ -97,7 +97,7 @@ async function once(args) {
         const sell = await checkOpenPositions({ config });
         if (sell.fired) console.log(`🔴 ${sell.fired} sell signal(s) fired across ${sell.checked} open position(s)`);
       } catch (err) {
-        console.error(`⚠️  Sell monitor failed: ${err.message}`);
+        console.error(`Sell monitor failed: ${err.message}`);
       }
 
       // Hourly trajectory sample. Cheap, append-only, and survives reboots
@@ -106,13 +106,13 @@ async function once(args) {
         const row = await sampleTrajectory(HERE);
         if (row) {
           console.log(
-            `📈 Trajectory: ${row.wallets} wallets · ${row.decided} decided token(s) · ` +
+            `Trajectory: ${row.wallets} wallets · ${row.decided} decided token(s) · ` +
               `fail ${row.tokenFailRate}% vs base ${row.baseFailRate}% · ` +
               `max graded/wallet ${row.maxGraded} · ${row.recurring} recurring`
           );
         }
       } catch (err) {
-        console.error(`⚠️  Trajectory sample failed: ${err.message}`);
+        console.error(`Trajectory sample failed: ${err.message}`);
       }
     }
 
@@ -139,7 +139,7 @@ if (!watch) {
   process.exit(ok ? 0 : 1);
 } else {
   const minutes = Number(argv[watchIndex + 1]) || WATCH_DEFAULT_MINUTES;
-  console.log(`👁️  Watch mode: scanning every ${minutes} minute(s). Ctrl+C to stop.`);
+  console.log(`Watch mode: scanning every ${minutes} minute(s). Ctrl+C to stop.`);
   await once(args);
   setInterval(() => once(args), minutes * 60 * 1000);
 }

@@ -220,7 +220,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
     address,
     recap: { multiplier, symbol: at('--symbol'), address },
   });
-  console.log(res.ok ? `✅ ${res.summary}` : `⏭️  ${res.summary}`);
+  console.log(res.ok ? `${res.summary}` : `${res.summary}`);
   if (res.replay) {
     console.log(
       `   pool walk: ${res.replay.pages} page(s), ${res.replay.inspected} tx replayed, ` +

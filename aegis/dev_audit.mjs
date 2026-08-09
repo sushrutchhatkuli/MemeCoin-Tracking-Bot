@@ -196,8 +196,8 @@ async function fetchOutcomes(mints, subjectMint) {
  * ------------------------------------------------------------------ */
 
 export const DEV_STATUS = {
-  GOOD: 'GOOD DEV ✅',
-  RUGGER: 'SERIAL RUGGER 🔴',
+  GOOD: 'GOOD DEV',
+  RUGGER: 'SERIAL RUGGER',
   UNKNOWN: 'UNKNOWN / NEW',
 };
 

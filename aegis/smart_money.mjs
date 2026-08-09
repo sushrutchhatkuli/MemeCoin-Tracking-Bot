@@ -286,10 +286,10 @@ export function formatSmartMoneyLine(match, { html = false } = {}) {
 
   const timing =
     match.entryMinutesAfterLaunch !== null && match.entryMinutesAfterLaunch !== undefined
-      ? ` · ${match.entryMinutesAfterLaunch < 1 ? '<1m' : `${Math.round(match.entryMinutesAfterLaunch)}m`} after launch${match.entryMinutesAfterLaunch <= 10 ? ' ⚡' : ''}`
+      ? ` · ${match.entryMinutesAfterLaunch < 1 ? '<1m' : `${Math.round(match.entryMinutesAfterLaunch)}m`} after launch${match.entryMinutesAfterLaunch <= 10 ? ' ' : ''}`
       : '';
 
-  const body = `🐋 SMART MONEY: ${match.displayLabel}${statsPart} ${action}${timing} | 🔗 `;
+  const body = `SMART MONEY: ${match.displayLabel}${statsPart} ${action}${timing} | `;
   return esc(body) + link(match.solscanUrl);
 }
 
@@ -944,10 +944,10 @@ export function describeInsiderAccumulation(security) {
   const insiderPct = security.insiderPct ?? 0;
 
   if (bundled > 0) {
-    return `⚠️ ${bundled} bundled insider wallet(s) across ${networks} network(s), holding ${insiderPct.toFixed(1)}% — same-block accumulation detected`;
+    return `${bundled} bundled insider wallet(s) across ${networks} network(s), holding ${insiderPct.toFixed(1)}% — same-block accumulation detected`;
   }
   if (insiderPct > 0) {
-    return `⚠️ Flagged insider wallets hold ${insiderPct.toFixed(1)}% of supply`;
+    return `Flagged insider wallets hold ${insiderPct.toFixed(1)}% of supply`;
   }
   return 'Clean organic buying (no same-block bundle networks detected)';
 }

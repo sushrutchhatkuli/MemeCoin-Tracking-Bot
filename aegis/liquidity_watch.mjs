@@ -169,7 +169,7 @@ async function tick({ config, credentials, dryRun, quiet }) {
 
   for (const d of res.drains) {
     const line =
-      `🚨 DRAIN ${d.position.symbol}: -${d.dropPct.toFixed(1)}% in ${d.elapsedSec.toFixed(0)}s ` +
+      `DRAIN ${d.position.symbol}: -${d.dropPct.toFixed(1)}% in ${d.elapsedSec.toFixed(0)}s ` +
       `(${d.fromSol.toFixed(1)} → ${d.toSol.toFixed(1)} SOL)`;
     console.log(`[${new Date().toISOString().slice(11, 19)}] ${line}${dryRun ? '  [dry run]' : ''}`);
 
@@ -183,7 +183,7 @@ async function tick({ config, credentials, dryRun, quiet }) {
         tradeLink: { template: config.tradeLinkTemplate },
       });
       const sent = await sendTelegram({ ...credentials, text });
-      if (!sent.ok) console.error(`   ⚠️  Telegram failed: ${sent.error}`);
+      if (!sent.ok) console.error(`   Telegram failed: ${sent.error}`);
     }
   }
 
