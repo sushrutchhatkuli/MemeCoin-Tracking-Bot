@@ -3268,6 +3268,12 @@
       "reason": "Post-mortem: $fomocat fell -97.1% within 1.02h",
       "added": "2026-08-09",
       "source": "post-mortem"
+    },
+    {
+      "address": "9rDMVCH7mQ9N2PkyHw8KT8wraMhF8tyMz9R631yyL1df",
+      "reason": "Post-mortem: $RODRI fell -82.3% within 3.87h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
     }
   ],
   "mints": [

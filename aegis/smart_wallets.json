@@ -4,7 +4,7 @@
     "the next sync. Add hand-picked wallets to a separate file instead.",
     "",
     "Source: aegis-observed",
-    "Generated: 2026-08-09T20:54:16.118Z",
+    "Generated: 2026-08-09T21:08:50.034Z",
     "Rules applied: win rate >= 75% over >= 3 graded buys,",
     "net profit rule SKIPPED (lifetime realized P&L is not derivable from observation),",
     "on-chain activity >= 100 signatures.",
@@ -15,7 +15,7 @@
     "and it should grow over time; the win rate will fall as it does."
   ],
   "generated": {
-    "at": "2026-08-09T20:54:16.118Z",
+    "at": "2026-08-09T21:08:50.034Z",
     "source": "aegis-observed",
     "profitRuleSkipped": true,
     "count": 9
@@ -83,9 +83,9 @@
     },
     {
       "address": "89Sv5FvnMNRid1bn8y2Ti1vJPSxWxgiW9GSLsPpBnKK1",
-      "label": "Elite Whale #6 (100% WR on 4 graded)",
+      "label": "Elite Whale #6 (100% WR on 5 graded)",
       "win_rate": "100%",
-      "graded_buys": 4,
+      "graded_buys": 5,
       "onchain_signatures": "1000+ (query cap)",
       "solscan": "https://solscan.io/account/89Sv5FvnMNRid1bn8y2Ti1vJPSxWxgiW9GSLsPpBnKK1",
       "source": "aegis-observed",
