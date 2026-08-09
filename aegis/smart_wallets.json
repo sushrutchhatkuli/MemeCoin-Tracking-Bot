@@ -4,9 +4,9 @@
     "the next sync. Add hand-picked wallets to a separate file instead.",
     "",
     "Source: aegis-observed",
-    "Generated: 2026-08-09T07:24:51.970Z",
+    "Generated: 2026-08-09T08:30:03.738Z",
     "Rules applied: win rate >= 75% over >= 3 graded buys,",
-    "net profit rule SKIPPED (lifetime realized P&L is not derivable from observation),",
+    "net profit >= $5,000,",
     "on-chain activity >= 100 signatures.",
     "Selected top 5 by win rate, then sample size.",
     "",
@@ -15,71 +15,24 @@
     "and it should grow over time; the win rate will fall as it does."
   ],
   "generated": {
-    "at": "2026-08-09T07:24:51.970Z",
+    "at": "2026-08-09T08:30:03.739Z",
     "source": "aegis-observed",
-    "profitRuleSkipped": true,
-    "count": 5
+    "profitRuleSkipped": false,
+    "count": 1
   },
   "wallets": [
     {
-      "address": "F5Hrs3fTxA6cPsdYa1r2zazymsetbFpXpzEuQWXPNusu",
-      "label": "Elite Whale #1 (100% WR on 3 graded)",
-      "win_rate": "100%",
-      "graded_buys": 3,
+      "address": "DUNEwN4Gz7AhLRdNDQbQtGfDCRiXnh536v3ge6xmTUZi",
+      "label": "Elite Whale #1 (80% WR | +$10k)",
+      "win_rate": "80%",
+      "graded_buys": 5,
       "onchain_signatures": "1000+ (query cap)",
-      "solscan": "https://solscan.io/account/F5Hrs3fTxA6cPsdYa1r2zazymsetbFpXpzEuQWXPNusu",
+      "solscan": "https://solscan.io/account/DUNEwN4Gz7AhLRdNDQbQtGfDCRiXnh536v3ge6xmTUZi",
       "source": "aegis-observed",
       "stats_updated": "2026-08-09",
-      "metrics_basis": "observed buys graded by post-mortem (not lifetime realized P&L); lifetime activity = 1000 signatures (capped)",
-      "enabled": true
-    },
-    {
-      "address": "6ASzpAo2AmQNNza1MgRZAgb2TS3GYYT9kJNF7CyS9zyF",
-      "label": "Elite Whale #2 (100% WR on 3 graded)",
-      "win_rate": "100%",
-      "graded_buys": 3,
-      "onchain_signatures": "1000+ (query cap)",
-      "solscan": "https://solscan.io/account/6ASzpAo2AmQNNza1MgRZAgb2TS3GYYT9kJNF7CyS9zyF",
-      "source": "aegis-observed",
-      "stats_updated": "2026-08-09",
-      "metrics_basis": "observed buys graded by post-mortem (not lifetime realized P&L); lifetime activity = 1000 signatures (capped)",
-      "enabled": true
-    },
-    {
-      "address": "5zmyLEkA53tRHkKCgujuvGgU6V3YThDS52AYqBxeDabD",
-      "label": "Elite Whale #3 (100% WR on 3 graded)",
-      "win_rate": "100%",
-      "graded_buys": 3,
-      "onchain_signatures": 531,
-      "solscan": "https://solscan.io/account/5zmyLEkA53tRHkKCgujuvGgU6V3YThDS52AYqBxeDabD",
-      "source": "aegis-observed",
-      "stats_updated": "2026-08-09",
-      "metrics_basis": "observed buys graded by post-mortem (not lifetime realized P&L); lifetime activity = 531 signatures",
-      "enabled": true
-    },
-    {
-      "address": "BaD1dUN93CnWZZ2yRX1jiYpjPzPJdA61TxMxLX9fxGqL",
-      "label": "Elite Whale #4 (100% WR on 3 graded)",
-      "win_rate": "100%",
-      "graded_buys": 3,
-      "onchain_signatures": "1000+ (query cap)",
-      "solscan": "https://solscan.io/account/BaD1dUN93CnWZZ2yRX1jiYpjPzPJdA61TxMxLX9fxGqL",
-      "source": "aegis-observed",
-      "stats_updated": "2026-08-09",
-      "metrics_basis": "observed buys graded by post-mortem (not lifetime realized P&L); lifetime activity = 1000 signatures (capped)",
-      "enabled": true
-    },
-    {
-      "address": "89Sv5FvnMNRid1bn8y2Ti1vJPSxWxgiW9GSLsPpBnKK1",
-      "label": "Elite Whale #5 (100% WR on 4 graded)",
-      "win_rate": "100%",
-      "graded_buys": 4,
-      "onchain_signatures": "1000+ (query cap)",
-      "solscan": "https://solscan.io/account/89Sv5FvnMNRid1bn8y2Ti1vJPSxWxgiW9GSLsPpBnKK1",
-      "source": "aegis-observed",
-      "stats_updated": "2026-08-09",
-      "metrics_basis": "observed buys graded by post-mortem (not lifetime realized P&L); lifetime activity = 1000 signatures (capped)",
-      "enabled": true
+      "metrics_basis": "observed buys graded by post-mortem (not lifetime realized P&L); lifetime activity = 1000 signatures (capped); realized +133.71 SOL over 342 swap(s) (history truncated)",
+      "enabled": true,
+      "net_profit_usd": "+$10k"
     }
   ]
 }

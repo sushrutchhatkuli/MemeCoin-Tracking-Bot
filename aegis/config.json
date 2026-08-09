@@ -570,7 +570,7 @@
     "observe": true,
     "syncIntervalHours": 2,
     "minWinRatePct": 75,
-    "minNetProfitUsd": 50000,
+    "minNetProfitUsd": 5000,
     "minLifetimeTrades": 100,
     "topN": 5,
     "enrichShortlistCap": 50,

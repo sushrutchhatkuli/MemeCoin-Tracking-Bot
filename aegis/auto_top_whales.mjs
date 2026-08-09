@@ -347,17 +347,25 @@ export async function deriveRealizedPnl(wallet, { heliusKey, solUsd, cfg = {} })
     const url =
       `https://api.helius.xyz/v0/addresses/${wallet}/transactions` +
       `?api-key=${encodeURIComponent(heliusKey)}&limit=100${before ? `&before=${before}` : ''}`;
-    let batch;
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(cfg.pnlTimeoutMs ?? 25000) });
-      if (!res.ok) {
-        // A partial history is still usable, but it must be FLAGGED — a
-        // truncated sum silently understates a wallet that traded earlier.
-        truncated = true;
-        break;
+    // Retried, because a 429 here does not just truncate a history — on the
+    // FIRST page it leaves txs at 0, which makes netUsd null, which fails
+    // Rule 2. Without a retry a wallet can be dropped from the elite list by a
+    // rate limit rather than on merit. Observed directly: consecutive syncs
+    // derived 48/48 and then 22/48 purely from request pacing.
+    let batch = null;
+    for (let attempt = 0; attempt < 3 && batch === null; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, (cfg.pnlDelayMs ?? 250) * 4 * attempt));
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(cfg.pnlTimeoutMs ?? 25000) });
+        if (!res.ok) continue;
+        batch = await res.json();
+      } catch {
+        /* retry, then give up */
       }
-      batch = await res.json();
-    } catch {
+    }
+    if (batch === null) {
+      // A partial history is still usable, but it must be FLAGGED — a
+      // truncated sum silently understates a wallet that traded earlier.
       truncated = true;
       break;
     }
