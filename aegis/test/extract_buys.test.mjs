@@ -33,6 +33,7 @@ import {
 } from '../audit.mjs';
 import { alertHeaderLines } from '../telegram.mjs';
 import { stopLossPctFor } from '../sell_notifier.mjs';
+import { capEnrichmentShortlist } from '../auto_top_whales.mjs';
 import { extractMints, channelMatches, SeenCache } from '../telegram_listener.mjs';
 
 const MINT = 'MintAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -875,6 +876,99 @@ test('the early insider tier gets the -15% stop its own alert text promises', ()
   assert.equal(stopLossPctFor({ category: 'COMMUNITY TAKEOVER GEM' }, cfg), 20);
   assert.equal(stopLossPctFor({}, cfg), 20, 'positions opened before this existed');
   assert.equal(stopLossPctFor({ category: 'X' }, {}), 20, 'default with no config');
+});
+
+/* ------------------------------------------------------------------ *
+ * Whale-sync enrichment cap
+ * ------------------------------------------------------------------ */
+
+const candidate = (i, gradedBuys, observedBuys = gradedBuys) => ({
+  address: `Wallet${String(i).padStart(3, '0')}`,
+  gradedBuys,
+  observed: { observedBuys },
+});
+
+test('the shortlist is capped at 50 before any per-wallet RPC work', () => {
+  // The ledger shape that caused the problem: thousands eligible, five written.
+  const eligible = Array.from({ length: 3_444 }, (_, i) => candidate(i, (i % 9) + 1));
+  const capped = capEnrichmentShortlist(eligible, 50);
+
+  assert.equal(capped.length, 50);
+  assert.equal(
+    ((eligible.length - capped.length) / eligible.length) * 100 > 98,
+    true,
+    'over 98% of per-wallet RPC work is skipped'
+  );
+});
+
+test('the cap keeps the MOST-observed wallets, not an arbitrary 50', () => {
+  const eligible = [
+    candidate(1, 2),
+    candidate(2, 9),
+    candidate(3, 1),
+    candidate(4, 7),
+    candidate(5, 4),
+  ];
+  const capped = capEnrichmentShortlist(eligible, 3);
+  assert.deepEqual(
+    capped.map((c) => c.gradedBuys),
+    [9, 7, 4],
+    'sorted by graded buys, descending'
+  );
+});
+
+test('observed buys break ties between equally-graded wallets', () => {
+  const eligible = [candidate(1, 5, 10), candidate(2, 5, 90), candidate(3, 5, 40)];
+  const capped = capEnrichmentShortlist(eligible, 2);
+  assert.deepEqual(capped.map((c) => c.observed.observedBuys), [90, 40]);
+});
+
+test('ungraded wallets cannot starve the cap of wallets that can qualify', () => {
+  // The reason the sort key is graded-first. A wallet with 200 observed buys
+  // and none decided yet can never pass the sample rule, so letting it occupy a
+  // slot would spend the RPC budget on a wallet that cannot reach the list.
+  const noisy = Array.from({ length: 60 }, (_, i) => candidate(100 + i, 0, 200));
+  const real = [candidate(1, 6, 6), candidate(2, 4, 4)];
+  const capped = capEnrichmentShortlist([...noisy, ...real], 50);
+
+  assert.equal(capped[0].gradedBuys, 6);
+  assert.equal(capped[1].gradedBuys, 4);
+  assert.equal(capped.length, 50);
+});
+
+test('the cap returns the same object references, so enrichment stays visible', () => {
+  // syncTopWhales enriches the shortlist in place and then ranks the FULL list.
+  // Copying the objects here would silently discard every enriched value.
+  const a = candidate(1, 5);
+  const capped = capEnrichmentShortlist([a], 50);
+  capped[0].lifetimeTrades = 987;
+  assert.equal(a.lifetimeTrades, 987, 'mutation must reach the original candidate');
+});
+
+test('a shortlist under the cap is returned whole', () => {
+  const eligible = [candidate(1, 3), candidate(2, 8)];
+  assert.equal(capEnrichmentShortlist(eligible, 50).length, 2);
+  assert.deepEqual(capEnrichmentShortlist([], 50), []);
+  assert.deepEqual(capEnrichmentShortlist(null, 50), []);
+});
+
+test('disabling the cap still returns a RANKED list, not the raw input', () => {
+  // Regression: the first version bailed out early on a non-finite cap and
+  // returned the input untouched, so "no limit" silently meant "no ranking".
+  // Caught by a diagnostic that trusted the ordering and got ledger order.
+  const eligible = [candidate(1, 1), candidate(2, 9), candidate(3, 4)];
+  for (const noCap of [Number.POSITIVE_INFINITY, -1, null, undefined_ok()]) {
+    const out = capEnrichmentShortlist(eligible, noCap);
+    assert.equal(out.length, 3, `cap=${noCap} keeps everything`);
+    assert.deepEqual(
+      out.map((c) => c.gradedBuys),
+      [9, 4, 1],
+      `cap=${noCap} must still rank best-first`
+    );
+  }
+  function undefined_ok() {
+    return NaN;
+  }
 });
 
 /* ------------------------------------------------------------------ *

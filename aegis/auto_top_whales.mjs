@@ -267,31 +267,85 @@ async function candidatesFromObservations(config) {
   return { candidates, totalSeen: wallets.length, solUsd, maturity };
 }
 
+/**
+ * Rank eligible candidates by how much of their behaviour has actually been
+ * observed, and keep only the top `cap` for per-wallet network work.
+ *
+ * Split out of syncTopWhales so the ordering can be tested without a network.
+ * Returns a NEW array of the SAME object references — enrichment mutates
+ * candidates in place, and the caller relies on those mutations being visible
+ * through the full `wellFormed` list it later ranks.
+ *
+ * Graded buys lead the sort, observed buys break ties. See the call site for
+ * why raw observation count alone would be the wrong key.
+ */
+export function capEnrichmentShortlist(eligible, cap = 50) {
+  if (!Array.isArray(eligible)) return [];
+
+  // Sort ALWAYS, slice conditionally. An earlier version returned the input
+  // unsorted whenever the cap was not a finite number, which made "no cap"
+  // silently mean "no ranking" — the ordering is the useful half of this
+  // function, and a caller disabling the limit still wants best-first.
+  const ranked = [...eligible].sort(
+    (a, b) =>
+      (b.gradedBuys ?? 0) - (a.gradedBuys ?? 0) ||
+      (b.observed?.observedBuys ?? 0) - (a.observed?.observedBuys ?? 0)
+  );
+  if (!Number.isFinite(cap) || cap < 0) return ranked;
+  return ranked.slice(0, cap);
+}
+
 /** Count on-chain signatures as a lifetime-activity proxy for finalists. */
 async function enrichLifetimeTrades(candidates, rpcUrl) {
   if (!rpcUrl) return;
+
+  // A failed enrichment leaves lifetimeTrades at the observed buy count, which
+  // then fails the >=100 trades rule — so a single transient RPC error silently
+  // drops a wallet off the elite list. Observed directly: two consecutive syncs
+  // over the same 50 wallets produced 43 and then 46 passes, and the run that
+  // lost three enrichments also lost the highest-profit wallet from the top 5.
+  //
+  // One retry plus a visible count converts that from an invisible coin-flip
+  // into something you can see in the log. It is affordable now only because
+  // the shortlist is capped — retrying 3,444 wallets would not have been.
+  let failed = 0;
   for (const c of candidates) {
-    try {
-      const r = await fetch(rpcUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getSignaturesForAddress',
-          params: [c.address, { limit: 1000 }],
-        }),
-        signal: AbortSignal.timeout(20000),
-      });
-      const j = await r.json();
-      if (Array.isArray(j.result)) {
-        c.lifetimeTrades = j.result.length;
-        c.basis += `; lifetime activity = ${j.result.length} signatures${j.result.length === 1000 ? ' (capped)' : ''}`;
+    let got = null;
+    for (let attempt = 0; attempt < 2 && got === null; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 600));
+      try {
+        const r = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getSignaturesForAddress',
+            params: [c.address, { limit: 1000 }],
+          }),
+          signal: AbortSignal.timeout(20000),
+        });
+        const j = await r.json();
+        if (Array.isArray(j.result)) got = j.result.length;
+      } catch {
+        /* retry once, then give up and leave the observed count in place */
       }
-    } catch {
-      /* leave the observed count in place */
+    }
+
+    if (got === null) {
+      failed++;
+    } else {
+      c.lifetimeTrades = got;
+      c.basis += `; lifetime activity = ${got} signatures${got === 1000 ? ' (capped)' : ''}`;
     }
     await new Promise((r) => setTimeout(r, 220));
+  }
+
+  if (failed) {
+    console.log(
+      `   ⚠️  ${failed} of ${candidates.length} enrichment call(s) failed after a retry — ` +
+        `those wallets keep their observed count and cannot pass the trades rule this sync`
+    );
   }
 }
 
@@ -443,9 +497,45 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
   // Rule 2 first meant no candidate was enriched, and Rule 3 reported 0 passes
   // regardless of the wallet's real history. Win rate is the cheap discriminator
   // and is computed without any network call, so it is the right gate.
-  const shortlist = wellFormed.filter(
+  const eligible = wellFormed.filter(
     (c) => c.winRatePct !== null && c.winRatePct >= rules.minWinRatePct
   );
+
+  // ---- Cap the shortlist before any per-wallet network work ---------
+  //
+  // Everything below this line costs RPC calls PER WALLET — screening, then
+  // enrichment — and the ledger had grown to 3,444 eligible wallets. Measured
+  // at 111 KB and 0.44s each, that is ~390 MB of JSON and ~25 minutes per sync,
+  // against a `topN` of 5 wallets actually written. The overwhelming majority of
+  // that work was discarded.
+  //
+  // Worse, it ran on a maintenance cadence of every 10 minutes, so the loop
+  // spent most of its life syncing instead of scanning — the source of the
+  // "468 tick(s) skipped while busy" in the logs.
+  //
+  // SORT KEY: graded buys first, observed buys second. Both are "how much have
+  // we actually seen this wallet do", but graded count is the one that gates
+  // qualification — the `sample` rule requires minGradedBuys decided outcomes,
+  // so a wallet with 40 observed buys and 0 graded ones can never make the list.
+  // Sorting on raw observed count alone would let those fill the cap and starve
+  // the wallets that can actually qualify.
+  //
+  // WHAT THIS TRADES AWAY, stated plainly: a wallet outside the top 50 by
+  // observation count can no longer be enriched, so it cannot pass the
+  // lifetime-trades rule and cannot reach the watchlist. Since the ledger
+  // collapses 3-4x per recurrence level (1466 wallets at >=1 graded buy, 9 at
+  // >=3), a cap of 50 sits far above where real candidates live. Raise
+  // eliteWhales.enrichShortlistCap if that stops being true.
+  const cap = config.eliteWhales?.enrichShortlistCap ?? 50;
+  const shortlist = capEnrichmentShortlist(eligible, cap);
+
+  if (eligible.length > shortlist.length) {
+    console.log(
+      `   ↳ shortlist capped: ${eligible.length.toLocaleString()} eligible → top ${shortlist.length} by observed activity ` +
+        `(${(100 - (shortlist.length / eligible.length) * 100).toFixed(1)}% of per-wallet RPC work skipped)`
+    );
+  }
+
   if (!importPath && shortlist.length) {
     const screenCache = {};
     const clean = [];
