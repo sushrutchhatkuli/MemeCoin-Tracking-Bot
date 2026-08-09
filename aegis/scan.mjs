@@ -305,7 +305,6 @@ async function analyzeToken({
     deployer: security?.ok ? security.creator : null,
   });
 
-  const signalCategory = classifySignal({ demand, security, config });
   const migration = migrationStatus(pair, security, config);
 
   // Cluster analysis needs the replayed buyers and a SOL price consistent with
@@ -331,6 +330,11 @@ async function analyzeToken({
       : { detected: false, label: null, clusterBuying: null, oversized: [], networks: [], watchlisted: [] };
 
   if (clusters?.detected) clusters.scoreBonus = clusterScoreBonus(clusters, config);
+
+  // Classification runs AFTER cluster detection, because the two insider tiers
+  // are defined by it — the plain GEM / SCALP bands never needed that input, so
+  // this used to sit further up.
+  const signalCategory = classifySignal({ demand, security, config, clusters, audit });
 
   // Network discovery reuses the funder cache the cluster pass just warmed, so
   // it costs little extra. Gated on a cluster having fired: expanding the net
@@ -594,11 +598,15 @@ export async function runScan(args = {}) {
           : '';
     const smTag = smartMoney?.detected ? ` 🐋x${smartMoney.count}` : '';
     const catTag =
-      result.signalCategory?.category === 'LONG-TERM GEM'
-        ? ' 💎GEM'
-        : result.signalCategory?.category === 'FAST SCALP'
-          ? ' ⚡SCALP'
-          : '';
+      result.signalCategory?.category === 'ESTABLISHED INSIDER GEM'
+        ? ' 💎INSIDER-GEM'
+        : result.signalCategory?.category === 'EARLY-STAGE INSIDER SCALP'
+          ? ' ⚡INSIDER-SCALP'
+          : result.signalCategory?.category === 'LONG-TERM GEM'
+            ? ' 💎GEM'
+            : result.signalCategory?.category === 'FAST SCALP'
+              ? ' ⚡SCALP'
+              : '';
     const holders = verdictInfo.holderGate?.holders;
     if (!quiet) console.log(
       `${icon} ${symbol.padEnd(12)} ${String(verdictInfo.score).padStart(3)}/100  ${verdictInfo.verdict.padEnd(24)} ` +
@@ -662,6 +670,12 @@ export async function runScan(args = {}) {
       console.log(`   🛑 $${symbol} alert CANCELLED at dispatch — ${alert.reason}`);
     } else if (alert.status === 'blocked-safety') {
       console.log(`   🛑 $${symbol} alert blocked by safety gate — ${alert.reason}`);
+    } else if (alert.status === 'blocked-insider-requirements') {
+      console.log(`   🛑 $${symbol} matched an insider band but failed a mandatory requirement — ${alert.reason}`);
+    } else if (alert.status === 'outside-insider-tiers') {
+      // Logged rather than dropped: this is real insider activity going silent,
+      // and silence with no stated reason is indistinguishable from a bug.
+      console.log(`   🔇 $${symbol} has insider activity but sits outside both tiers — ${alert.reason}`);
     }
 
     await sleep(config.requestDelayMs);

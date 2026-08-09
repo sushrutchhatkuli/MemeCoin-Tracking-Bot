@@ -23,7 +23,11 @@ import {
   concentrationCapFor,
   runSecurityAudit,
   classifySignal,
+  evaluateInsiderRequirements,
+  isInsiderCategory,
+  SIGNAL_CATEGORY,
 } from '../audit.mjs';
+import { alertHeaderLines } from '../telegram.mjs';
 
 const MINT = 'MintAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const POOL = 'PoolBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
@@ -385,6 +389,269 @@ test('a token outside both bands is left unclassified', () => {
   });
   assert.equal(r.category, 'UNCLASSIFIED');
   assert.equal(r.advice, null);
+});
+
+/* ------------------------------------------------------------------ *
+ * Dual insider tier classification
+ * ------------------------------------------------------------------ */
+
+// Mirrors the shipped config for both insider bands.
+const insiderConfig = {
+  thresholds: { maxTop10Pct: 20, minLpLockedPct: 99 },
+  signalCategories: {
+    ...catConfig.signalCategories,
+    insiderTiers: { maxTop10Pct: 20, minLpLockedPct: 99, scoreFloor: 68 },
+    insiderEstablished: {
+      minMarketCapUsd: 1_000_000,
+      maxMarketCapUsd: null,
+      minLiquidityUsd: 100_000,
+      minHolders: 1_000,
+      scoreBoost: 10,
+      label: '💎 ESTABLISHED INSIDER GEM',
+      advice: 'established insider advice',
+      alertHeader: '💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎',
+    },
+    insiderEarly: {
+      minMarketCapUsd: 30_000,
+      maxMarketCapUsd: 500_000,
+      scoreBoost: 0,
+      label: '⚡ EARLY-STAGE INSIDER SCALP',
+      advice: 'early insider advice',
+      alertHeader: '🚀 EARLY INSIDER SCALP ALERT ($30k–$500k MC) 🚀',
+    },
+  },
+};
+
+/** A contract that satisfies every mandatory requirement. */
+const cleanSecurity = (over = {}) => ({
+  ok: true,
+  chainKind: 'solana',
+  mintAuthority: null,
+  freezeAuthority: null,
+  lpLockedPct: 100,
+  top10Pct: 12,
+  totalHolders: 2_500,
+  ...over,
+});
+
+const PASSED = { status: 'PASSED', checks: [], failures: [], unknowns: [] };
+const insiders = (count = 2) => ({ detected: true, insiderCount: count, label: 'INSIDER CLUSTER' });
+
+const classifyInsider = (demand, over = {}) =>
+  classifySignal({
+    demand,
+    security: cleanSecurity(over.security),
+    config: insiderConfig,
+    clusters: over.clusters === undefined ? insiders() : over.clusters,
+    audit: over.audit ?? PASSED,
+  });
+
+test('a $60k insider-backed token is an EARLY-STAGE INSIDER SCALP', () => {
+  const r = classifyInsider({
+    marketCap: 60_000,
+    liquidityUsd: 25_000,
+    ageHours: 0.4,
+    ageIsLowerBound: false,
+  });
+  assert.equal(r.category, SIGNAL_CATEGORY.INSIDER_EARLY);
+  assert.equal(r.scoreBoost, 0, 'the early band adds no score of its own');
+  assert.match(r.alertHeader, /EARLY INSIDER SCALP ALERT/);
+  assert.equal(r.insiderRequirements.passed, true);
+});
+
+test('a $3M insider-backed token with deep liquidity is an ESTABLISHED INSIDER GEM', () => {
+  const r = classifyInsider({
+    marketCap: 3_000_000,
+    liquidityUsd: 450_000,
+    ageHours: 40,
+    ageIsLowerBound: false,
+  });
+  assert.equal(r.category, SIGNAL_CATEGORY.INSIDER_ESTABLISHED);
+  assert.equal(r.scoreBoost, 10);
+  assert.match(r.alertHeader, /ESTABLISHED INSIDER GEM ALERT/);
+});
+
+test('the established band has no ceiling — "$10M+" means what it says', () => {
+  const r = classifyInsider({
+    marketCap: 40_000_000,
+    liquidityUsd: 2_000_000,
+    ageHours: 400,
+    ageIsLowerBound: false,
+  });
+  assert.equal(r.category, SIGNAL_CATEGORY.INSIDER_ESTABLISHED);
+});
+
+test('no insider activity means no insider tier — the plain bands still apply', () => {
+  const r = classifyInsider(
+    { marketCap: 60_000, liquidityUsd: 25_000, ageHours: 0.4, ageIsLowerBound: false },
+    { clusters: { detected: false } }
+  );
+  assert.equal(r.category, SIGNAL_CATEGORY.SCALP);
+  assert.equal(isInsiderCategory(r.category), false);
+});
+
+test('an insider tier beats the plain GEM it overlaps', () => {
+  // $400k, mature, $80k liquidity: a LONG-TERM GEM under the plain rules. With
+  // cluster activity the early band takes it, because the tighter stop is the
+  // safer of the two pieces of advice about the same token.
+  const demand = { marketCap: 400_000, liquidityUsd: 80_000, ageHours: 30, ageIsLowerBound: false };
+  assert.equal(
+    classifySignal({ demand, security: cleanSecurity(), config: insiderConfig }).category,
+    SIGNAL_CATEGORY.GEM,
+    'without clusters it is a plain GEM'
+  );
+  assert.equal(classifyInsider(demand).category, SIGNAL_CATEGORY.INSIDER_EARLY);
+});
+
+test('the established tier refuses a token with too few holders or too little liquidity', () => {
+  const thin = classifyInsider(
+    { marketCap: 3_000_000, liquidityUsd: 60_000, ageHours: 40, ageIsLowerBound: false },
+    { security: { totalHolders: 2_500 } }
+  );
+  assert.notEqual(thin.category, SIGNAL_CATEGORY.INSIDER_ESTABLISHED, '$60k liq is under the floor');
+
+  const fewHolders = classifyInsider(
+    { marketCap: 3_000_000, liquidityUsd: 450_000, ageHours: 40, ageIsLowerBound: false },
+    { security: { totalHolders: 400 } }
+  );
+  assert.notEqual(fewHolders.category, SIGNAL_CATEGORY.INSIDER_ESTABLISHED);
+
+  const unknownHolders = classifyInsider(
+    { marketCap: 3_000_000, liquidityUsd: 450_000, ageHours: 40, ageIsLowerBound: false },
+    { security: { totalHolders: null } }
+  );
+  assert.notEqual(
+    unknownHolders.category,
+    SIGNAL_CATEGORY.INSIDER_ESTABLISHED,
+    'unknown holder count is not a thousand holders'
+  );
+});
+
+test('a failed mandatory requirement blocks the tier WITHOUT falling back to a plain one', () => {
+  // The whole point of the gate: a token that matched an insider band and then
+  // failed a security requirement must not re-enter as a plain GEM and collect
+  // the alert it was just denied.
+  const demand = { marketCap: 3_000_000, liquidityUsd: 450_000, ageHours: 40, ageIsLowerBound: false };
+
+  for (const [what, over] of [
+    ['active mint authority', { security: { mintAuthority: 'SomeMintAuthority1111111111' } }],
+    ['active freeze authority', { security: { freezeAuthority: 'SomeFreezeAuthority11111111' } }],
+    ['LP only 60% locked', { security: { lpLockedPct: 60 } }],
+    ['LP lock unknown', { security: { lpLockedPct: null } }],
+    ['top 10 at the 20% cap', { security: { top10Pct: 20 } }],
+    ['concentration unknown', { security: { top10Pct: null } }],
+    ['audit not PASSED', { audit: { status: 'UNVERIFIED', checks: [], failures: [] } }],
+  ]) {
+    const r = classifyInsider(demand, over);
+    assert.equal(r.category, SIGNAL_CATEGORY.NONE, `${what} must not classify`);
+    assert.equal(r.insiderRequirements.passed, false, what);
+    assert.match(r.reason, /requirements failed/, what);
+  }
+});
+
+test('every mandatory requirement is reported, passing or failing', () => {
+  const req = evaluateInsiderRequirements({
+    audit: PASSED,
+    security: cleanSecurity(),
+    clusters: insiders(3),
+    thresholds: { maxTop10Pct: 20, minLpLockedPct: 99 },
+  });
+  assert.equal(req.passed, true);
+  const labels = req.checks.map((c) => c.label);
+  for (const need of [
+    'Insider detected',
+    'Contract audit',
+    'Mint authority revoked',
+    'Freeze authority revoked',
+    'LP burned / locked',
+    'Top 10 concentration',
+  ]) {
+    assert.ok(labels.includes(need), `missing requirement row: ${need}`);
+  }
+});
+
+test('a token between the bands ($500k-$1M) reaches neither insider tier', () => {
+  // Documented gap. It is asserted rather than left implicit so that closing it
+  // later is a deliberate edit to a failing test, not a silent behaviour change.
+  const r = classifyInsider({
+    marketCap: 750_000,
+    liquidityUsd: 200_000,
+    ageHours: 3,
+    ageIsLowerBound: false,
+  });
+  assert.equal(isInsiderCategory(r.category), false);
+});
+
+test('the absolute-depth waiver applies to the established tier and nothing else', () => {
+  // A $3.4M token with a $410k pool is 12% of market cap — under the 15% ratio
+  // floor that would otherwise zero it. Real tokens in this band sit at 5-12%,
+  // so without the waiver the tier could never fire at all.
+  const deepButLowRatio = {
+    m5: { buys: 30, sells: 18, ratio: 1.7 },
+    h1: { buys: 300, sells: 220, ratio: 1.4 },
+    marketCap: 3_400_000,
+    liquidityUsd: 410_000,
+    liqToMcapPct: 12.1,
+    volume: { m5: 40_000, h1: 900_000, h24: 6_000_000 },
+    priceChange: { m5: 1, h1: 6, h6: 12, h24: 30 },
+    ageHours: 62,
+  };
+  const base = {
+    audit: PASSED,
+    security: { ok: true, totalHolders: 5_200, top10Pct: 9.2 },
+    demand: deepButLowRatio,
+    velocity: null,
+    catalysts: { bullish: [], bearish: [] },
+    thresholds: { ...thresholds, minLiqToMcapPct: 15, minAbsoluteLiquidityUsd: 100_000 },
+  };
+
+  const established = scoreToken({
+    ...base,
+    signalCategory: { category: SIGNAL_CATEGORY.INSIDER_ESTABLISHED },
+  });
+  assert.equal(established.safetyGateFailed, false, 'the deep pool clears the gate');
+  assert.notEqual(established.verdict, 'THIN LIQUIDITY');
+  assert.equal(established.liquidityGate.waivedByDepth, true);
+
+  // Same numbers, every other category: the ratio floor still bites. The waiver
+  // is a targeted fix for one band, not a general loosening.
+  for (const category of [
+    SIGNAL_CATEGORY.INSIDER_EARLY,
+    SIGNAL_CATEGORY.GEM,
+    SIGNAL_CATEGORY.SCALP,
+    SIGNAL_CATEGORY.NONE,
+  ]) {
+    const r = scoreToken({ ...base, signalCategory: { category } });
+    assert.equal(r.verdict, 'THIN LIQUIDITY', `${category} must still face the ratio floor`);
+    assert.equal(r.score, 0, category);
+  }
+
+  // A pool under the absolute floor gets no waiver even in the established tier.
+  const shallow = scoreToken({
+    ...base,
+    demand: { ...deepButLowRatio, liquidityUsd: 80_000, liqToMcapPct: 2.4 },
+    signalCategory: { category: SIGNAL_CATEGORY.INSIDER_ESTABLISHED },
+  });
+  assert.equal(shallow.verdict, 'THIN LIQUIDITY');
+});
+
+test('the tier header leads the Telegram alert', () => {
+  const early = alertHeaderLines({
+    signalCategory: { alertHeader: '🚀 EARLY INSIDER SCALP ALERT ($30k–$500k MC) 🚀' },
+    clusters: insiders(1),
+  });
+  assert.match(early[0], /EARLY INSIDER SCALP ALERT/);
+  assert.equal(early.length, 1, 'a single insider adds no swarm line');
+
+  const swarm = alertHeaderLines({
+    signalCategory: { alertHeader: '💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎' },
+    clusters: insiders(4),
+  });
+  assert.match(swarm[0], /ESTABLISHED INSIDER GEM ALERT/);
+  assert.match(swarm[1], /CABAL SWARM — 4 unique insider wallets/);
+
+  const fallback = alertHeaderLines({ signalCategory: {}, clusters: insiders(2) });
+  assert.match(fallback[0], /MULTI-INSIDER BUY ALERT/);
 });
 
 /* ------------------------------------------------------------------ *

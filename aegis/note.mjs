@@ -245,11 +245,15 @@ export function renderNote({
       {
         ...verdictInfo,
         categoryTag:
-          signalCategory?.category === 'LONG-TERM GEM'
-            ? 'signal/long-term-gem'
-            : signalCategory?.category === 'FAST SCALP'
-              ? 'signal/fast-scalp'
-              : null,
+          signalCategory?.category === 'ESTABLISHED INSIDER GEM'
+            ? 'signal/insider-established-gem'
+            : signalCategory?.category === 'EARLY-STAGE INSIDER SCALP'
+              ? 'signal/insider-early-scalp'
+              : signalCategory?.category === 'LONG-TERM GEM'
+                ? 'signal/long-term-gem'
+                : signalCategory?.category === 'FAST SCALP'
+                  ? 'signal/fast-scalp'
+                  : null,
       },
       social
     ).map((t) => `  - ${t}`),

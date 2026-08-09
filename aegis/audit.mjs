@@ -270,21 +270,136 @@ function resolveAge(pair, security) {
  * ------------------------------------------------------------------ */
 
 export const SIGNAL_CATEGORY = {
+  INSIDER_EARLY: 'EARLY-STAGE INSIDER SCALP',
+  INSIDER_ESTABLISHED: 'ESTABLISHED INSIDER GEM',
   GEM: 'LONG-TERM GEM',
   SCALP: 'FAST SCALP',
   NONE: 'UNCLASSIFIED',
 };
 
+const INSIDER_CATEGORIES = new Set([
+  SIGNAL_CATEGORY.INSIDER_EARLY,
+  SIGNAL_CATEGORY.INSIDER_ESTABLISHED,
+]);
+
+/** True for the two insider-backed tiers, which the notifier gates on. */
+export const isInsiderCategory = (category) => INSIDER_CATEGORIES.has(category);
+
+/**
+ * Mandatory security + insider requirements, shared by BOTH insider tiers.
+ *
+ * Every row must be AFFIRMATIVELY TRUE. Unknown counts as a failure here, which
+ * is deliberately stricter than the contract audit — that reports unknown as
+ * UNVERIFIED and leaves the token watchable. An insider tier is a promotion: it
+ * puts a louder header on the alert and, for the established tier, adds score.
+ * A promotion must never rest on data the provider simply never returned.
+ *
+ * These duplicate gates that runSecurityAudit and scoreToken already enforce.
+ * That repetition is the point — the tiers are the loudest alerts Aegis sends,
+ * so their preconditions are stated once more where they can be read and tested
+ * on their own, rather than inferred from the interaction of three modules.
+ */
+export function evaluateInsiderRequirements({ audit, security, clusters, thresholds = {} }) {
+  const rows = [];
+  const add = (label, passed, detail) => rows.push({ label, passed: passed === true, detail });
+
+  const top10Cap = thresholds.maxTop10Pct ?? 20;
+  const lpFloor = thresholds.minLpLockedPct ?? 99;
+  const evm = security?.chainKind === 'evm';
+
+  const count = clusters?.insiderCount ?? 0;
+  add(
+    'Insider detected',
+    clusters?.detected === true,
+    clusters?.detected
+      ? `${clusters.label ?? 'insider activity'}${count ? ` — ${count} unique wallet(s)` : ''}`
+      : 'No cluster, non-routine buy size or funder network matched'
+  );
+
+  add(
+    'Contract audit',
+    audit?.status === 'PASSED',
+    audit?.status === 'PASSED'
+      ? 'All contract checks passed'
+      : `Audit status is ${audit?.status ?? 'unknown'} — only PASSED qualifies`
+  );
+
+  if (evm) {
+    // EVM has no freeze authority; mintability is the equivalent supply control.
+    add(
+      'Mint authority revoked',
+      security?.isMintable === false,
+      security?.isMintable === false ? 'Supply fixed, not mintable' : 'Contract is mintable or unknown'
+    );
+    add('Freeze authority revoked', true, 'Not applicable on EVM — no freeze authority');
+  } else {
+    add(
+      'Mint authority revoked',
+      security?.ok === true && security.mintAuthority === null,
+      security?.ok !== true
+        ? 'Security report unavailable'
+        : security.mintAuthority === null
+          ? 'Revoked / Null'
+          : `ACTIVE (${security.mintAuthority})`
+    );
+    add(
+      'Freeze authority revoked',
+      security?.ok === true && security.freezeAuthority === null,
+      security?.ok !== true
+        ? 'Security report unavailable'
+        : security.freezeAuthority === null
+          ? 'Revoked / Null'
+          : `ACTIVE (${security.freezeAuthority})`
+    );
+  }
+
+  const lp = security?.lpLockedPct;
+  add(
+    'LP burned / locked',
+    lp !== null && lp !== undefined && lp >= lpFloor,
+    lp === null || lp === undefined
+      ? 'LP lock status not indexed — unknown does not qualify'
+      : `${lp.toFixed(1)}% burned / locked (required ≥ ${lpFloor}%)`
+  );
+
+  const top10 = security?.top10Pct;
+  add(
+    'Top 10 concentration',
+    top10 !== null && top10 !== undefined && top10 < top10Cap,
+    top10 === null || top10 === undefined
+      ? 'Holder distribution not indexed — unknown does not qualify'
+      : `Top 10 hold ${top10.toFixed(1)}% (limit ${top10Cap}%)`
+  );
+
+  const failures = rows.filter((r) => !r.passed).map((r) => `${r.label}: ${r.detail}`);
+  return { passed: failures.length === 0, checks: rows, failures };
+}
+
 /**
  * Sort a qualifying token into a holding style.
  *
- * The two tiers are deliberately asymmetric about missing data. GEM advice says
- * hold for days or weeks, so every one of its conditions must be positively
- * proven — an unknown age or unknown holder count disqualifies. SCALP advice
- * says take profit quickly, which stays sound even if the token turns out older
- * than assumed, so it tolerates an unproven age.
+ * Precedence, highest first:
+ *   1. 💎 ESTABLISHED INSIDER GEM   insider + $1M-$10M+ + deep liquidity + 1k holders
+ *   2. ⚡ EARLY-STAGE INSIDER SCALP  insider + $30k-$500k
+ *   3. 💎 ESTABLISHED GEM            mature and deep, no insider requirement
+ *   4. ⚡ FAST MOMENTUM SCALP        young and mid-cap
+ *
+ * The insider tiers are tested FIRST and legitimately overlap the plain ones: a
+ * mature $400k token with cluster activity becomes an EARLY-STAGE INSIDER SCALP
+ * rather than a GEM, because the insider entry is the more decision-relevant
+ * fact and the tighter stop-loss is the safer advice of the two.
+ *
+ * Both insider tiers require `evaluateInsiderRequirements` to pass in full.
+ * Without a `clusters` argument the insider tiers cannot fire at all, so older
+ * callers keep exactly their previous two-tier behaviour.
+ *
+ * The plain tiers stay asymmetric about missing data. GEM advice says hold for
+ * days or weeks, so every one of its conditions must be positively proven — an
+ * unknown age or unknown holder count disqualifies. SCALP advice says take
+ * profit quickly, which stays sound even if the token turns out older than
+ * assumed, so it tolerates an unproven age.
  */
-export function classifySignal({ demand, security, config }) {
+export function classifySignal({ demand, security, config, clusters = null, audit = null }) {
   const g = config.signalCategories?.gem ?? {};
   const s = config.signalCategories?.scalp ?? {};
   const holders = security?.ok ? security.totalHolders : null;
@@ -292,6 +407,16 @@ export function classifySignal({ demand, security, config }) {
   const mcap = demand.marketCap ?? 0;
   const liq = demand.liquidityUsd ?? 0;
   const age = demand.ageHours;
+
+  const insiderTier = classifyInsiderTier({
+    demand,
+    security,
+    config,
+    clusters,
+    audit,
+    holders,
+  });
+  if (insiderTier) return insiderTier;
 
   const gemChecks = {
     marketCap: mcap >= (g.minMarketCapUsd ?? 1_000_000),
@@ -335,6 +460,111 @@ export function classifySignal({ demand, security, config }) {
     scoreBoost: 0,
     checks: gemChecks,
     reason: `MC $${Math.round(mcap).toLocaleString('en-US')} / age ${age === null ? 'unknown' : `${age.toFixed(1)}h`} fits neither tier`,
+  };
+}
+
+/**
+ * Insider tier selection. Returns null when neither tier applies, so the caller
+ * falls through to the plain GEM / SCALP bands.
+ *
+ * Band membership is checked BEFORE the shared requirement gate so that a token
+ * outside both market-cap windows costs nothing to reject, and so the recorded
+ * `reason` distinguishes "wrong size" from "failed a security requirement" —
+ * two very different things when you are reading back why an alert never fired.
+ *
+ * ESTABLISHED is tested first: the bands cannot overlap at their configured
+ * values ($500k ceiling vs $1M floor), but ordering them explicitly means a
+ * future widening of the early band cannot silently demote a deep-liquidity,
+ * thousand-holder token into the tight-stop scalp tier.
+ */
+function classifyInsiderTier({ demand, security, config, clusters, audit, holders }) {
+  if (!clusters?.detected) return null;
+
+  const cats = config.signalCategories ?? {};
+  const shared = cats.insiderTiers ?? {};
+  const mcap = demand.marketCap ?? 0;
+  const liq = demand.liquidityUsd ?? 0;
+
+  const inBand = (cfg, floor, ceiling) => {
+    const min = cfg.minMarketCapUsd ?? floor;
+    // null / absent ceiling means open-ended, which is what "$10M+" asks for.
+    const max = cfg.maxMarketCapUsd ?? ceiling;
+    return mcap >= min && (max === null || mcap <= max);
+  };
+
+  const est = cats.insiderEstablished ?? {};
+  const early = cats.insiderEarly ?? {};
+
+  const estChecks = {
+    marketCap: inBand(est, 1_000_000, null),
+    liquidity: liq >= (est.minLiquidityUsd ?? 100_000),
+    // Holder count must be KNOWN, not merely "not below the floor". Missing
+    // distribution data cannot be read as a thousand holders.
+    holders:
+      holders !== null && holders !== undefined && holders >= (est.minHolders ?? 1_000),
+  };
+  const earlyChecks = { marketCap: inBand(early, 30_000, 500_000) };
+
+  const tier = Object.values(estChecks).every(Boolean)
+    ? {
+        cfg: est,
+        category: SIGNAL_CATEGORY.INSIDER_ESTABLISHED,
+        checks: estChecks,
+        label: est.label ?? '💎 ESTABLISHED INSIDER GEM',
+        advice:
+          est.advice ??
+          '💎 Established insider accumulation — high 90%+ survival rate & deep liquidity.',
+        alertHeader: est.alertHeader ?? '💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎',
+        scoreBoost: est.scoreBoost ?? 10,
+      }
+    : earlyChecks.marketCap
+      ? {
+          cfg: early,
+          category: SIGNAL_CATEGORY.INSIDER_EARLY,
+          checks: earlyChecks,
+          label: early.label ?? '⚡ EARLY-STAGE INSIDER SCALP',
+          advice:
+            early.advice ??
+            '⚡ Early insider entry — massive upside potential. Enforce tight -15% stop-loss!',
+          alertHeader: early.alertHeader ?? '🚀 EARLY INSIDER SCALP ALERT ($30k–$500k MC) 🚀',
+          scoreBoost: early.scoreBoost ?? 0,
+        }
+      : null;
+
+  if (!tier) return null;
+
+  const requirements = evaluateInsiderRequirements({
+    audit,
+    security,
+    clusters,
+    thresholds: { ...(config.thresholds ?? {}), ...shared },
+  });
+  if (!requirements.passed) {
+    // Deliberately NOT a downgrade to the plain tiers. A token that matched an
+    // insider band but failed a mandatory requirement is exactly the case the
+    // gate exists for; letting it re-enter as a plain GEM would hand it back
+    // the alert it was just denied.
+    return {
+      category: SIGNAL_CATEGORY.NONE,
+      label: 'UNCLASSIFIED',
+      advice: null,
+      scoreBoost: 0,
+      checks: tier.checks,
+      insiderRequirements: requirements,
+      reason: `Insider band matched but requirements failed — ${requirements.failures[0]}`,
+    };
+  }
+
+  return {
+    category: tier.category,
+    label: tier.label,
+    advice: tier.advice,
+    alertHeader: tier.alertHeader,
+    scoreBoost: tier.scoreBoost,
+    insider: true,
+    insiderCount: clusters.insiderCount ?? 0,
+    checks: tier.checks,
+    insiderRequirements: requirements,
   };
 }
 
@@ -491,7 +721,29 @@ export function scoreToken({
     security.totalHolders !== undefined &&
     security.totalHolders < (thresholds.minUniqueHolders ?? 150);
   const depthFloorPct = thresholds.minLiqToMcapPct ?? 15;
+
+  // Absolute-depth alternative to the ratio floor, for the established insider
+  // tier only.
+  //
+  // The 15%-of-market-cap floor is the right test for a small token, where a
+  // thin pool means you cannot get out. It is the WRONG test at the top of the
+  // range: real $1M-$10M tokens routinely sit at 5-12%, so the ratio floor
+  // rejected the entire established band — a $3.4M token with a $410k pool
+  // scored 0 and never alerted. A tier that cannot fire is not a safety
+  // feature, it is a dead one.
+  //
+  // Stated plainly, because it IS a loosening: a $100k pool absorbs a retail
+  // exit at single-digit slippage, but it does not make a $10M token as
+  // exitable as 15% would. Size your exit to the pool, not the market cap.
+  // Scoped to INSIDER_ESTABLISHED deliberately — every other token, including
+  // the early insider tier, still faces the full ratio floor.
+  const absoluteDepthFloor = thresholds.minAbsoluteLiquidityUsd ?? 100_000;
+  const deepPoolWaiver =
+    signalCategory?.category === SIGNAL_CATEGORY.INSIDER_ESTABLISHED &&
+    (demand.liquidityUsd ?? 0) >= absoluteDepthFloor;
+
   const liquidityGateFailed =
+    !deepPoolWaiver &&
     demand.liqToMcapPct !== null &&
     demand.liqToMcapPct !== undefined &&
     demand.marketCap > 0 &&
@@ -554,7 +806,8 @@ export function scoreToken({
   // leaving the position costs more than the move earned.
   const depthFloor = thresholds.minLiqToMcapPct ?? 15;
   const depthKnown = demand.liqToMcapPct !== null && demand.liqToMcapPct !== undefined;
-  const thinLiquidity = depthKnown && demand.marketCap > 0 && demand.liqToMcapPct < depthFloor;
+  const thinLiquidity =
+    !deepPoolWaiver && depthKnown && demand.marketCap > 0 && demand.liqToMcapPct < depthFloor;
 
   // --- Verdict -----------------------------------------------------
   let verdict;
@@ -647,12 +900,15 @@ export function scoreToken({
       floorPct: depthFloorPct,
       actualPct: demand.liqToMcapPct ?? null,
       passed: liquidityGateFailed ? false : true,
+      waivedByDepth: deepPoolWaiver,
       status:
         demand.liqToMcapPct === null || demand.liqToMcapPct === undefined
           ? 'Liquidity depth unknown'
-          : liquidityGateFailed
-            ? `${demand.liqToMcapPct.toFixed(1)}% of MCap — below ${depthFloorPct}% floor ❌`
-            : `${demand.liqToMcapPct.toFixed(1)}% of MCap — ${depthFloorPct}%+ floor passed ✅`,
+          : deepPoolWaiver
+            ? `$${Math.round(demand.liquidityUsd).toLocaleString('en-US')} pool (${demand.liqToMcapPct.toFixed(1)}% of MCap) — absolute depth floor passed ✅`
+            : liquidityGateFailed
+              ? `${demand.liqToMcapPct.toFixed(1)}% of MCap — below ${depthFloorPct}% floor ❌`
+              : `${demand.liqToMcapPct.toFixed(1)}% of MCap — ${depthFloorPct}%+ floor passed ✅`,
     },
     holderGate: {
       floor: holderFloor,

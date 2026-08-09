@@ -11,7 +11,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { fetchLiveHolderDistribution } from './sources.mjs';
-import { concentrationCapFor } from './audit.mjs';
+import { concentrationCapFor, isInsiderCategory } from './audit.mjs';
 import { formatSmartMoneyLine } from './smart_money.mjs';
 
 /* ------------------------------------------------------------------ *
@@ -343,6 +343,48 @@ function renderWhales(smartMoney) {
   return lines;
 }
 
+/**
+ * The first line(s) of the alert — the label a reader sees before anything else.
+ *
+ * When the token landed in one of the two insider tiers, that tier's header
+ * leads and states the market-cap band outright, because band is what decides
+ * how the position should be held: a $60k early entry and a $3M accumulation
+ * are not the same trade even when the insider evidence is identical.
+ *
+ * The cabal-size line follows only at 2+ unique wallets, where it adds a fact
+ * the tier header does not carry. At a single wallet it would just restate the
+ * header, and the full roster appears in the cluster block below regardless.
+ */
+export function alertHeaderLines({ signalCategory, clusters, smartMoney }) {
+  const count = clusters?.insiderCount ?? 0;
+  const tierHeader = signalCategory?.alertHeader ?? null;
+
+  if (tierHeader) {
+    const lines = [`<b>${esc(tierHeader)}</b>`];
+    if (count >= 4) lines.push(`🔥 <b>CABAL SWARM — ${count} unique insider wallets</b>`);
+    else if (count >= 2) lines.push(`🔥 <b>MULTI-INSIDER — ${count} unique wallets</b>`);
+    return lines;
+  }
+
+  // Fallback chain, unchanged. Reached when telegram.insiderTiersOnly is off
+  // and a token alerts from outside both bands, or on a non-insider signal.
+  return [
+    count >= 4
+      ? '🚀 <b>CABAL SWARM BUY ALERT</b> 🚀'
+      : count >= 2
+        ? '🚀 <b>MULTI-INSIDER BUY ALERT</b> 🚀'
+        : clusters?.detected
+          ? '🚀 <b>REAL-TIME INSIDER BUY ALERT</b> 🚀'
+          : signalCategory?.category === 'LONG-TERM GEM'
+            ? '💎 <b>LONG-TERM INVESTMENT GEM SIGNAL</b> 💎'
+            : signalCategory?.category === 'FAST SCALP'
+              ? '⚡ <b>FAST MOMENTUM SCALP SIGNAL</b> ⚡'
+              : smartMoney?.detected
+                ? '🚀 <b>HIGH PROBABILITY SIGNAL</b> 🚀'
+                : '🚀 <b>BUY SIGNAL</b> 🚀',
+  ];
+}
+
 export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters }) {
   const symbol = pair.baseToken?.symbol ?? 'UNKNOWN';
   const address = pair.baseToken.address;
@@ -368,21 +410,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     demand.m5.sells > 0 ? (demand.m5.buys / demand.m5.sells).toFixed(1) : '∞';
 
   return [
-    // Signal type leads, because it determines how the trade should be held —
-    // that decision matters more than the score.
-    (clusters?.insiderCount ?? 0) >= 4
-      ? '🚀 <b>CABAL SWARM BUY ALERT</b> 🚀'
-      : (clusters?.insiderCount ?? 0) >= 2
-        ? '🚀 <b>MULTI-INSIDER BUY ALERT</b> 🚀'
-        : clusters?.detected
-          ? '🚀 <b>REAL-TIME INSIDER BUY ALERT</b> 🚀'
-      : signalCategory?.category === 'LONG-TERM GEM'
-      ? '💎 <b>LONG-TERM INVESTMENT GEM SIGNAL</b> 💎'
-      : signalCategory?.category === 'FAST SCALP'
-        ? '⚡ <b>FAST MOMENTUM SCALP SIGNAL</b> ⚡'
-        : smartMoney?.detected
-          ? '🚀 <b>HIGH PROBABILITY SIGNAL</b> 🚀'
-          : '🚀 <b>BUY SIGNAL</b> 🚀',
+    ...alertHeaderLines({ signalCategory, clusters, smartMoney }),
     `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
     `<i>Score ${verdictInfo.score}/100</i>${clusters?.label ? ` | <b>${esc(clusters.label)}</b>` : ''}`,
     // Placed above the advice: if the buy button is locked, the trading advice
@@ -395,6 +423,11 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     ...renderWhales(smartMoney),
     '',
     '🔒 <b>SAFETY &amp; DENSITY AUDIT:</b>',
+    ...(signalCategory?.insiderRequirements
+      ? [
+          `• Insider Tier Gate: ${signalCategory.insiderRequirements.checks.filter((c) => c.passed).length}/${signalCategory.insiderRequirements.checks.length} mandatory requirements met ${signalCategory.insiderRequirements.passed ? '✅' : '❌'}`,
+        ]
+      : []),
     `• Holders: ${security?.totalHolders ?? '?'} Wallets (${verdictInfo.holderGate?.passed ? `Passed ${verdictInfo.holderGate.floor}+ Floor ✅` : 'Floor NOT passed ❌'})`,
     `• Top 10 Concentration: ${security?.top10Pct === null || security?.top10Pct === undefined ? '?' : `${security.top10Pct.toFixed(1)}%`}${reaudit?.ran ? ` (re-checked live: ${reaudit.now?.toFixed(1)}%, cap ${reaudit.cap}% ✅)` : ` (cap ${esc(String(concentrationCapFor(demand?.ageHours ?? null, { maxTop10Pct: 25, maxTop10PctYoung: 20 }).cap))}% ✅)`}`,
     `• Holder Data: ${security?.distributionSource === 'rpc-live' ? 'live on-chain ✅' : 'cached indexer ⚠️'}${reaudit?.ran ? '' : reaudit?.reason ? ` · re-audit skipped (${esc(String(reaudit.reason).slice(0, 60))})` : ''}`,
@@ -475,7 +508,9 @@ export function buildDigest({ rows, scanned, noteCount, startedAt, tradeLink }) 
           `liq ${r.liqPct.toFixed(0)}%`,
         ];
         if (r.smartMoney) extras.push(`🐋x${r.smartMoney}`);
-        if (r.category === 'LONG-TERM GEM') extras.push('💎GEM');
+        if (r.category === 'ESTABLISHED INSIDER GEM') extras.push('💎INSIDER-GEM');
+        else if (r.category === 'EARLY-STAGE INSIDER SCALP') extras.push('⚡INSIDER-SCALP');
+        else if (r.category === 'LONG-TERM GEM') extras.push('💎GEM');
         else if (r.category === 'FAST SCALP') extras.push('⚡SCALP');
         if (r.devStatus === 'GOOD DEV ✅') extras.push('dev✅');
         lines.push(`${head} — ${esc(extras.join(' · '))}`);
@@ -619,9 +654,40 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
   // out most real insider entries — which is the opposite of the intent.
   if (config.telegram.insiderOnly !== false) {
     if (!result.clusters?.detected) return { status: 'no-insider-activity' };
-    // Kept as an explicit floor, defaulting to 0 so the rule above stands
-    // alone. Raise `telegram.insiderMinScore` to require conviction as well.
-    const floor = config.telegram.insiderMinScore ?? 0;
+
+    // ---- Dual insider tier gate -----------------------------------
+    //
+    // Alerts are restricted to the two named market-cap tiers, so every
+    // notification carries a band-specific header and a holding style that was
+    // chosen for that band. classifySignal only awards a tier after
+    // evaluateInsiderRequirements passes in full, so this single check also
+    // enforces mint/freeze revoked, LP burned, and top-10 under the cap.
+    //
+    // The requirement object is re-checked directly as well. Same reasoning as
+    // the double safety-gate check above: the loudest alerts Aegis sends should
+    // not depend on one call site staying correct.
+    if (config.telegram.insiderTiersOnly !== false) {
+      const category = result.signalCategory?.category;
+      if (!isInsiderCategory(category)) {
+        return {
+          status: 'outside-insider-tiers',
+          reason:
+            result.signalCategory?.reason ??
+            `MC $${Math.round(demand.marketCap ?? 0).toLocaleString('en-US')} is outside both insider bands`,
+        };
+      }
+      const req = result.signalCategory?.insiderRequirements;
+      if (!req?.passed) {
+        return { status: 'blocked-insider-requirements', reason: req?.failures?.[0] ?? 'unknown' };
+      }
+    }
+
+    // Score floor. Cannot be applied during classification — a tier's own
+    // scoreBoost feeds the score — so it is enforced here at dispatch.
+    const floor =
+      config.telegram.insiderMinScore ??
+      config.signalCategories?.insiderTiers?.scoreFloor ??
+      0;
     if (verdictInfo.score < floor) return { status: 'below-insider-score-floor' };
   } else {
     if (verdictInfo.verdict !== 'BUY SIGNAL') return { status: 'not-a-signal' };

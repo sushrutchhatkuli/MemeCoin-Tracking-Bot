@@ -8,10 +8,16 @@
     "bsc"
   ],
   "rpcUrl": "https://api.mainnet-beta.solana.com",
+  "_filtersNote": [
+    "maxMarketCapUsd raised 8M -> 12M on 2026-08-08 so the ESTABLISHED INSIDER",
+    "GEM tier ($1M-$10M+) is reachable at all. At 8M the top fifth of that band",
+    "was discarded before it ever reached the audit, which would have made the",
+    "tier quietly unable to fire on the exact tokens it names."
+  ],
   "filters": {
     "minLiquidityUsd": 4000,
     "minMarketCapUsd": 12000,
-    "maxMarketCapUsd": 8000000,
+    "maxMarketCapUsd": 12000000,
     "maxAgeHours": 96,
     "minTxns24h": 40
   },
@@ -27,8 +33,20 @@
     "buySignalScore": 80,
     "watchScore": 55,
     "minUniqueHolders": 150,
-    "lowHolderScoreCap": 45
+    "lowHolderScoreCap": 45,
+    "minAbsoluteLiquidityUsd": 100000
   },
+  "_minAbsoluteLiquidityNote": [
+    "Absolute-depth alternative to minLiqToMcapPct, applied ONLY to the",
+    "ESTABLISHED INSIDER GEM tier. Added 2026-08-08 because the 15% ratio floor",
+    "rejected that entire band: real $1M-$10M tokens sit at 5-12%, so a $3.4M",
+    "token with a $410k pool scored 0 and the tier could never have fired.",
+    "",
+    "It IS a loosening, and worth knowing: a $100k pool absorbs a retail exit at",
+    "single-digit slippage, but it does not make a $10M token as exitable as 15%",
+    "would. Size the exit to the pool, not to the market cap. Every other token,",
+    "the early insider tier included, still faces the full ratio floor."
+  ],
   "social": {
     "bonusBothSocials": 10,
     "bonusOneSocial": 5
@@ -48,15 +66,85 @@
   ],
   "signalCategories": {
     "_precedence": [
-      "GEM is evaluated FIRST, so the two bands legitimately overlap:",
-      "a $300k-$1M token that is >=12h old with >=$50k liquidity becomes a GEM,",
-      "while a younger or thinner one in the same band becomes a SCALP.",
-      "The band is captured either way; maturity decides the holding style.",
+      "Four tiers, evaluated in this order — the first match wins:",
+      "  1. insiderEstablished  insider + $1M-$10M+ + >=$100k liq + >=1000 holders",
+      "  2. insiderEarly        insider + $30k-$500k",
+      "  3. gem                 mature and deep, no insider requirement",
+      "  4. scalp               young and mid-cap",
+      "",
+      "The insider tiers are tested FIRST and legitimately overlap the plain",
+      "ones: a mature $400k token with cluster activity becomes an EARLY-STAGE",
+      "INSIDER SCALP rather than a GEM. The insider entry is the more",
+      "decision-relevant fact, and the tighter stop is the safer of the two",
+      "pieces of advice to give about the same token.",
+      "",
+      "Between the plain tiers, GEM still wins the overlap: a $300k-$1M token",
+      "that is >=12h old with >=$50k liquidity becomes a GEM, while a younger or",
+      "thinner one in the same band becomes a SCALP.",
       "",
       "'category' is the stable machine value used by Dataview queries.",
       "'label' is the display string shown in alerts and notes — change that",
       "freely without breaking the dashboard."
     ],
+    "insiderTiers": {
+      "_note": [
+        "Requirements shared by BOTH insider tiers. Enforced in audit.mjs by",
+        "evaluateInsiderRequirements(), which is stricter than the contract",
+        "audit in one specific way: UNKNOWN COUNTS AS FAILURE. The contract",
+        "audit reports missing provider data as UNVERIFIED and leaves the token",
+        "watchable; an insider tier is a promotion — a louder header, and score",
+        "for the established tier — so it may not rest on data that was never",
+        "returned.",
+        "",
+        "Mint/freeze revoked and 'audit must be PASSED' are implicit in those",
+        "two rows and are not separately configurable: they are the definition",
+        "of a clean contract, not a tunable.",
+        "",
+        "scoreFloor is the same 68 as telegram.insiderMinScore, which is the",
+        "value the notifier actually applies. It is restated here because the",
+        "floor is part of the tier definition, not just a Telegram setting.",
+        "The score cannot be checked during classification — the tier's own",
+        "scoreBoost feeds into it — so the floor is applied at dispatch."
+      ],
+      "maxTop10Pct": 20,
+      "minLpLockedPct": 99,
+      "scoreFloor": 68
+    },
+    "insiderEstablished": {
+      "_note": [
+        "maxMarketCapUsd is null on purpose: the tier is specified as",
+        "'$1M-$10M+', so there is no ceiling. filters.maxMarketCapUsd is what",
+        "actually bounds it, since a token above that is never scanned at all."
+      ],
+      "minMarketCapUsd": 1000000,
+      "maxMarketCapUsd": null,
+      "minLiquidityUsd": 100000,
+      "minHolders": 1000,
+      "scoreBoost": 10,
+      "label": "💎 ESTABLISHED INSIDER GEM",
+      "advice": "💎 Established insider accumulation — high 90%+ survival rate & deep liquidity.",
+      "alertHeader": "💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎"
+    },
+    "insiderEarly": {
+      "_note": [
+        "scoreBoost is 0, matching the plain scalp tier. An early insider entry",
+        "already earns +15 to +50 from insiderScaleTiers; adding a band bonus on",
+        "top would let market-cap size alone push a thin token over the floor.",
+        "",
+        "OPEN MISMATCH: this tier's advice says '-15% stop-loss', but the",
+        "automated SELL SIGNAL still fires at sellSignals.stopLossPct = 20, and",
+        "that setting is global rather than per-tier. So the alert text asks for",
+        "a tighter stop than the notifier will actually send. Either enforce -15",
+        "by hand, or lower sellSignals.stopLossPct — which would tighten every",
+        "position, not just this tier."
+      ],
+      "minMarketCapUsd": 30000,
+      "maxMarketCapUsd": 500000,
+      "scoreBoost": 0,
+      "label": "⚡ EARLY-STAGE INSIDER SCALP",
+      "advice": "⚡ Early insider entry — massive upside potential. Enforce tight -15% stop-loss!",
+      "alertHeader": "🚀 EARLY INSIDER SCALP ALERT ($30k–$500k MC) 🚀"
+    },
     "gem": {
       "minMarketCapUsd": 300000,
       "minLiquidityUsd": 50000,
@@ -238,6 +326,18 @@
     "sendScanDigest": false,
     "requireLiveReaudit": false,
     "insiderOnly": true,
+    "insiderTiersOnly": true,
+    "_insiderTiersOnlyNote": [
+      "Restricts alerts to the two named tiers, so every notification carries",
+      "one of the two headers and a market-cap band you chose deliberately.",
+      "",
+      "KNOWN GAP, stated rather than hidden: the tiers do not cover $12k-$30k",
+      "or $500k-$1M. An insider-backed token in either of those windows now",
+      "scores and writes a note as before but sends NO Telegram alert, where",
+      "previously it would have. Set this to false to restore alerts on every",
+      "insider-detected token regardless of band, or widen insiderEarly's",
+      "maxMarketCapUsd to 1000000 to close the upper gap."
+    ],
     "insiderMinScore": 68,
     "_insiderMinScoreNote": [
       "Set to 68 on 2026-08-08 after measuring against the overnight run.",
