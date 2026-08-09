@@ -58,6 +58,48 @@ let skipped = 0;
 let alertsSent = 0;
 const durations = [];
 
+/**
+ * Per-tick heartbeat, for /status in the command bot.
+ *
+ * The bot is a SEPARATE PROCESS, so it cannot read `durations` above — an
+ * in-memory average is invisible to it. Writing the cadence to disk each tick is
+ * what makes "how fast is the scanner running" answerable at all, and the
+ * timestamp is what makes the answer trustworthy: a speed figure from a loop
+ * that died six hours ago reads as confirmation that everything is fine.
+ *
+ * Best-effort on purpose. A failed heartbeat write must never take down a scan
+ * loop that is otherwise working — the scan is the job, this is telemetry about
+ * it.
+ */
+async function writeHeartbeat(extra = {}) {
+  try {
+    const avg = durations.length
+      ? durations.reduce((a, b) => a + b, 0) / durations.length
+      : null;
+    await mkdir(join(HERE, '.state'), { recursive: true });
+    await writeFile(
+      join(HERE, '.state', 'scan_heartbeat.json'),
+      JSON.stringify(
+        {
+          lastTickAt: Date.now(),
+          lastDurationSec: durations.at(-1) ?? null,
+          rollingAvgSec: avg,
+          samples: durations.length,
+          tick,
+          skipped,
+          alertsSent,
+          ...extra,
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+  } catch {
+    /* telemetry only — never fail a scan over it */
+  }
+}
+
 async function onTick(bootConfig, limit, heavyEveryTicks) {
   // Re-read config every tick rather than using the startup snapshot.
   //
@@ -98,6 +140,8 @@ async function onTick(bootConfig, limit, heavyEveryTicks) {
 
     const sent = result?.alerts?.length ?? 0;
     alertsSent += sent;
+
+    await writeHeartbeat({ lastScanned: result?.scanned ?? 0, lastSellSignals: sellFired });
 
     // Silent by design: a tick that finds nothing prints one short line here
     // and sends nothing at all to Telegram.

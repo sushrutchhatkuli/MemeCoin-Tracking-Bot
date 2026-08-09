@@ -18,6 +18,7 @@ import {
   isAlertableCategory,
   evaluateSecurityShield,
   resolveInsiderBypass,
+  topInsiderScore,
   tractionFrom,
 } from './audit.mjs';
 import { formatSmartMoneyLine } from './smart_money.mjs';
@@ -852,12 +853,13 @@ export function buildDigest({ rows, scanned, noteCount, startedAt, tradeLink }) 
 const HELP_TEXT = [
   '<b>AEGIS COMMANDS</b>',
   '',
-  '<code>/audit &lt;contract&gt;</code> — full security + score report for one token',
+  '<code>/status</code> — scan speed, ledger size, blacklist, open trades, live floors',
+  '<code>/audit &lt;contract&gt;</code> — security, holder distribution and insider score for one token',
   '<code>/insiders &lt;contract&gt;</code> — cluster, funder network and bundle detail',
-  '<code>/status</code> — scanner state: positions, watchlist, ledger, floors',
+  '<code>/whales</code> — the elite watchlist, with win rates and their sample sizes',
   '<code>/help</code> — this message',
   '',
-  '<i>/audit and /insiders are read-only: they never write a note, open a position or send a buy alert.</i>',
+  '<i>Every command is read-only. None of them writes a note, opens a position or sends a buy alert — asking about a token must never be a way to accidentally enter one.</i>',
 ].join('\n');
 
 /** Split "/cmd@botname arg1 arg2" into a command and its arguments. */
@@ -873,7 +875,62 @@ export function parseCommand(text) {
 
 const MINT_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
-function statusReport({ config, positions, watchlist, observations, alertLog }) {
+/**
+ * Live scan cadence, read from the heartbeat loop.mjs writes each tick.
+ *
+ * A speed figure is only meaningful next to a liveness one: "42s per tick" from
+ * a scanner that stopped six hours ago is a worse answer than no answer, since
+ * it reads as confirmation that everything is running. So staleness is computed
+ * against the configured interval and stated first when the loop looks dead.
+ *
+ * The heartbeat is a separate file rather than a field on an existing one
+ * because the bot and the loop are different processes; the loop owns it and
+ * the bot only ever reads it.
+ */
+function scanSpeedLines(heartbeat, config) {
+  if (!heartbeat?.lastTickAt) {
+    return ['• Scan speed: <i>no heartbeat on file — the scan loop has not run yet</i>'];
+  }
+
+  const sinceSec = (Date.now() - heartbeat.lastTickAt) / 1000;
+  const interval = config?.realtime?.intervalSeconds ?? 30;
+  // Four missed intervals, floored at two minutes. A single slow tick is normal
+  // (a full pass measures 40-195s against a 30s target); four in a row is not.
+  const staleAfter = Math.max(120, interval * 4);
+  const live = sinceSec <= staleAfter;
+
+  const ago =
+    sinceSec < 90
+      ? `${Math.round(sinceSec)}s ago`
+      : sinceSec < 5400
+        ? `${Math.round(sinceSec / 60)}m ago`
+        : `${(sinceSec / 3600).toFixed(1)}h ago`;
+
+  const avg = heartbeat.rollingAvgSec;
+  const speed =
+    typeof avg === 'number'
+      ? `<b>${avg.toFixed(0)}s</b>/tick avg over ${heartbeat.samples ?? '?'} tick(s)` +
+        (typeof heartbeat.lastDurationSec === 'number'
+          ? `, last ${heartbeat.lastDurationSec.toFixed(0)}s`
+          : '')
+      : '<i>not yet measured</i>';
+
+  return [
+    `• Scanner: ${live ? `<b>LIVE</b> — last tick ${ago}` : `<b>STALE</b> — last tick ${ago}, expected every ~${interval}s`}`,
+    `• Scan speed: ${speed} (target ${interval}s)`,
+    ...(typeof heartbeat.tick === 'number'
+      ? [
+          `• Ticks this run: <b>${heartbeat.tick.toLocaleString('en-US')}</b>` +
+            (heartbeat.skipped ? ` · ${heartbeat.skipped} skipped while busy` : ''),
+        ]
+      : []),
+    ...(live
+      ? []
+      : ['<i>A stale heartbeat means loop.mjs is not running. Nothing below is being updated.</i>']),
+  ];
+}
+
+function statusReport({ config, positions, watchlist, observations, alertLog, heartbeat = null, blacklist = null }) {
   const open = Object.values(positions?.positions ?? {}).filter((p) => p.status === 'OPEN');
   const wallets = Object.keys(observations?.wallets ?? {}).length;
   const alertCount = Object.keys(alertLog ?? {}).length;
@@ -884,6 +941,8 @@ function statusReport({ config, positions, watchlist, observations, alertLog }) 
   const lines = [
     '<b>AEGIS STATUS</b>',
     '',
+    ...scanSpeedLines(heartbeat, config),
+    '',
     `• Open positions: <b>${open.length}</b>`,
   ];
   for (const p of open.slice(0, 5)) {
@@ -892,9 +951,14 @@ function statusReport({ config, positions, watchlist, observations, alertLog }) 
       `   ↳ $${esc(p.symbol)} — entry ${usdShort(p.entryMarketCap)}, peak ${usdShort(p.peakMarketCap)}, ${age}h, fired [${esc(p.firedTriggers.join(',') || 'none')}]`
     );
   }
+  if (open.length > 5) lines.push(`   ↳ <i>… and ${open.length - 5} more</i>`);
   lines.push(
     `• Elite watchlist: <b>${watchlist?.entries?.length ?? watchlist?.index?.size ?? 0}</b> wallet(s)`,
     `• Observation ledger: <b>${wallets.toLocaleString('en-US')}</b> wallet(s)`,
+    // Deployers and mints are counted separately because they are different
+    // kinds of address — see blacklist.mjs on why merging them is worse than
+    // having no blacklist at all.
+    `• Blacklisted: <b>${(blacklist?.wallets?.size ?? 0).toLocaleString('en-US')}</b> deployer(s), <b>${blacklist?.mints?.size ?? 0}</b> mint(s)`,
     `• Alerts on record: <b>${alertCount}</b>`,
     '',
     '<b>Active floors</b>',
@@ -910,6 +974,102 @@ function statusReport({ config, positions, watchlist, observations, alertLog }) 
       lines.push(`• $${esc(r.symbol)} — ${r.score}/100, ${((Date.now() - r.sentAt) / 3600000).toFixed(1)}h ago`);
     }
   }
+  return lines.join('\n');
+}
+
+/**
+ * The elite watchlist, as it stands right now.
+ *
+ * ── WHY EVERY NUMBER HERE CARRIES A SAMPLE SIZE ─────────────────────────────
+ * A win rate without its denominator is the single most misleading figure this
+ * bot could print. smart_wallets.json is written by auto_top_whales.mjs at
+ * minGradedBuys=3 against a 75% bar, which means the top of the list is
+ * mathematically forced to read "100% WR" — a wallet with exactly 3 graded buys
+ * must be 3/3, because 2/3 is 66.7% and fails the rule. Ten wallets all showing
+ * 100% is a property of the threshold, not evidence that ten wallets are
+ * flawless. So the graded-buy count is printed beside every rate, never behind
+ * a tap, and the caveat below is not optional.
+ *
+ * The rates are also AEGIS-OBSERVED — the tokens this scanner happened to scan,
+ * graded by its own post-mortem — not the wallets' market-wide records, and the
+ * sample skews optimistic because buyer replay only reads tokens with a live
+ * pool. Realized P&L is not derivable from observation at all. GMGN and Birdeye
+ * sell the real figures and are gated (403/401), so each row links out rather
+ * than inventing them.
+ */
+function whalesReport(whales) {
+  const entries = (whales?.wallets ?? []).filter(
+    (w) => w?.address && w.enabled !== false && !String(w.address).startsWith('EXAMPLE_')
+  );
+
+  if (!entries.length) {
+    return [
+      '<b>TOP ELITE WHALES</b>',
+      '',
+      '<i>The watchlist is empty. auto_top_whales.mjs writes it from Aegis’s own graded observations once wallets clear the configured win-rate and sample-size rules, or you can seed it with</i> <code>node auto_top_whales.mjs --import &lt;leaderboard.csv&gt;</code><i>.</i>',
+    ].join('\n');
+  }
+
+  const gen = whales.generated ?? {};
+  const built = gen.at ? (Date.now() - Date.parse(gen.at)) / 3600000 : null;
+
+  const lines = [
+    '<b>TOP ELITE WHALES</b>',
+    `<i>${entries.length} wallet(s)` +
+      (built !== null && Number.isFinite(built) ? ` · list rebuilt ${built < 1 ? `${Math.round(built * 60)}m` : `${built.toFixed(1)}h`} ago` : '') +
+      (gen.source ? ` · ${esc(gen.source)}` : '') +
+      '</i>',
+    '',
+  ];
+
+  const CAVEAT =
+    '<i>READ THE SAMPLE SIZE. These rates are computed over Aegis-observed buys only — not the wallets’ market-wide records — and the list is selected at a 75% bar over as few as 3 graded buys, which forces the top entries to read 100%. That is the threshold, not proof of edge. Estimated P&amp;L assumes the wallet still holds; Aegis never observes exits. Tap GMGN or Birdeye for real lifetime figures.</i>';
+
+  // Rows are fitted to a CHARACTER BUDGET rather than a fixed count, and the
+  // caveat's cost is reserved before the first row is added.
+  //
+  // A fixed cap is the obvious implementation and it is wrong here: each row
+  // carries three full 44-character addresses inside three URLs, so twelve rows
+  // is already ~4.3k and lands in the generic truncation guard — which cuts
+  // mid-anchor, leaving a dangling <a href= and stripping the sample-size
+  // caveat, the one part of this report that must never be the thing that gets
+  // dropped. Budgeting means the cap moves with the content instead of being a
+  // number that happened to fit when it was written.
+  const overheadLine = '\n<i>… and 999 more in smart_wallets.json</i>';
+  let budget = TELEGRAM_MAX_CHARS - lines.join('\n').length - CAVEAT.length - overheadLine.length - 8;
+
+  let shown = 0;
+  for (const w of entries) {
+    const short = `${w.address.slice(0, 6)}…${w.address.slice(-4)}`;
+    const graded = w.graded_buys ?? w.trades ?? null;
+    const bits = [
+      w.win_rate ? `<b>${esc(String(w.win_rate))}</b> win rate` : null,
+      graded !== null ? `${esc(String(graded))} graded buy(s)` : null,
+      w.net_profit_usd ? `${esc(String(w.net_profit_usd))} P&amp;L` : null,
+      w.onchain_signatures ? `${esc(String(w.onchain_signatures))} sigs` : null,
+    ].filter(Boolean);
+
+    const row = [
+      `${shown + 1}. <code>${esc(short)}</code> — ${bits.join(' · ') || '<i>no stats on file</i>'}`,
+      `    <a href="https://solscan.io/account/${esc(w.address)}">Solscan</a> · ` +
+        `<a href="https://gmgn.ai/sol/address/${esc(w.address)}">GMGN</a> · ` +
+        `<a href="https://birdeye.so/profile/${esc(w.address)}">Birdeye</a>`,
+    ];
+
+    const cost = row.join('\n').length + 1;
+    // Always render at least one wallet: a report that lists nobody because the
+    // first row was slightly over budget is worse than a slightly long message.
+    if (cost > budget && shown > 0) break;
+    budget -= cost;
+    lines.push(...row);
+    shown++;
+  }
+
+  if (entries.length > shown) {
+    lines.push('', `<i>… and ${entries.length - shown} more in smart_wallets.json</i>`);
+  }
+  lines.push('', CAVEAT);
+
   return lines.join('\n');
 }
 
@@ -948,8 +1108,28 @@ function auditReport({ pair, result }) {
     for (const u of audit.unknowns.slice(0, 3)) lines.push(`• ${esc(u)}`);
   }
 
+  // Insider score, asked for by name. The top matched wallet's alpha points, or
+  // an explicit "unscored" — a wallet Aegis has no ledger history for is not a
+  // zero, and printing 0 would read as a judgement rather than as no data.
+  if (clusters?.detected) {
+    const top = topInsiderScore({ clusters, smartMoney: result.smartMoney });
+    const floor = result.insiderBypassFloor ?? null;
+    lines.push(
+      '',
+      '<b>INSIDERS</b>',
+      `• ${esc(clusters.label ?? 'activity detected')} — ${clusters.insiderCount ?? 0} distinct wallet(s)`,
+      top
+        ? `• Top insider score: <b>${esc(String(top.score))}</b>` +
+          (top.wallet ? ` (<code>${esc(`${top.wallet.slice(0, 6)}…${top.wallet.slice(-4)}`)}</code>)` : '') +
+          (floor !== null ? ` · bypass floor ${esc(String(floor))}` : '')
+        : '• Top insider score: <i>none of the matched wallets carries a score</i>',
+      ...(verdictInfo.insiderBypass?.applied
+        ? [`• 🔴 <b>Shield bypassed</b> — waived: ${esc(verdictInfo.insiderBypass.gates.join(', '))}`]
+        : []),
+    );
+  }
+
   const flags = [
-    clusters?.detected ? `insiders: ${clusters.label ?? 'detected'} (${clusters.insiderCount ?? 0})` : null,
     cto?.detected ? 'community takeover' : null,
     megaRunner?.detected ? 'mega-runner volume' : null,
   ].filter(Boolean);
@@ -1010,9 +1190,21 @@ export async function handleCommand({ command, args, deps = {} }) {
     case 'start':
       return HELP_TEXT;
 
+    // Each handler checks its own loader is present. runCommandBot does catch a
+    // throw, but "Command failed: loaders.loadStatus is not a function" is a
+    // stack trace wearing a reply's clothes — it tells you nothing about which
+    // part of the bot was started wrong.
     case 'status': {
-      const state = await loaders.loadStatus();
-      return statusReport(state);
+      if (!loaders.loadStatus) return 'The status loader is not wired up on this bot.';
+      return statusReport(await loaders.loadStatus());
+    }
+
+    // Deliberately NOT served from loadStatus: that loader reads the 16 MB
+    // observation ledger, and answering "who is on the watchlist" should not
+    // cost a full state load.
+    case 'whales': {
+      if (!loaders.loadWhales) return 'The watchlist loader is not wired up on this bot.';
+      return whalesReport(await loaders.loadWhales());
     }
 
     case 'audit':
@@ -1020,6 +1212,7 @@ export async function handleCommand({ command, args, deps = {} }) {
       const address = args[0];
       if (!address) return `Usage: <code>/${command} &lt;contract address&gt;</code>`;
       if (!MINT_RE.test(address)) return 'That does not look like a Solana contract address.';
+      if (!loaders.auditOnce) return 'The audit pipeline is not wired up on this bot.';
       const res = await loaders.auditOnce(address);
       if (!res.ok) return `${esc(res.error)}`;
       return command === 'audit' ? auditReport(res) : insiderReport(res);
@@ -1326,37 +1519,27 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
 
 /* ------------------------------------------------------------------ *
  * CLI — node telegram.mjs --bot
- * ------------------------------------------------------------------ */
-
+ * ------------------------------------------------------------------ *
+ *
+ * Kept as an alias so the documented command still works, but the wiring now
+ * lives in bot.mjs and there is exactly one copy of it. Two copies of the
+ * loader set is how /whales ends up reading a different file from /status, and
+ * two copies of the startup path is how one of them quietly loses the
+ * authorisation check.
+ *
+ * Imported dynamically because bot.mjs imports THIS module; at CLI time the
+ * cycle is already resolved, which is the same reason auditOnce is deferred.
+ */
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   if (!process.argv.includes('--bot')) {
-    console.log('Usage: node telegram.mjs --bot    (starts the interactive command bot)');
+    console.log('Usage: node bot.mjs                 (starts the interactive command assistant)');
+    console.log('       node bot.mjs --once /status  (run one command locally and exit)');
     process.exit(0);
   }
 
   const HERE = dirname(fileURLToPath(import.meta.url));
   const credentials = await loadEnv(join(HERE, '.env'));
-
-  // Imported lazily: scan.mjs pulls in the whole pipeline, and telegram.mjs is
-  // itself imported BY scan.mjs — loading it at module scope would be circular.
-  const { auditOnce } = await import('./scan.mjs');
-  const { loadPositions } = await import('./sell_notifier.mjs');
-  const { loadWatchlist } = await import('./smart_money.mjs');
-  const { loadObservations } = await import('./wallet_observations.mjs');
-
-  const deps = {
-    auditOnce,
-    loadStatus: async () => {
-      const config = JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'));
-      const [positions, watchlist, observations, alertLog] = await Promise.all([
-        loadPositions(),
-        loadWatchlist(join(HERE, config.smartMoney.watchlistFile)),
-        loadObservations(join(HERE, '.state', 'wallet_observations.json')),
-        loadAlertLog(join(HERE, '.state', 'alerts.json')),
-      ]);
-      return { config, positions, watchlist, observations, alertLog };
-    },
-  };
+  const { buildDeps } = await import('./bot.mjs');
 
   const controller = new AbortController();
   const shutdown = () => {
@@ -1367,5 +1550,5 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  await runCommandBot({ credentials, deps, signal: controller.signal });
+  await runCommandBot({ credentials, deps: buildDeps(), signal: controller.signal });
 }

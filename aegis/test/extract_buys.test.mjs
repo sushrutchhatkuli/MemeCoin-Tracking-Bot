@@ -38,6 +38,7 @@ import {
   SIGNAL_CATEGORY,
 } from '../audit.mjs';
 import { alertHeaderLines, buildMessage, maybeAlert, parseCommand, handleCommand } from '../telegram.mjs';
+import { buildDeps, toPlainText } from '../bot.mjs';
 import { stopLossPctFor, armedTrailingLock, evaluateTriggers, detectLiquidityDrain, TRIGGER } from '../sell_notifier.mjs';
 import { walletScorecard } from '../wallet_observations.mjs';
 import { detectJitoBundles } from '../insider_cluster.mjs';
@@ -2258,6 +2259,274 @@ test('/status reports positions and the live floors', async () => {
   assert.match(out, /TOAD/);
   assert.match(out, /Alert score floor: 68/);
   assert.match(out, /Early-scalp cluster: ≥2/);
+});
+
+/* ------------------------------------------------------------------ *
+ * /status live scan speed, ledger, blacklist
+ * ------------------------------------------------------------------ */
+
+const statusDeps = (over = {}) => ({
+  loadStatus: async () => ({
+    config: {
+      realtime: { intervalSeconds: 30 },
+      telegram: { insiderMinScore: 68 },
+      thresholds: { maxTop10Pct: 20, minLiqToMcapPct: 15, minUniqueHolders: 150,
+        dynamicConcentration: { maxTop10Pct: 30 } },
+      signalCategories: { insiderEarly: { minInsiderWallets: 2 } },
+    },
+    positions: { positions: {} },
+    watchlist: { entries: [1, 2, 3] },
+    observations: { wallets: Object.fromEntries(Array.from({ length: 34_521 }, (_, i) => [`w${i}`, {}])) },
+    alertLog: {},
+    blacklist: { wallets: new Map([['a', {}], ['b', {}]]), mints: new Map([['m', {}]]) },
+    ...over,
+  }),
+});
+
+test('/status reports scan speed, the ledger size and the blacklist counts', async () => {
+  const out = await handleCommand({
+    command: 'status',
+    args: [],
+    deps: statusDeps({
+      heartbeat: { lastTickAt: Date.now() - 12_000, lastDurationSec: 47.2, rollingAvgSec: 51.8, samples: 20, tick: 883, skipped: 4 },
+    }),
+  });
+
+  assert.match(out, /Scanner: <b>LIVE<\/b> — last tick 12s ago/);
+  assert.match(out, /Scan speed: <b>52s<\/b>\/tick avg over 20 tick\(s\), last 47s \(target 30s\)/);
+  assert.match(out, /Ticks this run: <b>883<\/b> · 4 skipped while busy/);
+  assert.match(out, /Observation ledger: <b>34,521<\/b> wallet\(s\)/);
+  assert.match(out, /Blacklisted: <b>2<\/b> deployer\(s\), <b>1<\/b> mint\(s\)/);
+});
+
+test('a dead scan loop is reported as STALE, not as a speed figure', async () => {
+  // The failure this guards against is not a wrong number — it is a RIGHT
+  // number presented as if the scanner were running. "52s per tick" from a loop
+  // that died six hours ago reads as confirmation that everything is fine.
+  const out = await handleCommand({
+    command: 'status',
+    args: [],
+    deps: statusDeps({
+      heartbeat: { lastTickAt: Date.now() - 6 * 3600_000, lastDurationSec: 47, rollingAvgSec: 52, samples: 20, tick: 883 },
+    }),
+  });
+
+  assert.match(out, /Scanner: <b>STALE<\/b> — last tick 6\.0h ago/);
+  assert.match(out, /loop\.mjs is not running/);
+  assert.doesNotMatch(out, /LIVE/);
+});
+
+test('a missing heartbeat says so rather than implying a stopped scanner is live', async () => {
+  const out = await handleCommand({ command: 'status', args: [], deps: statusDeps({ heartbeat: null }) });
+  assert.match(out, /no heartbeat on file/);
+  assert.doesNotMatch(out, /LIVE/);
+  // Everything else still reports — one missing file must not blank the command.
+  assert.match(out, /Observation ledger: <b>34,521<\/b>/);
+  assert.match(out, /Alert score floor: 68/);
+});
+
+test('one slow tick is still LIVE; four missed intervals is not', async () => {
+  const at = (sec) => statusDeps({ heartbeat: { lastTickAt: Date.now() - sec * 1000, rollingAvgSec: 50, samples: 5, tick: 9 } });
+  // A full pass measures 40-195s against a 30s target, so a 110s gap is normal.
+  assert.match(await handleCommand({ command: 'status', args: [], deps: at(110) }), /LIVE/);
+  assert.match(await handleCommand({ command: 'status', args: [], deps: at(400) }), /STALE/);
+});
+
+/* ------------------------------------------------------------------ *
+ * /whales
+ * ------------------------------------------------------------------ */
+
+const whaleFile = {
+  generated: { at: new Date(Date.now() - 90 * 60_000).toISOString(), source: 'aegis-observed' },
+  wallets: [
+    { address: 'F5Hrs3fTxA6cPsdYa1r2zazymsetbFpXpzEuQWXPNusu', win_rate: '100%', graded_buys: 3, onchain_signatures: 531, enabled: true },
+    { address: 'EsXTkkmsS4K3ZhcoGfoP72y1j8ujMa3CNNgQRGziGrnh', win_rate: '75%', graded_buys: 4, enabled: true },
+    { address: 'EXAMPLE_REPLACE_ME', win_rate: '99%', graded_buys: 900 },
+    { address: '7ztfru1ejJW8hyRb166sggdQY2P6i6K4b1PJMydYyTfD', win_rate: '80%', graded_buys: 5, enabled: false },
+  ],
+};
+
+test('/whales lists the watchlist with win rates and their sample sizes', async () => {
+  const out = await handleCommand({
+    command: 'whales',
+    args: [],
+    deps: { loadWhales: async () => whaleFile },
+  });
+
+  assert.match(out, /TOP ELITE WHALES/);
+  assert.match(out, /2 wallet\(s\)/, 'the placeholder and the disabled entry are excluded');
+  assert.doesNotMatch(out, /EXAMPLE_REPLACE_ME/);
+  assert.doesNotMatch(out, /7ztfru/, 'enabled:false stays off the list');
+
+  assert.match(out, /F5Hrs3…Nusu/);
+  assert.match(out, /<b>100%<\/b> win rate · 3 graded buy\(s\)/);
+  assert.match(out, /<b>75%<\/b> win rate · 4 graded buy\(s\)/);
+  assert.match(out, /list rebuilt 1\.5h ago/);
+  assert.match(out, /solscan\.io\/account\/F5Hrs3/);
+  assert.match(out, /gmgn\.ai/);
+});
+
+test('/whales never prints a win rate without its denominator', async () => {
+  // A 100% rate over 3 graded buys is a property of the 75% selection bar, not
+  // evidence of edge, and the report says so every time.
+  const out = await handleCommand({
+    command: 'whales',
+    args: [],
+    deps: { loadWhales: async () => whaleFile },
+  });
+  assert.match(out, /READ THE SAMPLE SIZE/);
+  assert.match(out, /as few as 3 graded buys, which forces the top entries to read 100%/);
+  assert.match(out, /Aegis never observes exits/);
+});
+
+test('/whales answers usefully when the watchlist is empty or unwired', async () => {
+  const empty = await handleCommand({
+    command: 'whales',
+    args: [],
+    deps: { loadWhales: async () => ({ wallets: [] }) },
+  });
+  assert.match(empty, /watchlist is empty/);
+  assert.match(empty, /auto_top_whales\.mjs --import/, 'says how to fix it');
+
+  // A bot wired without the loader says so instead of throwing into the poller.
+  assert.match(await handleCommand({ command: 'whales', args: [], deps: {} }), /not wired up/);
+});
+
+test('/whales caps the list so a long watchlist cannot break the message', async () => {
+  const many = {
+    generated: {},
+    wallets: Array.from({ length: 50 }, (_, i) => ({
+      address: `${'W'.repeat(38)}${String(i).padStart(6, '0')}`,
+      win_rate: '90%',
+      graded_buys: 4,
+    })),
+  };
+  const out = await handleCommand({ command: 'whales', args: [], deps: { loadWhales: async () => many } });
+
+  assert.ok(out.length <= 4096, `message must fit Telegram's limit, got ${out.length}`);
+  assert.doesNotMatch(out, /… truncated/, 'the budget must fit rows, not fall back to truncation');
+
+  // Fitted at a ROW boundary: three complete anchors per wallet, none dangling.
+  const anchors = (out.match(/<a href="[^"]+">[^<]+<\/a>/g) ?? []).length;
+  const shown = (out.match(/^\d+\. <code>/gm) ?? []).length;
+  assert.ok(shown > 0, 'at least one wallet is always rendered');
+  assert.equal(anchors, shown * 3, 'every rendered row has all three of its links');
+  assert.equal((out.match(/<a href=/g) ?? []).length, anchors, 'no half-written anchor tag');
+
+  // The remainder line agrees with what was actually shown, rather than with a
+  // cap the renderer no longer uses.
+  assert.match(out, new RegExp(`… and ${50 - shown} more in smart_wallets\\.json`));
+
+  // The caveat is the one part that must survive any amount of trimming.
+  assert.match(out, /READ THE SAMPLE SIZE/);
+});
+
+test('/whales renders a wallet even when one row alone exceeds the budget', () => {
+  // Degenerate input: a single entry whose stats string is longer than the whole
+  // message allowance. Listing nobody would be a worse answer than a long one.
+  const huge = { generated: {}, wallets: [{ address: 'W'.repeat(44), win_rate: 'x'.repeat(5000), graded_buys: 1 }] };
+  return handleCommand({ command: 'whales', args: [], deps: { loadWhales: async () => huge } }).then((out) => {
+    assert.match(out, /^\d+\. <code>/m, 'the first wallet is rendered regardless');
+    assert.match(out, /READ THE SAMPLE SIZE/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * /audit insider score
+ * ------------------------------------------------------------------ */
+
+const auditDepsFor = (result) => ({
+  auditOnce: async () => ({
+    ok: true,
+    pair: { chainId: 'solana', baseToken: { symbol: 'TOAD', address: REAL_MINT } },
+    result: {
+      verdictInfo: { verdict: 'WATCH', score: 66 },
+      demand: { marketCap: 60_000, liquidityUsd: 25_000, liqToMcapPct: 41, ageHours: 1,
+        m5: { buys: 40, sells: 8 }, volume: { h1: 90_000 } },
+      security: { totalHolders: 420, top10Pct: 14.2 },
+      audit: { status: 'PASSED', failures: [], unknowns: [] },
+      signalCategory: { category: 'EARLY-STAGE INSIDER SCALP', label: 'EARLY-STAGE INSIDER SCALP' },
+      ...result,
+    },
+  }),
+});
+
+test('/audit reports the top insider score alongside the security verdict', async () => {
+  const out = await handleCommand({
+    command: 'audit',
+    args: [REAL_MINT],
+    deps: auditDepsFor({
+      clusters: {
+        detected: true, label: 'INSIDER CLUSTER', insiderCount: 2,
+        uniqueInsiders: [{ wallet: 'GkjJYRAryyz7HoxuR6V993n91eRoGpNc3XRTGG5UMwZH', insiderScore: 105 },
+                         { wallet: 'AnotherWalletBbbbbbbbbbbbbbbbbbbbbbbbbbbbb', insiderScore: 12 }],
+      },
+    }),
+  });
+
+  assert.match(out, /Holders 420 · Top10 14\.2%/, 'holder distribution is still reported');
+  assert.match(out, /INSIDER CLUSTER — 2 distinct wallet\(s\)/);
+  assert.match(out, /Top insider score: <b>105<\/b>/, 'the HIGHEST score, not the first');
+  assert.match(out, /GkjJYR…MwZH/);
+});
+
+test('/audit says "unscored" rather than 0 when no insider carries a score', async () => {
+  // 0 would read as a judgement about the wallet. It is the absence of data.
+  const out = await handleCommand({
+    command: 'audit',
+    args: [REAL_MINT],
+    deps: auditDepsFor({
+      clusters: { detected: true, label: 'NON-ROUTINE BUY SIZE', insiderCount: 1, uniqueInsiders: [{ wallet: 'W1' }] },
+    }),
+  });
+  assert.match(out, /none of the matched wallets carries a score/);
+  assert.doesNotMatch(out, /Top insider score: <b>0<\/b>/);
+});
+
+test('/audit surfaces a bypassed shield in the insider block', async () => {
+  const out = await handleCommand({
+    command: 'audit',
+    args: [REAL_MINT],
+    deps: auditDepsFor({
+      verdictInfo: {
+        verdict: 'WATCH', score: 71,
+        insiderBypass: { applied: true, score: 105, floor: 85, gates: ['Liquidity Pool'] },
+      },
+      clusters: { detected: true, label: 'INSIDER CLUSTER', insiderCount: 2,
+        uniqueInsiders: [{ wallet: 'GkjJYRAryyz7HoxuR6V993n91eRoGpNc3XRTGG5UMwZH', insiderScore: 105 }] },
+    }),
+  });
+  assert.match(out, /Shield bypassed<\/b> — waived: Liquidity Pool/);
+});
+
+/* ------------------------------------------------------------------ *
+ * bot.mjs entry point
+ * ------------------------------------------------------------------ */
+
+test('the bot wires every command the help text advertises', async () => {
+  const deps = buildDeps();
+  for (const loader of ['auditOnce', 'loadStatus', 'loadWhales']) {
+    assert.equal(typeof deps[loader], 'function', `missing loader: ${loader}`);
+  }
+
+  // Every /command in HELP_TEXT must actually dispatch. This is the check that
+  // catches a command being documented and never implemented.
+  const help = await handleCommand({ command: 'help', args: [], deps: {} });
+  const advertised = [...help.matchAll(/<code>\/([a-z]+)/g)].map((m) => m[1]);
+  assert.ok(advertised.length >= 5, `expected the full command list, got ${advertised.join(',')}`);
+  for (const cmd of advertised) {
+    const reply = await handleCommand({ command: cmd, args: [], deps: {} });
+    assert.doesNotMatch(reply, /^Unknown command/, `/${cmd} is advertised but not dispatched`);
+  }
+});
+
+test('terminal rendering strips markup without resurrecting escaped angle brackets', () => {
+  // &amp;lt; must survive as the literal text "&lt;". Decoding &amp; first would
+  // turn it into <, re-creating markup out of text that was escaped to stop it.
+  assert.equal(toPlainText('<b>hi</b>'), 'hi');
+  assert.equal(toPlainText('a &amp;lt;b&amp;gt; c'), 'a &lt;b&gt; c');
+  assert.equal(toPlainText('/audit &lt;contract&gt;'), '/audit <contract>');
+  assert.equal(toPlainText('P&amp;L'), 'P&L');
 });
 
 /* ------------------------------------------------------------------ *

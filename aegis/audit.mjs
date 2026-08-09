@@ -470,6 +470,34 @@ const insiderScoreOf = (m) => {
 };
 
 /**
+ * The highest-scoring matched insider, or null when none carries a score.
+ *
+ * Exported because /audit reports this number and the bypass gates on it, and
+ * two implementations of "which insider counts" would eventually disagree about
+ * which wallet the alert is naming.
+ */
+export function topInsiderScore({ clusters = null, smartMoney = null } = {}) {
+  const roster = [
+    ...(clusters?.uniqueInsiders ?? clusters?.watchlisted ?? []),
+    ...(smartMoney?.matches ?? []),
+  ];
+
+  let best = null;
+  for (const m of roster) {
+    const score = insiderScoreOf(m);
+    if (score === null) continue;
+    if (!best || score > best.score) {
+      best = {
+        score,
+        wallet: m.wallet ?? m.address ?? null,
+        label: m.label ?? m.displayLabel ?? null,
+      };
+    }
+  }
+  return best;
+}
+
+/**
  * Resolve whether this token's insiders unlock the safety bypass.
  *
  * Pure and side-effect free, so both the scorer and the notifier can call it
@@ -487,23 +515,7 @@ export function resolveInsiderBypass({ clusters = null, smartMoney = null, confi
 
   // The deduplicated roster, plus any smart-money holder matches. Both are
   // "matched insiders" for this purpose; neither counts without a score.
-  const roster = [
-    ...(clusters.uniqueInsiders ?? clusters.watchlisted ?? []),
-    ...(smartMoney?.matches ?? []),
-  ];
-
-  let best = null;
-  for (const m of roster) {
-    const score = insiderScoreOf(m);
-    if (score === null) continue;
-    if (!best || score > best.score) {
-      best = {
-        score,
-        wallet: m.wallet ?? m.address ?? null,
-        label: m.label ?? m.displayLabel ?? null,
-      };
-    }
-  }
+  const best = topInsiderScore({ clusters, smartMoney });
 
   if (!best) {
     return { ...base, reason: 'no matched insider carries a score — unscored does not clear the floor' };
