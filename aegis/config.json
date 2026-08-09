@@ -139,6 +139,7 @@
     "cacheMinutes": 60,
     "resolveLimit": 15,
     "resolveDelayMs": 6000,
+    "resolveDelayMsWithKey": 1000,
     "timeoutMs": 12000
   },
   "megaRunner": {

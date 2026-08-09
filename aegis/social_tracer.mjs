@@ -33,18 +33,72 @@
  * default, and the alert says which kind of match it was.
  */
 
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CG = 'https://api.coingecko.com/api/v3';
+export const SOCIAL_CACHE_PATH = join(HERE, '.state', 'social_cache.json');
 
 /* ------------------------------------------------------------------ *
  * Trending, with address resolution
  * ------------------------------------------------------------------ */
 
 const cache = { trending: null, fetchedAt: 0 };
+
+/**
+ * Disk-backed cache.
+ *
+ * The in-memory cache alone only ever helped loop.mjs, which is long-lived.
+ * Every `node scan.mjs` and `node index.mjs` run is a FRESH PROCESS and started
+ * cold, paying the full trending resolution — measured at ~90s, the majority of
+ * a 138s one-shot scan. Persisting it means the cost is paid once per TTL
+ * across every entry point rather than once per process.
+ *
+ * solanaMints is a Map, which JSON cannot represent, so it is stored as entries
+ * and rehydrated on load. A cache that silently deserialised to `{}` would look
+ * exactly like "nothing is trending" — which is a different and wrong claim.
+ */
+async function loadDiskCache(path = SOCIAL_CACHE_PATH) {
+  try {
+    const raw = JSON.parse(await readFile(path, 'utf8'));
+    if (!raw?.fetchedAt || !Array.isArray(raw.coins)) return null;
+    return {
+      ok: true,
+      coins: raw.coins,
+      solanaMints: new Map(raw.solanaMints ?? []),
+      resolved: raw.resolved ?? 0,
+      failed: raw.failed ?? 0,
+      fetchedAt: raw.fetchedAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function saveDiskCache(payload, path = SOCIAL_CACHE_PATH) {
+  try {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(
+      path,
+      JSON.stringify(
+        {
+          fetchedAt: payload.fetchedAt,
+          coins: payload.coins,
+          solanaMints: [...payload.solanaMints.entries()],
+          resolved: payload.resolved,
+          failed: payload.failed,
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+  } catch {
+    /* a cache that cannot be written is a slow scan, not a broken one */
+  }
+}
 
 /**
  * CoinGecko GET, with optional demo-key auth.
@@ -75,13 +129,47 @@ async function getJson(url, timeoutMs, apiKey = null) {
  * on failure rather than reporting "nothing is trending", which would be a
  * different and wrong claim.
  */
-export async function fetchTrending({ config = {}, now = Date.now(), force = false, apiKey = null } = {}) {
+/**
+ * COINGECKO_API_KEY, read directly rather than via telegram.mjs's loadEnv.
+ *
+ * Kept self-contained so the key is picked up however this module is reached —
+ * scan.mjs passes it explicitly, but the CLI, a test, or any future caller
+ * should not have to know to thread it through for the rate limit to lift.
+ * process.env wins, matching loadEnv's precedence.
+ */
+async function resolveApiKey(explicit) {
+  if (explicit) return explicit;
+  if (process.env.COINGECKO_API_KEY) return process.env.COINGECKO_API_KEY;
+  try {
+    const raw = await readFile(join(HERE, '.env'), 'utf8');
+    const m = raw.match(/^\s*COINGECKO_API_KEY\s*=\s*(.+)\s*$/m);
+    const v = m?.[1]?.trim().replace(/^["']|["']$/g, '');
+    return v || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchTrending({ config = {}, now = Date.now(), force = false, apiKey: rawKey = null } = {}) {
   const cfg = config.socialTracer ?? {};
+  const apiKey = await resolveApiKey(rawKey);
   const ttlMs = (cfg.cacheMinutes ?? 15) * 60_000;
   const timeoutMs = cfg.timeoutMs ?? 12000;
 
   if (!force && cache.trending && now - cache.fetchedAt < ttlMs) {
-    return { ...cache.trending, cached: true };
+    return { ...cache.trending, cached: true, cacheSource: 'memory' };
+  }
+
+  // Disk before network. This is the whole point of persisting: a one-shot
+  // `node scan.mjs` has an empty in-memory cache but the file on disk may be
+  // seconds old, and re-resolving 15 contracts to rediscover that costs ~90s.
+  if (!force) {
+    const disk = await loadDiskCache();
+    if (disk && now - disk.fetchedAt < ttlMs) {
+      cache.trending = disk;
+      cache.fetchedAt = disk.fetchedAt;
+      return { ...disk, cached: true, cacheSource: 'disk' };
+    }
   }
 
   let coins;
@@ -97,7 +185,14 @@ export async function fetchTrending({ config = {}, now = Date.now(), force = fal
   // bursts, and a 429 here would poison the whole trending set.
   const solanaMints = new Map();
   const resolveLimit = cfg.resolveLimit ?? 15;
-  const delayMs = cfg.resolveDelayMs ?? 2200;
+
+  // The 6s gap exists purely to survive the KEYLESS tier, where a 2.2s gap lost
+  // 10 of 15 lookups to 429s. A demo key raises the limit enough that the wait
+  // is no longer buying anything, so pacing follows whether a key is present:
+  // 15 lookups at 6s is ~90s, at 1s it is ~15s.
+  const delayMs = apiKey
+    ? (cfg.resolveDelayMsWithKey ?? 1000)
+    : (cfg.resolveDelayMs ?? 6000);
   let resolved = 0;
   let failed = 0;
 
@@ -133,6 +228,7 @@ export async function fetchTrending({ config = {}, now = Date.now(), force = fal
   const out = { ok: true, coins, solanaMints, resolved, failed, fetchedAt: now, cached: false };
   cache.trending = out;
   cache.fetchedAt = now;
+  await saveDiskCache(out);
   return out;
 }
 
