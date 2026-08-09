@@ -505,6 +505,7 @@ async function analyzeToken({
     clusters,
     megaRunner,
     socialHype,
+    config,
   });
 
   return {

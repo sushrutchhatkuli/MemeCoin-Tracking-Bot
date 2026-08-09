@@ -344,6 +344,38 @@ export const isInsiderCategory = (category) => INSIDER_CATEGORIES.has(category);
 /** True for any category cleared to send a Telegram alert. */
 export const isAlertableCategory = (category) => ALERTABLE_CATEGORIES.has(category);
 
+/** signalCategories key for a classified category, or null for the plain tiers. */
+const TIER_CONFIG_KEY = {
+  [SIGNAL_CATEGORY.INSIDER_EARLY]: 'insiderEarly',
+  [SIGNAL_CATEGORY.INSIDER_ESTABLISHED]: 'insiderEstablished',
+  [SIGNAL_CATEGORY.CTO]: 'communityTakeover',
+};
+
+/**
+ * The unique-holder floor that applies to a token, which is tier-aware.
+ *
+ * The global `thresholds.minUniqueHolders` (150) is the default and applies to
+ * everything unclassified. A tier may set its own `minHolders` to override it —
+ * the early insider band does, at 75, so fresh $30k-$75k launches can clear the
+ * gate while their holder base is still small.
+ *
+ * That override is a LOOSENING of a safety gate and should be read as one.
+ * Holder count is a separate axis from concentration: ten wallets can each hold
+ * a clean 8% and still leave a token exit-trapped because there is nobody to
+ * sell to. See the note beside insiderEarly.minHolders in config.json for the
+ * measured record of the band below it.
+ */
+export function resolveHolderFloor({ signalCategory, config = {}, thresholds = null }) {
+  const th = thresholds ?? config.thresholds ?? {};
+  const globalFloor = th.minUniqueHolders ?? 150;
+
+  const key = TIER_CONFIG_KEY[signalCategory?.category];
+  if (!key) return globalFloor;
+
+  const tierFloor = config.signalCategories?.[key]?.minHolders;
+  return typeof tierFloor === 'number' ? tierFloor : globalFloor;
+}
+
 /* ------------------------------------------------------------------ *
  * Mandatory anti-rugpull shield
  * ------------------------------------------------------------------ */
@@ -375,7 +407,7 @@ export const isAlertableCategory = (category) => ALERTABLE_CATEGORIES.has(catego
  * would only have meant the CTO tier could never fire on the exact pattern it
  * is named after.
  */
-export function evaluateSecurityShield({ security, demand, thresholds = {}, cto = null }) {
+export function evaluateSecurityShield({ security, demand, thresholds = {}, cto = null, holderFloorOverride = null }) {
   const rows = [];
   const add = (label, passed, detail) => rows.push({ label, passed: passed === true, detail });
 
@@ -389,7 +421,10 @@ export function evaluateSecurityShield({ security, demand, thresholds = {}, cto 
     tractionFrom(security, demand)
   );
   const lpFloor = thresholds.minLpLockedPct ?? 99;
-  const holderFloor = thresholds.minUniqueHolders ?? 150;
+  // Caller-supplied so the shield prints the SAME floor scoreToken enforced.
+  // A tier with its own minHolders relaxes the global one, and a hardcoded 150
+  // here would state a limit in the alert that was never applied.
+  const holderFloor = holderFloorOverride ?? thresholds.minUniqueHolders ?? 150;
   const depthFloorPct = thresholds.minLiqToMcapPct ?? 15;
   const absoluteFloor = thresholds.minAbsoluteLiquidityUsd ?? 100_000;
 
@@ -969,7 +1004,16 @@ function classifyInsiderTier({ demand, security, config, clusters, audit, holder
     holders:
       holders !== null && holders !== undefined && holders >= (est.minHolders ?? 1_000),
   };
-  const earlyChecks = { marketCap: inBand(early, 30_000, 500_000) };
+  // Holder count must be KNOWN and at or above the tier's own floor. Same
+  // asymmetry as the established tier: missing distribution data is not a
+  // holder base, and this tier's floor is what later relaxes the global gate,
+  // so it cannot rest on an unread number.
+  const earlyChecks = {
+    marketCap: inBand(early, 30_000, 500_000),
+    holders:
+      early.minHolders === undefined ||
+      (holders !== null && holders !== undefined && holders >= early.minHolders),
+  };
 
   const tier = Object.values(estChecks).every(Boolean)
     ? {
@@ -983,7 +1027,7 @@ function classifyInsiderTier({ demand, security, config, clusters, audit, holder
         alertHeader: est.alertHeader ?? '💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎',
         scoreBoost: est.scoreBoost ?? 10,
       }
-    : earlyChecks.marketCap
+    : Object.values(earlyChecks).every(Boolean)
       ? {
           cfg: early,
           category: SIGNAL_CATEGORY.INSIDER_EARLY,
@@ -1154,6 +1198,7 @@ export function scoreToken({
   clusters,
   megaRunner,
   socialHype,
+  config,
 }) {
   // Demand — 30 pts
   const demandScore =
@@ -1189,11 +1234,17 @@ export function scoreToken({
   // their own scam from a wallet on someone's alpha list; if smart money could
   // lift the score, that would be a way to walk a rug straight past the audit.
   const securityFailed = audit.status === 'FAILED';
+
+  // Tier-aware, defaulting to thresholds.minUniqueHolders. `config` is only
+  // supplied by scan.mjs; every other caller (and every existing test) passes
+  // thresholds alone and keeps the global floor unchanged.
+  const effectiveHolderFloor = resolveHolderFloor({ signalCategory, config, thresholds });
+
   const holderFloorFailed =
     security?.ok &&
     security.totalHolders !== null &&
     security.totalHolders !== undefined &&
-    security.totalHolders < (thresholds.minUniqueHolders ?? 150);
+    security.totalHolders < effectiveHolderFloor;
   const depthFloorPct = thresholds.minLiqToMcapPct ?? 15;
 
   // Absolute-depth alternative to the ratio floor, for the established insider
@@ -1295,7 +1346,7 @@ export function scoreToken({
   // Holder count is a separate axis from concentration: 10 wallets can hold a
   // clean 8% each and still leave the token trivially exit-trapped because
   // there is nobody to sell to. Both must pass.
-  const holderFloor = thresholds.minUniqueHolders ?? 150;
+  const holderFloor = effectiveHolderFloor;
   const uniqueHolders = security?.ok ? security.totalHolders : null;
   const holdersKnown = uniqueHolders !== null && uniqueHolders !== undefined;
   const lowHolders = holdersKnown && uniqueHolders < holderFloor;
@@ -1393,7 +1444,7 @@ export function scoreToken({
       : securityFailed
         ? audit.failures?.[0] ?? 'Contract audit failed'
         : holderFloorFailed
-          ? `Only ${security?.totalHolders} holders — below the ${thresholds.minUniqueHolders ?? 150} floor`
+          ? `Only ${security?.totalHolders} holders — below the ${effectiveHolderFloor} floor`
           : liquidityGateFailed
             ? `Liquidity is ${demand.liqToMcapPct.toFixed(1)}% of market cap — below the ${depthFloorPct}% slippage floor`
             : null,

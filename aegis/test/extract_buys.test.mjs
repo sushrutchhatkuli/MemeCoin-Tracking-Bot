@@ -31,6 +31,7 @@ import {
   tractionFrom,
   isInsiderCategory,
   isAlertableCategory,
+  resolveHolderFloor,
   SIGNAL_CATEGORY,
 } from '../audit.mjs';
 import { alertHeaderLines, parseCommand, handleCommand } from '../telegram.mjs';
@@ -892,6 +893,111 @@ test('the early insider tier gets the -15% stop its own alert text promises', ()
   assert.equal(stopLossPctFor({ category: 'COMMUNITY TAKEOVER GEM' }, cfg), 20);
   assert.equal(stopLossPctFor({}, cfg), 20, 'positions opened before this existed');
   assert.equal(stopLossPctFor({ category: 'X' }, {}), 20, 'default with no config');
+});
+
+/* ------------------------------------------------------------------ *
+ * Tier-aware holder floor
+ * ------------------------------------------------------------------ */
+
+const floorConfig = {
+  thresholds: { minUniqueHolders: 150 },
+  signalCategories: { insiderEarly: { minHolders: 75 }, insiderEstablished: { minHolders: 1000 } },
+};
+
+test('the early tier uses its own holder floor; everything else keeps 150', () => {
+  const at = (category) => resolveHolderFloor({ signalCategory: { category }, config: floorConfig });
+  assert.equal(at(SIGNAL_CATEGORY.INSIDER_EARLY), 75);
+  assert.equal(at(SIGNAL_CATEGORY.INSIDER_ESTABLISHED), 1000);
+  assert.equal(at(SIGNAL_CATEGORY.SCALP), 150, 'plain scalp is unchanged');
+  assert.equal(at(SIGNAL_CATEGORY.GEM), 150);
+  assert.equal(at(SIGNAL_CATEGORY.NONE), 150);
+  assert.equal(resolveHolderFloor({ signalCategory: null, config: floorConfig }), 150);
+});
+
+test('a tier without its own minHolders falls back to the global floor', () => {
+  const noOverride = { thresholds: { minUniqueHolders: 150 }, signalCategories: { insiderEarly: {} } };
+  assert.equal(
+    resolveHolderFloor({ signalCategory: { category: SIGNAL_CATEGORY.INSIDER_EARLY }, config: noOverride }),
+    150
+  );
+  // No config at all — callers that pass thresholds alone must be unaffected.
+  assert.equal(
+    resolveHolderFloor({ signalCategory: { category: SIGNAL_CATEGORY.INSIDER_EARLY }, thresholds: { minUniqueHolders: 150 } }),
+    150
+  );
+});
+
+test('an 80-holder early scalp now clears the gate that 150 blocked', () => {
+  const base = {
+    audit: PASSED,
+    security: { ok: true, totalHolders: 80, top10Pct: 10 },
+    demand: strongDemand,
+    velocity: null,
+    catalysts: { bullish: [], bearish: [] },
+    thresholds: { ...thresholds, minUniqueHolders: 150 },
+  };
+
+  const early = scoreToken({
+    ...base,
+    signalCategory: { category: SIGNAL_CATEGORY.INSIDER_EARLY },
+    config: floorConfig,
+  });
+  assert.equal(early.safetyGateFailed, false);
+  assert.notEqual(early.verdict, 'UNVERIFIED / LOW HOLDERS');
+  assert.equal(early.holderGate.floor, 75);
+
+  // The same 80-holder token in any other category is still blocked.
+  const scalp = scoreToken({
+    ...base,
+    signalCategory: { category: SIGNAL_CATEGORY.SCALP },
+    config: floorConfig,
+  });
+  assert.equal(scalp.verdict, 'UNVERIFIED / LOW HOLDERS');
+  assert.equal(scalp.score, 0);
+});
+
+test('below the tier floor the early scalp is still blocked', () => {
+  const r = scoreToken({
+    audit: PASSED,
+    security: { ok: true, totalHolders: 74, top10Pct: 10 },
+    demand: strongDemand,
+    velocity: null,
+    catalysts: { bullish: [], bearish: [] },
+    thresholds: { ...thresholds, minUniqueHolders: 150 },
+    signalCategory: { category: SIGNAL_CATEGORY.INSIDER_EARLY },
+    config: floorConfig,
+  });
+  assert.equal(r.verdict, 'UNVERIFIED / LOW HOLDERS');
+  assert.equal(r.score, 0);
+});
+
+test('the tier itself refuses an unknown holder count', () => {
+  // The tier floor is what relaxes the global gate, so it cannot rest on a
+  // number that was never read.
+  const cfg = {
+    ...insiderConfig,
+    signalCategories: {
+      ...insiderConfig.signalCategories,
+      insiderEarly: { ...insiderConfig.signalCategories.insiderEarly, minHolders: 75, minInsiderWallets: 1 },
+    },
+  };
+  const demand = { marketCap: 60_000, liquidityUsd: 25_000, ageHours: 0.4, ageIsLowerBound: false };
+  const clusters = clusterOf({ count: 2, clusterSize: 2 });
+
+  const known = classifySignal({
+    demand, security: cleanSecurity({ totalHolders: 80 }), config: cfg, clusters, audit: PASSED,
+  });
+  assert.equal(known.category, SIGNAL_CATEGORY.INSIDER_EARLY);
+
+  const unknown = classifySignal({
+    demand, security: cleanSecurity({ totalHolders: null }), config: cfg, clusters, audit: PASSED,
+  });
+  assert.notEqual(unknown.category, SIGNAL_CATEGORY.INSIDER_EARLY);
+
+  const tooFew = classifySignal({
+    demand, security: cleanSecurity({ totalHolders: 60 }), config: cfg, clusters, audit: PASSED,
+  });
+  assert.notEqual(tooFew.category, SIGNAL_CATEGORY.INSIDER_EARLY);
 });
 
 /* ------------------------------------------------------------------ *

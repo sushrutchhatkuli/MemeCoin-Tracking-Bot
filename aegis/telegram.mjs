@@ -614,7 +614,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     ...renderClusters(clusters),
     ...renderWhales(smartMoney),
     ...renderShield(
-      evaluateSecurityShield({ security, demand, thresholds: thresholds ?? {}, cto })
+      evaluateSecurityShield({ security, demand, thresholds: thresholds ?? {}, cto, holderFloorOverride: verdictInfo?.holderGate?.floor ?? null })
     ),
     '',
     '🔒 <b>SAFETY &amp; DENSITY AUDIT:</b>',
