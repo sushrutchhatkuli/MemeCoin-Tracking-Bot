@@ -193,6 +193,59 @@ function passesDepthFilter(demand, filters) {
   return null;
 }
 
+/* ------------------------------------------------------------------ *
+ * Audit cooldown shield
+ * ------------------------------------------------------------------ *
+ *
+ * Discovery surfaces ~130 candidates a tick and the scan audits 6-10 of them,
+ * sorted by 1h volume. That sort is stable across ticks, so without a cooldown
+ * the same handful of high-volume tokens is re-audited every ~50 seconds while
+ * the other ~120 are never looked at once. The cooldown rotates the window.
+ *
+ * ── WHAT THIS COSTS, stated plainly ─────────────────────────────────────────
+ * A token audited at 60/100 that turns into a 90 two minutes later will not be
+ * re-scored for up to 10 minutes, so its alert is delayed by that much. That is
+ * the trade: responsiveness on tokens already seen, in exchange for coverage of
+ * tokens never seen. It is worth taking here only because the never-seen pile
+ * is roughly twelve times larger than the seen one.
+ *
+ * Two things deliberately DO NOT go through this shield:
+ *   - an explicit --token / listener / bot audit, which must always run;
+ *   - open positions, which sell_notifier prices every tick independently of
+ *     the scan. A cooldown on the audit side cannot blind the sell side.
+ */
+
+const COOLDOWN_PATH = ['.state', 'audit_cooldown.json'];
+
+export function pruneCooldown(store, ttlMs, now = Date.now()) {
+  const fresh = {};
+  for (const [mint, ts] of Object.entries(store ?? {})) {
+    if (typeof ts === 'number' && now - ts < ttlMs) fresh[mint] = ts;
+  }
+  return fresh;
+}
+
+/** Case-insensitive: DexScreener and the RPC disagree on mint casing. */
+export const cooldownKey = (address) => String(address ?? '').toLowerCase();
+
+export function isOnCooldown(store, address, ttlMs, now = Date.now()) {
+  const ts = store?.[cooldownKey(address)];
+  return typeof ts === 'number' && now - ts < ttlMs;
+}
+
+async function loadCooldown(path, ttlMs, now) {
+  try {
+    return pruneCooldown(JSON.parse(await readFile(path, 'utf8')), ttlMs, now);
+  } catch {
+    return {};
+  }
+}
+
+async function saveCooldown(path, store) {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(store, null, 2), 'utf8');
+}
+
 async function analyzeToken({
   pair,
   config,
@@ -572,6 +625,13 @@ export async function runScan(args = {}) {
   if (credentials.rpcOverride) config.rpcUrl = credentials.rpcOverride;
   const now = new Date();
 
+  // Audit cooldown. Persisted rather than held in memory: index.mjs starts a
+  // fresh process per scheduled run, so an in-memory set would reset on every
+  // one of those and only ever work for loop.mjs.
+  const cooldownPath = join(HERE, ...COOLDOWN_PATH);
+  const cooldownMs = (config.auditCooldownMinutes ?? 10) * 60_000;
+  const seenAuditTokens = await loadCooldown(cooldownPath, cooldownMs, now.getTime());
+
   // Market-wide context, fetched ONCE per scan. Both are free-tier APIs with
   // real rate limits, and neither varies per token — pulling them inside the
   // audit loop would multiply the cost by the scan limit for identical data.
@@ -677,9 +737,24 @@ export async function runScan(args = {}) {
       pairs.push(...map.values());
     }
     pairs.sort((a, b) => (b.volume?.h1 ?? 0) - (a.volume?.h1 ?? 0));
+
+    // Cooldown BEFORE the cap, which is the whole point. Filtering after the
+    // slice would let recently-audited tokens occupy the audit budget and then
+    // be discarded, so a tick with 8 slots might do 2 real audits. Filtering
+    // first means all 8 slots go to tokens that have not been seen.
+    const beforeCooldown = pairs.length;
+    pairs = pairs.filter((p) => !isOnCooldown(seenAuditTokens, p.baseToken?.address, cooldownMs, now.getTime()));
+    const suppressed = beforeCooldown - pairs.length;
+
     const cap = args.limit ?? config.maxTokensPerScan;
     pairs = pairs.slice(0, cap);
-    console.log(`   ${pairs.length} tradeable pairs to audit.\n`);
+    console.log(
+      `   ${pairs.length} tradeable pairs to audit` +
+        (suppressed
+          ? ` (${suppressed} skipped — audited within the last ${(cooldownMs / 60000).toFixed(0)}m)`
+          : '') +
+        '.\n'
+    );
   }
 
   // --- Analyse ------------------------------------------------------
@@ -698,6 +773,15 @@ export async function runScan(args = {}) {
         continue;
       }
     }
+
+    // Recorded BEFORE the audit, not after. analyzeToken makes a dozen network
+    // calls and can throw; stamping only on success would put a token that
+    // failed halfway through back at the front of the next tick, to fail the
+    // same way again. The cooldown is about work spent, not work completed.
+    //
+    // An explicit --token deep dive is exempt: asking for a specific token must
+    // always audit it, and must not consume its cooldown slot either.
+    if (!args.token) seenAuditTokens[cooldownKey(pair.baseToken.address)] = now.getTime();
 
     const result = await analyzeToken({
       pair,
@@ -836,6 +920,9 @@ export async function runScan(args = {}) {
   await saveState(statePath, state);
   await saveDeployerCache(deployerCachePath, deployerCache);
   await saveAlertLog(alertLogPath, alertLog);
+  // Pruned on write as well as on read, so the file cannot grow without bound
+  // if the process is killed before its next load.
+  await saveCooldown(cooldownPath, pruneCooldown(seenAuditTokens, cooldownMs, now.getTime()));
   pruneObservations(observations, now.getTime());
   await saveObservations(observationsPath, observations);
   await savePositions(positions);

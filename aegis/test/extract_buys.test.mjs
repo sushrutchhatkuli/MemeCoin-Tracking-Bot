@@ -37,6 +37,7 @@ import { alertHeaderLines, parseCommand, handleCommand } from '../telegram.mjs';
 import { stopLossPctFor, armedTrailingLock, evaluateTriggers, TRIGGER } from '../sell_notifier.mjs';
 import { walletScorecard } from '../wallet_observations.mjs';
 import { detectJitoBundles } from '../insider_cluster.mjs';
+import { pruneCooldown, isOnCooldown, cooldownKey } from '../scan.mjs';
 import { capEnrichmentShortlist } from '../auto_top_whales.mjs';
 import { extractMints, channelMatches, SeenCache } from '../telegram_listener.mjs';
 
@@ -891,6 +892,75 @@ test('the early insider tier gets the -15% stop its own alert text promises', ()
   assert.equal(stopLossPctFor({ category: 'COMMUNITY TAKEOVER GEM' }, cfg), 20);
   assert.equal(stopLossPctFor({}, cfg), 20, 'positions opened before this existed');
   assert.equal(stopLossPctFor({ category: 'X' }, {}), 20, 'default with no config');
+});
+
+/* ------------------------------------------------------------------ *
+ * Audit cooldown shield
+ * ------------------------------------------------------------------ */
+
+const TEN_MIN = 10 * 60_000;
+const T0 = Date.UTC(2026, 7, 9, 12, 0, 0);
+
+test('a token is on cooldown for exactly the configured window', () => {
+  const store = { [REAL_MINT.toLowerCase()]: T0 };
+  assert.equal(isOnCooldown(store, REAL_MINT, TEN_MIN, T0), true, 'immediately after');
+  assert.equal(isOnCooldown(store, REAL_MINT, TEN_MIN, T0 + 9 * 60_000), true, '9 minutes later');
+  assert.equal(isOnCooldown(store, REAL_MINT, TEN_MIN, T0 + TEN_MIN), false, 'at the boundary');
+  assert.equal(isOnCooldown(store, REAL_MINT, TEN_MIN, T0 + 11 * 60_000), false, 'after');
+});
+
+test('cooldown lookups are case-insensitive', () => {
+  // DexScreener and the RPC disagree on mint casing; a case-sensitive key
+  // would silently never match and the shield would do nothing at all.
+  const store = { [REAL_MINT.toLowerCase()]: T0 };
+  assert.equal(isOnCooldown(store, REAL_MINT.toUpperCase(), TEN_MIN, T0), true);
+  assert.equal(cooldownKey('ABC'), 'abc');
+});
+
+test('an unseen token is never on cooldown', () => {
+  assert.equal(isOnCooldown({}, REAL_MINT, TEN_MIN, T0), false);
+  assert.equal(isOnCooldown(null, REAL_MINT, TEN_MIN, T0), false);
+  assert.equal(isOnCooldown({ [REAL_MINT.toLowerCase()]: 'not-a-number' }, REAL_MINT, TEN_MIN, T0), false);
+});
+
+test('pruning drops expired entries and keeps live ones', () => {
+  const store = {
+    fresh: T0 - 60_000,
+    borderline: T0 - TEN_MIN + 1,
+    stale: T0 - 11 * 60_000,
+    ancient: T0 - 86_400_000,
+    corrupt: null,
+  };
+  const pruned = pruneCooldown(store, TEN_MIN, T0);
+  assert.deepEqual(Object.keys(pruned).sort(), ['borderline', 'fresh']);
+});
+
+test('pruning survives a missing or malformed store', () => {
+  assert.deepEqual(pruneCooldown(undefined, TEN_MIN, T0), {});
+  assert.deepEqual(pruneCooldown({}, TEN_MIN, T0), {});
+});
+
+test('the shield rotates the audit window instead of shrinking it', () => {
+  // The property that matters: filtering happens BEFORE the cap, so a tick
+  // still fills all its slots — with different tokens. Filtering after the
+  // slice would have produced 1 audit instead of 3.
+  const candidates = ['aaa', 'bbb', 'ccc', 'ddd', 'eee', 'fff'].map((a) => ({
+    baseToken: { address: a },
+  }));
+  const cap = 3;
+  const store = {};
+
+  const tick = (now) => {
+    const fresh = candidates.filter((p) => !isOnCooldown(store, p.baseToken.address, TEN_MIN, now));
+    const chosen = fresh.slice(0, cap);
+    for (const p of chosen) store[cooldownKey(p.baseToken.address)] = now;
+    return chosen.map((p) => p.baseToken.address);
+  };
+
+  assert.deepEqual(tick(T0), ['aaa', 'bbb', 'ccc']);
+  assert.deepEqual(tick(T0 + 50_000), ['ddd', 'eee', 'fff'], 'second tick is 100% fresh');
+  assert.deepEqual(tick(T0 + 100_000), [], 'nothing left uncooled');
+  assert.deepEqual(tick(T0 + TEN_MIN + 1000), ['aaa', 'bbb', 'ccc'], 'window reopens');
 });
 
 /* ------------------------------------------------------------------ *
