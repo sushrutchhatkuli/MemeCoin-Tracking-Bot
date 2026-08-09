@@ -570,10 +570,10 @@
     "observe": true,
     "syncIntervalHours": 2,
     "minWinRatePct": 75,
-    "minNetProfitUsd": 5000,
+    "minNetProfitUsd": 2500,
     "minLifetimeTrades": 100,
-    "topN": 5,
-    "enrichShortlistCap": 50,
+    "topN": 50,
+    "enrichShortlistCap": 200,
     "_enrichShortlistCapNote": [
       "Hard ceiling on how many wallets get per-wallet RPC work (system-account",
       "screening, then lifetime-signature enrichment) during a sync.",
@@ -594,7 +594,7 @@
       "the SECOND screening pass, which runs over the ranked finalists and is",
       "bounded by topN rather than by this cap."
     ],
-    "profitRule": "filter",
+    "profitRule": "skip",
     "minGradedBuys": 3,
     "minRepresentativeness": 0.5,
     "_option2Note": [
@@ -748,7 +748,9 @@
       ],
       "enabled": true,
       "dropPct": 15,
-      "maxSampleAgeSeconds": 600
+      "maxSampleAgeSeconds": 600,
+      "pollSeconds": 10,
+      "pollerHeartbeatSeconds": 60
     },
     "enabled": true,
     "insiderExitPct": 40,

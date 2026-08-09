@@ -400,6 +400,24 @@ export async function checkOpenPositions({ config, dryRun = false, quiet = false
   const env = await loadEnv(join(HERE, '.env'));
   const rpcUrl = env.rpcOverride ?? config.rpcUrl;
   const now = Date.now();
+
+  // Read the poller's state file DIRECTLY rather than importing
+  // liquidity_watch.mjs — that module imports this one, and a cycle between
+  // them is not worth introducing for one JSON read.
+  //
+  // A live heartbeat means the 10s poller owns drain detection. Stale or
+  // absent, and this process does the check itself at loop cadence, so
+  // stopping the poller degrades resolution without ever losing coverage.
+  let pollerLive = false;
+  let pollerFired = {};
+  try {
+    const raw = JSON.parse(await readFile(join(HERE, '.state', 'liquidity_watch.json'), 'utf8'));
+    const maxAge = (cfg.liquidityDrain?.pollerHeartbeatSeconds ?? 60) * 1000;
+    pollerLive = typeof raw.heartbeatAt === 'number' && now - raw.heartbeatAt <= maxAge;
+    pollerFired = raw.fired ?? {};
+  } catch {
+    /* no poller running — this process keeps the check */
+  }
   const maxAgeMs = (cfg.maxMonitorHours ?? 48) * 3600 * 1000;
 
   // Batch the market data — one request covers up to 30 positions.
@@ -425,11 +443,29 @@ export async function checkOpenPositions({ config, dryRun = false, quiet = false
     // Evaluated FIRST and short-circuiting: a pool being emptied outranks every
     // other trigger, including a trailing lock that would otherwise report a
     // tidy profitable exit on a token you are about to be unable to sell.
+    //
+    // When the dedicated 10s poller is alive it owns this check, and running it
+    // here too would double-alert. This process stays the SINGLE WRITER of
+    // open_positions.json, so it still closes what the poller reported.
     const liquiditySol = pair?.liquidity?.quote ?? null;
     const drain =
-      typeof liquiditySol === 'number'
-        ? detectLiquidityDrain(p, liquiditySol, cfg, now)
-        : null;
+      pollerLive || typeof liquiditySol !== 'number'
+        ? null
+        : detectLiquidityDrain(p, liquiditySol, cfg, now);
+
+    if (pollerLive && pollerFired[key] && !p.firedTriggers.includes(TRIGGER.LIQUIDITY_DRAIN)) {
+      const f = pollerFired[key];
+      if (!dryRun) {
+        p.firedTriggers.push(TRIGGER.LIQUIDITY_DRAIN);
+        p.status = 'CLOSED';
+      }
+      if (!quiet) {
+        console.log(
+          `   🚨 $${p.symbol} closed by the liquidity watcher (-${f.dropPct?.toFixed(1)}% in ${f.elapsedSec?.toFixed(0)}s)`
+        );
+      }
+      continue;
+    }
 
     if (typeof liquiditySol === 'number') {
       p.lastLiquiditySol = liquiditySol;

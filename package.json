@@ -15,6 +15,7 @@
     "listen": "node aegis/telegram_listener.mjs",
     "listen:login": "node aegis/telegram_listener.mjs --login",
     "listen:channels": "node aegis/telegram_listener.mjs --channels",
+    "watch:liq": "node aegis/liquidity_watch.mjs",
     "bot": "node aegis/telegram.mjs --bot",
     "test": "node --test aegis/test/",
     "test:telegram": "node aegis/index.mjs --test-telegram"

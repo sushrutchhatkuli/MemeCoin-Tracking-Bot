@@ -39,6 +39,7 @@ import { stopLossPctFor, armedTrailingLock, evaluateTriggers, detectLiquidityDra
 import { walletScorecard } from '../wallet_observations.mjs';
 import { detectJitoBundles } from '../insider_cluster.mjs';
 import { recommendSize, formatSizeLine } from '../position_sizer.mjs';
+import { pollOnce, pollerIsLive, pruneWatchState } from '../liquidity_watch.mjs';
 import { pruneCooldown, isOnCooldown, cooldownKey } from '../scan.mjs';
 import { capEnrichmentShortlist } from '../auto_top_whales.mjs';
 import { extractMints, channelMatches, SeenCache } from '../telegram_listener.mjs';
@@ -1018,6 +1019,118 @@ test('a missing or malformed baseline never fires', () => {
     detectLiquidityDrain(pos(100, 45), 50, { liquidityDrain: { enabled: false } }, NOW2),
     null
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * Dedicated 10-second liquidity poller
+ * ------------------------------------------------------------------ */
+
+const pollCfg = {
+  sellSignals: {
+    liquidityDrain: { enabled: true, dropPct: 15, maxSampleAgeSeconds: 600, pollSeconds: 10 },
+  },
+};
+const openStore = (over = {}) => ({
+  positions: {
+    'solana:MintA': {
+      status: 'OPEN', chain: 'solana', address: 'MintA', symbol: 'TOAD',
+      entryMarketCap: 100_000, peakMarketCap: 100_000, alertedAt: NOW2,
+      firedTriggers: [], insiders: [], ...over,
+    },
+  },
+});
+/** Injected price feed: one pair with a settable SOL reserve. */
+const feed = (sol) => async () =>
+  new Map([['minta', { liquidity: { quote: sol }, marketCap: 90_000 }]]);
+
+test('the poller detects a drain across two 10-second samples', async () => {
+  let state = { heartbeatAt: 0, samples: {}, fired: {} };
+
+  // First poll only establishes a baseline — nothing to compare against yet.
+  const first = await pollOnce({
+    positions: openStore(), watchState: state, config: pollCfg,
+    now: NOW2, fetchPairs: feed(800),
+  });
+  assert.equal(first.drains.length, 0);
+  assert.equal(first.watchState.samples['solana:MintA'].sol, 800);
+  state = first.watchState;
+
+  // Ten seconds later the pool is down 30%.
+  const second = await pollOnce({
+    positions: openStore(), watchState: state, config: pollCfg,
+    now: NOW2 + 10_000, fetchPairs: feed(560),
+  });
+  assert.equal(second.drains.length, 1);
+  const d = second.drains[0];
+  assert.match(d.headline, /EMERGENCY EXIT/);
+  assert.equal(Number(d.dropPct.toFixed(1)), 30.0);
+  assert.equal(d.elapsedSec, 10, 'a real 10-second window, which the loop cannot sample');
+});
+
+test('the poller does not re-alert the same position', async () => {
+  let state = (await pollOnce({
+    positions: openStore(), watchState: { heartbeatAt: 0, samples: {}, fired: {} },
+    config: pollCfg, now: NOW2, fetchPairs: feed(800),
+  })).watchState;
+
+  const fired = await pollOnce({
+    positions: openStore(), watchState: state, config: pollCfg,
+    now: NOW2 + 10_000, fetchPairs: feed(560),
+  });
+  assert.equal(fired.drains.length, 1);
+
+  const again = await pollOnce({
+    positions: openStore(), watchState: fired.watchState, config: pollCfg,
+    now: NOW2 + 20_000, fetchPairs: feed(300),
+  });
+  assert.equal(again.drains.length, 0, 'already fired for this position');
+});
+
+test('a slow bleed under the threshold never fires', async () => {
+  let state = { heartbeatAt: 0, samples: {}, fired: {} };
+  let sol = 800;
+  for (let i = 0; i < 8; i++) {
+    sol *= 0.95; // -5% per poll: -34% overall, but never >15% between samples
+    const r = await pollOnce({
+      positions: openStore(), watchState: state, config: pollCfg,
+      now: NOW2 + (i + 1) * 10_000, fetchPairs: feed(sol),
+    });
+    assert.equal(r.drains.length, 0, `poll ${i + 1}`);
+    state = r.watchState;
+  }
+});
+
+test('the heartbeat is written on every poll, including empty ones', async () => {
+  // sell_notifier stands down on the heartbeat, so it must not depend on a
+  // detection having happened — or on any position being open.
+  const empty = await pollOnce({
+    positions: { positions: {} }, watchState: { heartbeatAt: 0, samples: {}, fired: {} },
+    config: pollCfg, now: NOW2, fetchPairs: feed(800),
+  });
+  assert.equal(empty.checked, 0);
+  assert.equal(empty.watchState.heartbeatAt, NOW2);
+});
+
+test('poller liveness drives the handoff both ways', () => {
+  const now = NOW2;
+  assert.equal(pollerIsLive({ heartbeatAt: now - 5_000 }, 60, now), true);
+  assert.equal(pollerIsLive({ heartbeatAt: now - 59_000 }, 60, now), true);
+  assert.equal(pollerIsLive({ heartbeatAt: now - 61_000 }, 60, now), false, 'stale -> loop resumes');
+  assert.equal(pollerIsLive({ heartbeatAt: 0 }, 60, now), false);
+  assert.equal(pollerIsLive({}, 60, now), false, 'never started -> loop keeps the check');
+  assert.equal(pollerIsLive(null, 60, now), false);
+});
+
+test('watch state is pruned to positions that are still open', () => {
+  const state = {
+    heartbeatAt: NOW2,
+    samples: { 'solana:A': { sol: 1, at: NOW2 }, 'solana:GONE': { sol: 2, at: NOW2 } },
+    fired: { 'solana:A': { at: NOW2 }, 'solana:GONE': { at: NOW2 } },
+  };
+  const pruned = pruneWatchState(state, ['solana:A']);
+  assert.deepEqual(Object.keys(pruned.samples), ['solana:A']);
+  assert.deepEqual(Object.keys(pruned.fired), ['solana:A']);
+  assert.equal(pruned.heartbeatAt, NOW2, 'heartbeat survives pruning');
 });
 
 /* ------------------------------------------------------------------ *
