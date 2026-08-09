@@ -793,41 +793,91 @@ export async function runScan(args = {}) {
   const alerts = [];
   const digestRows = [];
 
-  for (const pair of pairs) {
+  /**
+   * Bounded-concurrency map. Workers pull from a shared cursor, so a slow token
+   * cannot stall the others behind it the way a fixed chunk split would.
+   */
+  const mapConcurrent = async (items, limit, fn) => {
+    const out = new Array(items.length);
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < items.length) {
+        const i = cursor++;
+        out[i] = await fn(items[i], i);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+    return out;
+  };
+
+  // ---- PHASE 1: analyse concurrently ------------------------------
+  //
+  // Only the ANALYSIS runs in parallel. It is network-bound — security fetch,
+  // buyer replay, deployer audit, funder tracing — and that is where the ~27s
+  // per token goes.
+  //
+  // Side effects are deliberately NOT run here. Notes, alerts, positions, the
+  // digest and the console log all happen in phase 2, sequentially and in the
+  // original order, because parallelising them buys nothing and breaks things
+  // that matter: interleaved log lines, nondeterministic digest ordering, and
+  // check-then-act races across awaits in the alert cooldown and position
+  // opener. Concurrency belongs where the waiting is, not where the writing is.
+  const auditCandidates = args.token
+    ? pairs.map((pair) => ({ pair, reject: null }))
+    : pairs.map((pair) => ({ pair, reject: passesFilters(pair, config.filters) }));
+
+  for (const c of auditCandidates) {
+    if (c.reject) skipped.push(`${c.pair.baseToken?.symbol ?? '???'} — ${c.reject}`);
+    // Stamped here rather than inside the worker so the cooldown reflects what
+    // was SELECTED, identically to the serial version.
+    else if (!args.token) seenAuditTokens[cooldownKey(c.pair.baseToken.address)] = now.getTime();
+  }
+
+  const toAudit = auditCandidates.filter((c) => !c.reject).map((c) => c.pair);
+  const concurrency = Math.max(1, config.auditConcurrency ?? 4);
+
+  const analysed = await mapConcurrent(toAudit, concurrency, async (pair) => {
+    try {
+      const result = await analyzeToken({
+        pair,
+        config,
+        state,
+        watchlist,
+        deployerCache,
+        blacklist,
+        observations,
+        funderCache,
+        discoveredStore,
+        screenCache,
+        newsWindow,
+        trending,
+        now,
+      });
+      return { pair, result, error: null };
+    } catch (err) {
+      // One token failing must not take the pass down — the others already
+      // spent their RPC budget.
+      return { pair, result: null, error: err.message };
+    }
+  });
+
+  if (!realtime && toAudit.length) {
+    console.log(`   ⚡ audited ${toAudit.length} token(s) at concurrency ${concurrency}\n`);
+  }
+
+  // ---- PHASE 2: side effects, sequential and ordered ---------------
+  for (const entry of analysed) {
+    const { pair, result: preAnalysed, error: analysisError } = entry;
     const symbol = pair.baseToken?.symbol ?? '???';
 
-    if (!args.token) {
-      const reject = passesFilters(pair, config.filters);
-      if (reject) {
-        skipped.push(`${symbol} — ${reject}`);
-        continue;
-      }
+    if (analysisError) {
+      skipped.push(`${symbol} — audit failed: ${analysisError}`);
+      continue;
     }
 
-    // Recorded BEFORE the audit, not after. analyzeToken makes a dozen network
-    // calls and can throw; stamping only on success would put a token that
-    // failed halfway through back at the front of the next tick, to fail the
-    // same way again. The cooldown is about work spent, not work completed.
-    //
-    // An explicit --token deep dive is exempt: asking for a specific token must
-    // always audit it, and must not consume its cooldown slot either.
-    if (!args.token) seenAuditTokens[cooldownKey(pair.baseToken.address)] = now.getTime();
 
-    const result = await analyzeToken({
-      pair,
-      config,
-      state,
-      watchlist,
-      deployerCache,
-      blacklist,
-      observations,
-      funderCache,
-      discoveredStore,
-      screenCache,
-      newsWindow,
-      trending,
-      now,
-    });
+    // Analysis already ran in phase 1; this loop only applies side effects.
+    const result = preAnalysed;
     const { verdictInfo, audit, demand, deployer, smartMoney, social } = result;
 
     if (!args.token) {

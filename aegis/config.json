@@ -962,6 +962,23 @@
       { "minScore": 68, "maxScore": 74, "sol": 0.25, "label": "Light Scalp" }
     ]
   },
+  "auditConcurrency": 4,
+  "_auditConcurrencyNote": [
+    "How many tokens are ANALYSED at once. Only the analysis is parallel — it is",
+    "network-bound (security fetch, buyer replay, deployer audit, funder",
+    "tracing) and that is where the ~27s per token goes.",
+    "",
+    "Side effects stay SEQUENTIAL and in candidate order: notes, alerts,",
+    "positions, the digest and the console log. Parallelising those buys",
+    "nothing and breaks things that matter — interleaved log lines,",
+    "nondeterministic digest ordering, and check-then-act races across awaits",
+    "in the alert cooldown and the position opener.",
+    "",
+    "RAISING THIS MULTIPLIES RPC PRESSURE by the same factor. Helius already",
+    "429s under load in this pipeline (measured in the whale sync and the",
+    "CoinGecko resolver), so 4 is deliberately modest. If audits start failing",
+    "or buyer replays come back empty, lower it before anything else."
+  ],
   "auditCooldownMinutes": 10,
   "_auditCooldownNote": [
     "Audit cooldown shield. A mint audited within this window is skipped when",
