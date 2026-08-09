@@ -35,9 +35,10 @@ import {
   SIGNAL_CATEGORY,
 } from '../audit.mjs';
 import { alertHeaderLines, parseCommand, handleCommand } from '../telegram.mjs';
-import { stopLossPctFor, armedTrailingLock, evaluateTriggers, TRIGGER } from '../sell_notifier.mjs';
+import { stopLossPctFor, armedTrailingLock, evaluateTriggers, detectLiquidityDrain, TRIGGER } from '../sell_notifier.mjs';
 import { walletScorecard } from '../wallet_observations.mjs';
 import { detectJitoBundles } from '../insider_cluster.mjs';
+import { recommendSize, formatSizeLine } from '../position_sizer.mjs';
 import { pruneCooldown, isOnCooldown, cooldownKey } from '../scan.mjs';
 import { capEnrichmentShortlist } from '../auto_top_whales.mjs';
 import { extractMints, channelMatches, SeenCache } from '../telegram_listener.mjs';
@@ -893,6 +894,130 @@ test('the early insider tier gets the -15% stop its own alert text promises', ()
   assert.equal(stopLossPctFor({ category: 'COMMUNITY TAKEOVER GEM' }, cfg), 20);
   assert.equal(stopLossPctFor({}, cfg), 20, 'positions opened before this existed');
   assert.equal(stopLossPctFor({ category: 'X' }, {}), 20, 'default with no config');
+});
+
+/* ------------------------------------------------------------------ *
+ * Position sizer
+ * ------------------------------------------------------------------ */
+
+const sizerCfg = {};
+
+test('the conviction ladder maps score bands to sizes', () => {
+  const at = (score) => recommendSize({ score, config: sizerCfg })?.sol ?? null;
+  assert.equal(at(67), null, 'below the ladder there is no recommendation');
+  assert.equal(at(68), 0.25);
+  assert.equal(at(74), 0.25);
+  assert.equal(at(75), 0.75);
+  assert.equal(at(89), 0.75);
+  assert.equal(at(90), 2.0);
+  assert.equal(at(100), 2.0);
+});
+
+test('a sub-floor score returns null, never a token size', () => {
+  // "0.1 SOL" on a 40-score would turn an absence of conviction into a small
+  // amount of it, which is the wrong reading for someone acting quickly.
+  for (const s of [0, 40, 67, null, undefined, NaN]) {
+    assert.equal(recommendSize({ score: s, config: sizerCfg }), null, String(s));
+  }
+});
+
+test('cabal and bundle decorate the top rung without gating it', () => {
+  const clean = recommendSize({ score: 95, clusters: { insiderCount: 1 }, config: sizerCfg });
+  assert.equal(clean.sol, 2.0, 'a 95 on clean fundamentals still gets the top size');
+  assert.equal(clean.qualifier, null);
+
+  const swarm = recommendSize({ score: 95, clusters: { insiderCount: 5 }, config: sizerCfg });
+  assert.match(swarm.label, /Cabal Swarm/);
+
+  const jito = recommendSize({
+    score: 95, clusters: { insiderCount: 3, jito: { detected: true } }, config: sizerCfg,
+  });
+  assert.match(jito.label, /Jito Block #0/);
+
+  // The qualifier must not promote a lower rung.
+  const mid = recommendSize({ score: 80, clusters: { insiderCount: 6, jito: { detected: true } }, config: sizerCfg });
+  assert.equal(mid.sol, 0.75, 'a swarm at score 80 is still a standard entry');
+});
+
+test('pool share is computed and flags a thin pool', () => {
+  const deep = recommendSize({ score: 95, demand: { liquiditySol: 800 }, config: sizerCfg });
+  assert.equal(Number(deep.poolSharePct.toFixed(2)), 0.25);
+  assert.equal(deep.thinPool, false);
+
+  const thin = recommendSize({ score: 95, demand: { liquiditySol: 12 }, config: sizerCfg });
+  assert.equal(Number(thin.poolSharePct.toFixed(2)), 16.67);
+  assert.equal(thin.thinPool, true);
+  assert.equal(thin.sol, 2.0, 'the warning must not shrink the configured size');
+
+  const unknown = recommendSize({ score: 95, demand: {}, config: sizerCfg });
+  assert.equal(unknown.poolSharePct, null);
+  assert.equal(unknown.thinPool, false, 'unknown depth is not a thin pool');
+});
+
+test('the alert line matches the specified format', () => {
+  const line = formatSizeLine(recommendSize({ score: 82, config: sizerCfg }));
+  assert.equal(line, '⚖️ RECOMMENDED BUY SIZE: 0.75 SOL (Standard Entry)');
+  const withPool = formatSizeLine(recommendSize({ score: 82, demand: { liquiditySol: 800 }, config: sizerCfg }));
+  assert.match(withPool, /^⚖️ RECOMMENDED BUY SIZE: 0\.75 SOL \(Standard Entry\) — 0\.09% of the pool$/);
+  assert.equal(formatSizeLine(null), null);
+});
+
+test('the sizer can be disabled entirely', () => {
+  assert.equal(recommendSize({ score: 95, config: { positionSizer: { enabled: false } } }), null);
+});
+
+/* ------------------------------------------------------------------ *
+ * Liquidity drain early warning
+ * ------------------------------------------------------------------ */
+
+const drainCfg = { liquidityDrain: { enabled: true, dropPct: 15, maxSampleAgeSeconds: 600 } };
+const NOW2 = Date.UTC(2026, 7, 9, 14, 0, 0);
+const pos = (lastSol, agoSec) => ({
+  symbol: 'TOAD',
+  lastLiquiditySol: lastSol,
+  lastLiquidityAt: NOW2 - agoSec * 1000,
+  firedTriggers: [],
+});
+
+test('a >15% reserve drop fires the emergency exit', () => {
+  const d = detectLiquidityDrain(pos(100, 45), 80, drainCfg, NOW2);
+  assert.ok(d);
+  assert.match(d.headline, /EMERGENCY EXIT: LIQUIDITY DRAIN DETECTED/);
+  assert.equal(d.closes, true);
+  assert.equal(Number(d.dropPct.toFixed(1)), 20.0);
+});
+
+test('the alert states the REAL elapsed time, not a configured window', () => {
+  // The spec says "within 10 seconds", but this monitor samples on the scan
+  // loop (40-195s measured). Reporting 10s would fabricate precision in the
+  // exact number used to judge urgency.
+  const d = detectLiquidityDrain(pos(100, 87), 70, drainCfg, NOW2);
+  assert.match(d.reason, /in 87s/);
+  assert.doesNotMatch(d.reason, /in 10s/);
+  assert.match(d.reason, /100\.0 → 70\.0 SOL/);
+});
+
+test('a drop under the threshold does not fire', () => {
+  assert.equal(detectLiquidityDrain(pos(100, 45), 86, drainCfg, NOW2), null, '14% is below 15%');
+  assert.equal(detectLiquidityDrain(pos(100, 45), 120, drainCfg, NOW2), null, 'liquidity rising');
+});
+
+test('a stale baseline is discarded rather than read as a drain', () => {
+  // Comparing against a 20-minute-old sample says the token got quieter, not
+  // that someone pulled the pool.
+  assert.equal(detectLiquidityDrain(pos(100, 1200), 50, drainCfg, NOW2), null);
+  assert.ok(detectLiquidityDrain(pos(100, 599), 50, drainCfg, NOW2), 'inside the window it fires');
+});
+
+test('a missing or malformed baseline never fires', () => {
+  assert.equal(detectLiquidityDrain(pos(null, 45), 50, drainCfg, NOW2), null);
+  assert.equal(detectLiquidityDrain(pos(0, 45), 50, drainCfg, NOW2), null, 'zero baseline');
+  assert.equal(detectLiquidityDrain(pos(100, 45), null, drainCfg, NOW2), null, 'unknown current');
+  assert.equal(detectLiquidityDrain({}, 50, drainCfg, NOW2), null);
+  assert.equal(
+    detectLiquidityDrain(pos(100, 45), 50, { liquidityDrain: { enabled: false } }, NOW2),
+    null
+  );
 });
 
 /* ------------------------------------------------------------------ *

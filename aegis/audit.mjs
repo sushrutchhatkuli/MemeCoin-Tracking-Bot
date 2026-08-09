@@ -274,6 +274,10 @@ export function analyzeDemand(pair, security) {
     h24: window('h24'),
     marketCap,
     liquidityUsd,
+    // The SOL side of the pool. Used by the position sizer to express a
+    // recommended size as a share of the pool, and captured as the baseline
+    // the drain detector measures against.
+    liquiditySol: pct(pair?.liquidity?.quote) ?? null,
     liqToMcapPct: marketCap > 0 ? (liquidityUsd / marketCap) * 100 : 0,
     volume: {
       m5: pct(pair?.volume?.m5) ?? 0,

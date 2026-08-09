@@ -722,6 +722,34 @@
       "P&L. Aegis does not know your fill, your size, or whether you took the",
       "trade at all."
     ],
+    "liquidityDrain": {
+      "_note": [
+        "Emergency exit on a sharp fall in the pool's SOL reserve, read from",
+        "DexScreener's liquidity.quote — already fetched for pricing, so it",
+        "costs no extra call.",
+        "",
+        "ON THE 10-SECOND WINDOW IN THE SPEC: it is not achievable here. This",
+        "monitor runs on the scan loop, whose tick targets 30s but measures",
+        "40-195s in practice, so there is no sample inside a 10-second window.",
+        "What is implemented is '>dropPct between consecutive samples', and the",
+        "alert states the REAL elapsed time rather than a configured one. A",
+        "drain caught 90s apart is still worth knowing; calling it '10s' would",
+        "fabricate precision in exactly the number used to judge urgency.",
+        "",
+        "For genuine 10-second resolution the reserve must be polled on its own",
+        "timer, independent of the scan — a separate process, not a config",
+        "change. maxSampleAgeSeconds discards comparisons too stale to mean",
+        "anything: a 20-minute-old baseline says the token got quieter, not",
+        "that someone pulled the pool.",
+        "",
+        "Evaluated FIRST and short-circuiting: a pool being emptied outranks",
+        "every other trigger, including a trailing lock that would otherwise",
+        "report a tidy profitable exit on a token you cannot sell."
+      ],
+      "enabled": true,
+      "dropPct": 15,
+      "maxSampleAgeSeconds": 600
+    },
     "enabled": true,
     "insiderExitPct": 40,
     "takeProfitMultiple": 1.5,
@@ -826,6 +854,39 @@
     "intervalSeconds": 30,
     "scanLimit": 8,
     "maintenanceEveryTicks": 20
+  },
+  "positionSizer": {
+    "_note": [
+      "Conviction ladder mapping score to a recommended SOL size, rendered as a",
+      "bold line in every BUY alert.",
+      "",
+      "ON THE NAME: this is a fixed ladder, NOT the Kelly criterion. Kelly is",
+      "f* = (bp - q)/b and needs a win probability and a payoff ratio; neither",
+      "exists at the moment of alert. The nearest measured input is the",
+      "post-mortem base rate — currently ~77% rugged across 2,500+ graded",
+      "tokens — and fed to Kelly honestly that returns a NEGATIVE fraction,",
+      "i.e. 'do not size this'. The ladder is a deliberate human override of",
+      "that arithmetic, which is a legitimate choice, but it is not a derived",
+      "optimum and should not be described as one.",
+      "",
+      "WHAT THE LADDER DOES NOT KNOW: your bankroll, your open exposure, or",
+      "pool depth. 2 SOL into an 800 SOL pool is nothing; 2 SOL into a 12 SOL",
+      "pool is most of the float and moves the price against you on the way in",
+      "AND on the way out. The alert therefore prints the size as a percentage",
+      "of the pool, and warns above thinPoolWarnPct — it does NOT shrink the",
+      "size, because the number you configured is the number you get.",
+      "",
+      "The top rung is reached on score alone. Cabal Swarm and Jito Block #0",
+      "decorate its label rather than gating it, so a 95 earned on clean",
+      "fundamentals is not silently sized like a 75."
+    ],
+    "enabled": true,
+    "thinPoolWarnPct": 1,
+    "ladder": [
+      { "minScore": 90, "maxScore": 100, "sol": 2.0, "label": "HEAVY CONVICTION" },
+      { "minScore": 75, "maxScore": 89, "sol": 0.75, "label": "Standard Entry" },
+      { "minScore": 68, "maxScore": 74, "sol": 0.25, "label": "Light Scalp" }
+    ]
   },
   "auditCooldownMinutes": 10,
   "_auditCooldownNote": [

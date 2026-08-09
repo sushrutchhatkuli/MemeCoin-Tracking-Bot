@@ -19,6 +19,7 @@ import {
   tractionFrom,
 } from './audit.mjs';
 import { formatSmartMoneyLine } from './smart_money.mjs';
+import { recommendSize, formatSizeLine } from './position_sizer.mjs';
 
 /* ------------------------------------------------------------------ *
  * .env
@@ -574,7 +575,7 @@ function renderMegaRunner(megaRunner) {
   ];
 }
 
-export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader, news, social }) {
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader, news, social, sizerConfig }) {
   const symbol = pair.baseToken?.symbol ?? 'UNKNOWN';
   const address = pair.baseToken.address;
   const usd = (n) =>
@@ -598,6 +599,21 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
   const ratio =
     demand.m5.sells > 0 ? (demand.m5.buys / demand.m5.sells).toFixed(1) : '∞';
 
+  // Recommended size. Sits directly under the trade advice, because the two are
+  // read together — "take profit at +50%" is not actionable without a size.
+  const size = recommendSize({ score: verdictInfo.score, clusters, demand, config: sizerConfig ?? {} });
+  const sizeLines = size
+    ? [
+        '',
+        `<b>${esc(formatSizeLine(size))}</b>`,
+        ...(size.thinPool
+          ? [
+              `<i>⚠️ That is ${size.poolSharePct.toFixed(2)}% of the whole pool — expect slippage on entry AND on exit. The ladder keys on score only; it does not know pool depth, your bankroll or your open exposure.</i>`,
+            ]
+          : []),
+      ]
+    : [];
+
   return [
     ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social }),
     `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
@@ -608,6 +624,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
       ? ['', `<b>${esc(migration.label)}</b>`, `<i>${esc(migration.detail)}</i>`]
       : []),
     ...(signalCategory?.advice ? ['', `<b>${esc(signalCategory.advice)}</b>`] : []),
+    ...sizeLines,
     ...renderNewsAndSocial(news, social),
     ...renderMegaRunner(megaRunner),
     ...renderCto(cto),
@@ -1194,6 +1211,7 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     megaRunnerHeader: config.megaRunner?.alertHeader ?? null,
     news: result.news,
     social: result.social,
+    sizerConfig: config,
   });
 
   const sent = await sendTelegram({ ...credentials, text });

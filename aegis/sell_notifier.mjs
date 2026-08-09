@@ -51,7 +51,68 @@ export const TRIGGER = {
   TAKE_PROFIT: 'TAKE_PROFIT',
   STOP_LOSS: 'STOP_LOSS',
   TRAILING_LOCK: 'TRAILING_LOCK',
+  LIQUIDITY_DRAIN: 'LIQUIDITY_DRAIN',
 };
+
+/**
+ * Pool-drain detector: a sharp fall in the pool's SOL reserve.
+ *
+ * Reserve comes from DexScreener's `liquidity.quote`, which is the SOL side of
+ * the pair and is already fetched for pricing — so this costs no extra call.
+ *
+ * ── ON THE 10-SECOND WINDOW ─────────────────────────────────────────────────
+ * The specification asks for ">15% within 10 seconds". This monitor runs on the
+ * scan loop, whose tick is a 30s target but measures 40-195s in practice, so a
+ * 10-second window cannot be observed — there is no sample inside it.
+ *
+ * What is implemented is ">15% between consecutive samples", and the alert
+ * states the REAL elapsed time rather than the configured one. A drain caught
+ * 90 seconds apart is still worth knowing about, but calling it "in 10s" would
+ * be a fabricated precision, and the number an operator uses to judge urgency
+ * is exactly the one that would be wrong.
+ *
+ * To genuinely reach 10-second resolution the reserve has to be polled on its
+ * own timer, independent of the scan. `maxSampleAgeSeconds` bounds how stale a
+ * comparison may be before it is discarded as uninformative.
+ */
+export function detectLiquidityDrain(position, currentLiquiditySol, cfg, now = Date.now()) {
+  const drain = cfg.liquidityDrain ?? {};
+  if (drain.enabled === false) return null;
+
+  const prev = position?.lastLiquiditySol;
+  const prevAt = position?.lastLiquidityAt;
+  if (
+    typeof prev !== 'number' ||
+    typeof prevAt !== 'number' ||
+    typeof currentLiquiditySol !== 'number' ||
+    prev <= 0
+  ) {
+    return null;
+  }
+
+  const elapsedSec = (now - prevAt) / 1000;
+  const maxAge = drain.maxSampleAgeSeconds ?? 600;
+  // A comparison against a 20-minute-old sample says nothing about a sudden
+  // pull — it is just the token being quieter than it was.
+  if (elapsedSec <= 0 || elapsedSec > maxAge) return null;
+
+  const dropPct = ((prev - currentLiquiditySol) / prev) * 100;
+  if (dropPct < (drain.dropPct ?? 15)) return null;
+
+  return {
+    trigger: TRIGGER.LIQUIDITY_DRAIN,
+    headline: '🚨 EMERGENCY EXIT: LIQUIDITY DRAIN DETECTED',
+    reason:
+      `Pool SOL reserves fell ${dropPct.toFixed(1)}% in ${elapsedSec.toFixed(0)}s ` +
+      `(${prev.toFixed(1)} → ${currentLiquiditySol.toFixed(1)} SOL) — dev or whale pulling liquidity`,
+    action: 'EXIT IMMEDIATELY to preserve capital.',
+    closes: true,
+    dropPct,
+    elapsedSec,
+    fromSol: prev,
+    toSol: currentLiquiditySol,
+  };
+}
 
 /**
  * The trailing stop currently armed for a position, as a percentage ABOVE entry.
@@ -146,6 +207,11 @@ export function openPosition(store, { pair, demand, clusters, rpcBalances = {}, 
     // looked up later, so a position keeps the stop-loss it was OPENED with
     // even if the config is retuned underneath it mid-trade.
     category,
+    // Drain baseline, captured at alert time so the very first monitor tick has
+    // something to compare against. Without it the first tick is blind, and the
+    // first tick after a buy alert is exactly when a rug is most likely.
+    lastLiquiditySol: demand?.liquiditySol ?? null,
+    lastLiquidityAt: Date.now(),
     firedTriggers: [],
     status: 'OPEN',
   };
@@ -353,6 +419,31 @@ export async function checkOpenPositions({ config, dryRun = false, quiet = false
     const currentMcap = pair ? (pair.marketCap ?? pair.fdv ?? 0) : null;
     if (currentMcap !== null && currentMcap > (p.peakMarketCap ?? 0)) {
       p.peakMarketCap = currentMcap;
+    }
+
+    // ---- Liquidity drain -------------------------------------------
+    // Evaluated FIRST and short-circuiting: a pool being emptied outranks every
+    // other trigger, including a trailing lock that would otherwise report a
+    // tidy profitable exit on a token you are about to be unable to sell.
+    const liquiditySol = pair?.liquidity?.quote ?? null;
+    const drain =
+      typeof liquiditySol === 'number'
+        ? detectLiquidityDrain(p, liquiditySol, cfg, now)
+        : null;
+
+    if (typeof liquiditySol === 'number') {
+      p.lastLiquiditySol = liquiditySol;
+      p.lastLiquidityAt = now;
+    }
+
+    if (drain && !p.firedTriggers.includes(TRIGGER.LIQUIDITY_DRAIN)) {
+      results.push({ key, position: p, currentMcap, ...drain });
+      if (!dryRun) {
+        p.firedTriggers.push(TRIGGER.LIQUIDITY_DRAIN);
+        p.status = 'CLOSED';
+      }
+      firedCount++;
+      continue;
     }
 
     // Insider balances — only read when the trigger has not already fired,
