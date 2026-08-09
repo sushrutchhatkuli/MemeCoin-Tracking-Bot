@@ -2710,6 +2710,18 @@
       "reason": "Post-mortem: $PORF fell -100% within 1.07h (pair delisted)",
       "added": "2026-08-09",
       "source": "post-mortem"
+    },
+    {
+      "address": "4yMn5kLZcNLS1bBCuLWJG187Bt8NnpyCUhfmmKajGXQn",
+      "reason": "Post-mortem: $MINTY fell -98.2% within 2.48h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "4ts6oRLdXJ4Dcwv7PTmA48yNGhRXy9omW1x9UX7faDVe",
+      "reason": "Post-mortem: $FIW fell -100% within 1h (pair delisted)",
+      "added": "2026-08-09",
+      "source": "post-mortem"
     }
   ],
   "mints": [
