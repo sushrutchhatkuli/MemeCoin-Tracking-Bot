@@ -63,6 +63,7 @@ import { discoverNetwork, loadDiscovered, saveDiscovered, walletLinks } from './
 import { fetchBreakingNews, matchTokenToNews } from './news_sentinel.mjs';
 import { fetchTrending, scoreSocialHype } from './social_tracer.mjs';
 import { loadSurfaced, surfacedFreshness } from './discovery_daemon.mjs';
+import { maybeNotifyQuota, currentQuotaEvents } from './quota_sentinel.mjs';
 import {
   loadObservations,
   saveObservations,
@@ -1039,6 +1040,13 @@ export async function runScan(args = {}) {
     for (const s of skipped.slice(0, 12)) console.log(`   - ${s}`);
     if (skipped.length > 12) console.log(`   … and ${skipped.length - 12} more`);
   }
+
+  // Flushed once per pass, after the scan's own work. A throttled key degrades
+  // results silently, so this is the only thing that surfaces it.
+  try {
+    const q = await maybeNotifyQuota({ config });
+    if (q.sent.length) console.log(`⚠️  API quota alert sent for: ${q.sent.join(', ')}`);
+  } catch { /* telemetry must never fail a scan */ }
 
   return { written, alerts, skipped, scanned: digestRows.length, rows: digestRows };
 }

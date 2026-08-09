@@ -7,9 +7,21 @@
  *   - GoPlus Labs  : EVM contract security (taxes, honeypot sim, verified source)
  */
 
+import { recordQuotaEvent } from './quota_sentinel.mjs';
+
 const JSON_HEADERS = { accept: 'application/json' };
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Map a URL to the provider whose quota it consumes. */
+function providerFor(url) {
+  const u = String(url);
+  if (u.includes('helius')) return 'helius';
+  if (u.includes('coingecko')) return 'coingecko';
+  if (u.includes('rugcheck')) return 'rugcheck';
+  if (u.includes('dexscreener')) return 'dexscreener';
+  return 'unknown';
+}
 
 /** Fetch JSON with timeout, 429 back-off and bounded retries. Never throws. */
 async function getJson(url, { timeoutMs = 20000, retries = 2 } = {}) {
@@ -20,6 +32,8 @@ async function getJson(url, { timeoutMs = 20000, retries = 2 } = {}) {
       const res = await fetch(url, { headers: JSON_HEADERS, signal: ctrl.signal });
       clearTimeout(timer);
       if (res.status === 429) {
+        // Provider inferred from the host so one hook covers every upstream.
+        recordQuotaEvent({ provider: providerFor(url), status: 429, body: '' });
         await sleep(1500 * (attempt + 1));
         continue;
       }

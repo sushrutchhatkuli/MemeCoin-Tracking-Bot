@@ -962,6 +962,32 @@
       { "minScore": 68, "maxScore": 74, "sol": 0.25, "label": "Light Scalp" }
     ]
   },
+  "quotaSentinel": {
+    "_note": [
+      "Watches for 429s and quota-exhaustion bodies from Helius, CoinGecko,",
+      "RugCheck and DexScreener, and sends one Telegram warning per provider",
+      "per cooldown window.",
+      "",
+      "WHY IT EXISTS: a throttled key does not announce itself, it degrades",
+      "quietly. The whale sync derived 48/48 PnL figures on one run and 22/48",
+      "an hour later purely from request pacing, and the CoinGecko resolver",
+      "recorded WIF, JUP and BONK as not-a-Solana-token when its lookups 429d.",
+      "Both kept running and produced a worse answer that looked exactly like a",
+      "normal one. That silent loss of fidelity is what this catches.",
+      "",
+      "minEventsToAlert exists because a single 429 is ordinary backpressure",
+      "that self-corrects; alerting on it would train the alert to be ignored.",
+      "An EXHAUSTED classification (a quota message in the body, or HTTP 402)",
+      "alerts on the first occurrence regardless — that one does not recover on",
+      "its own and needs a new key.",
+      "",
+      "The cooldown is persisted to .state/ because every scan is a fresh",
+      "process; an in-memory guard would re-alert on every single run."
+    ],
+    "enabled": true,
+    "cooldownMinutes": 60,
+    "minEventsToAlert": 3
+  },
   "auditConcurrency": 4,
   "_auditConcurrencyNote": [
     "How many tokens are ANALYSED at once. Only the analysis is parallel — it is",

@@ -37,6 +37,8 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 
+import { recordQuotaEvent } from './quota_sentinel.mjs';
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CG = 'https://api.coingecko.com/api/v3';
 export const SOCIAL_CACHE_PATH = join(HERE, '.state', 'social_cache.json');
@@ -116,7 +118,14 @@ async function getJson(url, timeoutMs, apiKey = null) {
   const headers = { accept: 'application/json', 'user-agent': 'aegis-social-tracer/1.0' };
   if (apiKey) headers['x-cg-demo-api-key'] = apiKey;
   const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) {
+    // The body is read only on failure. A CoinGecko 429 sometimes carries a
+    // quota message, which is what distinguishes "slow down" from "this key is
+    // finished" — two problems with different fixes.
+    const body = await res.text().catch(() => '');
+    recordQuotaEvent({ provider: 'coingecko', status: res.status, body });
+    throw new Error(`HTTP ${res.status}`);
+  }
   return res.json();
 }
 
