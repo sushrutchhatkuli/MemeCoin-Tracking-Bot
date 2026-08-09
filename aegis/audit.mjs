@@ -682,7 +682,14 @@ export function applyCtoOverride(catalysts, cto) {
  * so their preconditions are stated once more where they can be read and tested
  * on their own, rather than inferred from the interaction of three modules.
  */
-export function evaluateInsiderRequirements({ audit, security, clusters, thresholds = {}, demand = null }) {
+export function evaluateInsiderRequirements({
+  audit,
+  security,
+  clusters,
+  thresholds = {},
+  demand = null,
+  minInsiderWallets = 1,
+}) {
   const rows = [];
   const add = (label, passed, detail) => rows.push({ label, passed: passed === true, detail });
 
@@ -706,6 +713,49 @@ export function evaluateInsiderRequirements({ audit, security, clusters, thresho
       ? `${clusters.label ?? 'insider activity'}${count ? ` — ${count} unique wallet(s)` : ''}`
       : 'No cluster, non-routine buy size or funder network matched'
   );
+
+  // ---- Multi-wallet requirement ------------------------------------
+  //
+  // A tier can demand that the evidence be COORDINATION rather than one wallet
+  // doing something unusual. Two conditions, both required:
+  //
+  //   1. enough distinct insider wallets, and
+  //   2. STRUCTURAL evidence tying them together — co-buying inside the launch
+  //      window, a shared funding origin, or same-slot execution.
+  //
+  // The second condition is the one that does the work. Without it, two
+  // unrelated watchlisted wallets that happened to buy the same token hours
+  // apart would satisfy a bare count, and that is not a cabal — it is two
+  // people liking the same coin.
+  //
+  // Measured against 301 insider-detected notes on file: 243 of them (81%)
+  // were NON-ROUTINE BUY SIZE with cluster size 0 and no funder network — one
+  // wallet making one large buy. Those are exactly what this blocks.
+  if (minInsiderWallets > 1) {
+    const clusterSize = clusters?.clusterBuying?.size ?? 0;
+    const networkSize = Math.max(0, ...(clusters?.networks ?? []).map((n) => n.size ?? 0));
+    const bundleSize = clusters?.jito?.detected ? (clusters.jito.size ?? 0) : 0;
+
+    const structural = Math.max(clusterSize, networkSize, bundleSize);
+    const evidence =
+      structural === bundleSize && bundleSize >= minInsiderWallets
+        ? `${bundleSize} wallets in one slot`
+        : structural === clusterSize && clusterSize >= minInsiderWallets
+          ? `${clusterSize} wallets co-buying in the launch window`
+          : structural === networkSize && networkSize >= minInsiderWallets
+            ? `${networkSize} wallets sharing a funder`
+            : null;
+
+    add(
+      `Multi-wallet cluster (≥${minInsiderWallets})`,
+      count >= minInsiderWallets && structural >= minInsiderWallets,
+      evidence
+        ? `${evidence} — ${count} distinct insider wallet(s)`
+        : count < minInsiderWallets
+          ? `Only ${count} distinct insider wallet(s) — a single buyer is not a cluster`
+          : `${count} wallets, but none co-buying within the launch window, sharing a funder, or in one slot`
+    );
+  }
 
   add(
     'Contract audit',
@@ -955,6 +1005,11 @@ function classifyInsiderTier({ demand, security, config, clusters, audit, holder
     clusters,
     thresholds: { ...(config.thresholds ?? {}), ...shared },
     demand,
+    // Per-tier. The early band demands coordination because it is the noisiest
+    // and least-verified end of the market; the established band does not, as
+    // its own floors (>=$1M cap, >=$100k liquidity, >=1000 holders) already
+    // exclude the launch-sniping noise this is aimed at.
+    minInsiderWallets: tier.cfg.minInsiderWallets ?? shared.minInsiderWallets ?? 1,
   });
   if (!requirements.passed) {
     // Deliberately NOT a downgrade to the plain tiers. A token that matched an

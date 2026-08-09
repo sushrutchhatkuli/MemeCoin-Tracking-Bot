@@ -33,7 +33,7 @@ import {
   isAlertableCategory,
   SIGNAL_CATEGORY,
 } from '../audit.mjs';
-import { alertHeaderLines } from '../telegram.mjs';
+import { alertHeaderLines, parseCommand, handleCommand } from '../telegram.mjs';
 import { stopLossPctFor, armedTrailingLock, evaluateTriggers, TRIGGER } from '../sell_notifier.mjs';
 import { walletScorecard } from '../wallet_observations.mjs';
 import { detectJitoBundles } from '../insider_cluster.mjs';
@@ -891,6 +891,211 @@ test('the early insider tier gets the -15% stop its own alert text promises', ()
   assert.equal(stopLossPctFor({ category: 'COMMUNITY TAKEOVER GEM' }, cfg), 20);
   assert.equal(stopLossPctFor({}, cfg), 20, 'positions opened before this existed');
   assert.equal(stopLossPctFor({ category: 'X' }, {}), 20, 'default with no config');
+});
+
+/* ------------------------------------------------------------------ *
+ * Multi-wallet cluster requirement for the early scalp tier
+ * ------------------------------------------------------------------ */
+
+const clusterOf = ({ count = 0, clusterSize = 0, networkSize = 0, bundle = 0, label = 'X' }) => ({
+  detected: true,
+  insiderCount: count,
+  label,
+  clusterBuying: clusterSize ? { size: clusterSize, members: [], windowSec: 60 } : null,
+  networks: networkSize ? [{ size: networkSize, funderShort: 'f…x', funderSolscan: '#', members: [] }] : [],
+  oversized: [],
+  watchlisted: [],
+  jito: bundle ? { detected: true, size: bundle, confirmed: false } : { detected: false },
+});
+
+const earlyReq = (clusters) =>
+  evaluateInsiderRequirements({
+    audit: PASSED,
+    security: cleanSecurity(),
+    clusters,
+    thresholds: { maxTop10Pct: 20, minLpLockedPct: 99 },
+    minInsiderWallets: 2,
+  });
+
+test('a lone NON-ROUTINE BUY SIZE detection is blocked from the early tier', () => {
+  // 243 of 301 insider-detected notes on file are exactly this shape: one
+  // wallet, one large buy, cluster size 0, no funder network.
+  const solo = clusterOf({ count: 0, label: 'NON-ROUTINE BUY SIZE' });
+  solo.oversized = [{ short: 'aaa…bbb', reason: '9 SOL buy' }];
+  const r = earlyReq(solo);
+  assert.equal(r.passed, false);
+  assert.match(r.failures.join(' '), /single buyer is not a cluster/);
+});
+
+test('one tracked wallet is not a cluster either', () => {
+  const r = earlyReq(clusterOf({ count: 1, label: 'INSIDER TRACKED' }));
+  assert.equal(r.passed, false);
+});
+
+test('two wallets without structural evidence are still blocked', () => {
+  // Two watchlisted wallets that bought hours apart is not a cabal — it is two
+  // people liking the same coin. The count alone must not satisfy the gate.
+  const r = earlyReq(clusterOf({ count: 2, label: 'INSIDER TRACKED' }));
+  assert.equal(r.passed, false);
+  assert.match(r.failures.join(' '), /none co-buying within the launch window/);
+});
+
+test('2 wallets co-buying in the launch window pass', () => {
+  const r = earlyReq(clusterOf({ count: 2, clusterSize: 2, label: 'INSIDER CLUSTER' }));
+  assert.equal(r.passed, true);
+  const row = r.checks.find((c) => c.label.startsWith('Multi-wallet'));
+  assert.match(row.detail, /co-buying in the launch window/);
+});
+
+test('2 wallets sharing a master funder pass', () => {
+  const r = earlyReq(clusterOf({ count: 2, networkSize: 2, label: 'SHARED FUNDER NETWORK' }));
+  assert.equal(r.passed, true);
+  assert.match(r.checks.find((c) => c.label.startsWith('Multi-wallet')).detail, /sharing a funder/);
+});
+
+test('a same-slot bundle satisfies the cluster requirement', () => {
+  const r = earlyReq(clusterOf({ count: 3, bundle: 3, label: 'SAME-SLOT CABAL BUNDLE' }));
+  assert.equal(r.passed, true);
+  assert.match(r.checks.find((c) => c.label.startsWith('Multi-wallet')).detail, /one slot/);
+});
+
+test('the established tier is unaffected — no multi-wallet row at all', () => {
+  const r = evaluateInsiderRequirements({
+    audit: PASSED,
+    security: cleanSecurity(),
+    clusters: clusterOf({ count: 1, label: 'INSIDER TRACKED' }),
+    thresholds: { maxTop10Pct: 20, minLpLockedPct: 99 },
+    // default minInsiderWallets = 1
+  });
+  assert.equal(r.passed, true);
+  assert.equal(r.checks.some((c) => c.label.startsWith('Multi-wallet')), false);
+});
+
+test('end to end: a single-buy token cannot reach EARLY-STAGE INSIDER SCALP', () => {
+  const cfg = {
+    ...insiderConfig,
+    signalCategories: {
+      ...insiderConfig.signalCategories,
+      insiderEarly: { ...insiderConfig.signalCategories.insiderEarly, minInsiderWallets: 2 },
+    },
+  };
+  const demand = { marketCap: 60_000, liquidityUsd: 25_000, ageHours: 0.4, ageIsLowerBound: false };
+  const solo = clusterOf({ count: 0, label: 'NON-ROUTINE BUY SIZE' });
+
+  const blocked = classifySignal({
+    demand, security: cleanSecurity(), config: cfg, clusters: solo, audit: PASSED,
+  });
+  assert.equal(blocked.category, SIGNAL_CATEGORY.NONE);
+  assert.equal(isAlertableCategory(blocked.category), false);
+
+  const allowed = classifySignal({
+    demand, security: cleanSecurity(), config: cfg,
+    clusters: clusterOf({ count: 2, clusterSize: 2 }), audit: PASSED,
+  });
+  assert.equal(allowed.category, SIGNAL_CATEGORY.INSIDER_EARLY);
+});
+
+/* ------------------------------------------------------------------ *
+ * Interactive Telegram commands
+ * ------------------------------------------------------------------ */
+
+test('command parsing handles arguments, @botname and non-commands', () => {
+  assert.deepEqual(parseCommand('/help'), { command: 'help', args: [] });
+  assert.deepEqual(parseCommand('/audit ABC123'), { command: 'audit', args: ['ABC123'] });
+  assert.deepEqual(parseCommand('/status@AegisBot'), { command: 'status', args: [] });
+  assert.deepEqual(parseCommand('  /AUDIT   xyz  '), { command: 'audit', args: ['xyz'] });
+  for (const bad of ['hello', '', null, undefined, 42, 'not /a command']) {
+    assert.equal(parseCommand(bad), null, String(bad));
+  }
+});
+
+test('/help and an unknown command both answer without touching the pipeline', async () => {
+  let called = false;
+  const deps = { auditOnce: async () => { called = true; return { ok: false, error: 'x' }; } };
+  assert.match(await handleCommand({ command: 'help', args: [], deps }), /AEGIS COMMANDS/);
+  assert.match(await handleCommand({ command: 'nonsense', args: [], deps }), /Unknown command/);
+  assert.equal(called, false);
+});
+
+test('/audit validates the address before spending an RPC call', async () => {
+  let called = false;
+  const deps = { auditOnce: async () => { called = true; return { ok: true }; } };
+
+  assert.match(await handleCommand({ command: 'audit', args: [], deps }), /Usage/);
+  assert.match(await handleCommand({ command: 'audit', args: ['not-an-address'], deps }), /does not look like/);
+  assert.equal(called, false, 'a malformed address must never reach the pipeline');
+});
+
+test('/audit reports the verdict and surfaces a blocked reason', async () => {
+  const deps = {
+    auditOnce: async () => ({
+      ok: true,
+      pair: { chainId: 'solana', baseToken: { symbol: 'TOAD', address: REAL_MINT } },
+      result: {
+        verdictInfo: {
+          verdict: 'SCAM/AVOID', score: 0, safetyGateFailed: true,
+          safetyGateReason: 'Blacklisted deployer or mint',
+        },
+        demand: {
+          marketCap: 50_000, liquidityUsd: 10_000, liqToMcapPct: 20, ageHours: 3,
+          m5: { buys: 4, sells: 9 }, volume: { h1: 12_000 },
+        },
+        security: { totalHolders: 900, top10Pct: 44.2 },
+        audit: { status: 'FAILED', failures: ['Mint Authority: ACTIVE'], unknowns: [] },
+        signalCategory: { category: 'UNCLASSIFIED' },
+        clusters: { detected: false },
+      },
+    }),
+  };
+  const out = await handleCommand({ command: 'audit', args: [REAL_MINT], deps });
+  assert.match(out, /AUDIT: \$TOAD/);
+  assert.match(out, /SCAM\/AVOID/);
+  assert.match(out, /BLOCKED:/);
+  assert.match(out, /Mint Authority: ACTIVE/);
+});
+
+test('/insiders says so plainly when there is nothing to report', async () => {
+  const deps = {
+    auditOnce: async () => ({
+      ok: true,
+      pair: { chainId: 'solana', baseToken: { symbol: 'QUIET', address: REAL_MINT } },
+      result: { clusters: { detected: false, buyersSeen: 22 } },
+    }),
+  };
+  const out = await handleCommand({ command: 'insiders', args: [REAL_MINT], deps });
+  assert.match(out, /No cluster, funder network/);
+  assert.match(out, /22 buyer\(s\) replayed/);
+});
+
+test('/status reports positions and the live floors', async () => {
+  const deps = {
+    loadStatus: async () => ({
+      config: {
+        telegram: { insiderMinScore: 68 },
+        thresholds: {
+          maxTop10Pct: 20, minLiqToMcapPct: 15, minUniqueHolders: 150,
+          dynamicConcentration: { maxTop10Pct: 30 },
+        },
+        signalCategories: { insiderEarly: { minInsiderWallets: 2 } },
+      },
+      positions: {
+        positions: {
+          a: { status: 'OPEN', symbol: 'TOAD', entryMarketCap: 100_000, peakMarketCap: 250_000,
+               alertedAt: Date.now() - 3600_000, firedTriggers: ['TAKE_PROFIT'] },
+          b: { status: 'CLOSED', symbol: 'OLD', entryMarketCap: 1, peakMarketCap: 1,
+               alertedAt: Date.now(), firedTriggers: [] },
+        },
+      },
+      watchlist: { entries: [1, 2, 3, 4, 5] },
+      observations: { wallets: { w1: {}, w2: {} } },
+      alertLog: { x: { symbol: 'TOAD', score: 92, sentAt: Date.now() - 7200_000 } },
+    }),
+  };
+  const out = await handleCommand({ command: 'status', args: [], deps });
+  assert.match(out, /Open positions: <b>1<\/b>/, 'closed positions excluded');
+  assert.match(out, /TOAD/);
+  assert.match(out, /Alert score floor: 68/);
+  assert.match(out, /Early-scalp cluster: ≥2/);
 });
 
 /* ------------------------------------------------------------------ *

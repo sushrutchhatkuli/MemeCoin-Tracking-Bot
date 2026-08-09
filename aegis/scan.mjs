@@ -816,7 +816,58 @@ export async function runScan(args = {}) {
     if (skipped.length > 12) console.log(`   … and ${skipped.length - 12} more`);
   }
 
-  return { written, alerts, skipped, scanned: digestRows.length };
+  return { written, alerts, skipped, scanned: digestRows.length, rows: digestRows };
+}
+
+/**
+ * Audit one token and return the full result WITHOUT alerting or writing.
+ *
+ * Exists for the Telegram command bot: `/audit <mint>` is a question, and
+ * answering it must not fire a BUY alert, open a position or write a note.
+ * Everything stateful in runScan is deliberately skipped here — the caller
+ * gets the analysis and decides what to do with it.
+ *
+ * The observation ledger is loaded read-only so insider scorecards still
+ * populate; nothing is saved back.
+ */
+export async function auditOnce(address, { chain = null } = {}) {
+  const config = applyEnvOverrides(
+    JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'))
+  );
+
+  const pair = await fetchSinglePair(address);
+  if (!pair) return { ok: false, error: 'No tradeable DexScreener pair for that address' };
+  if (chain && pair.chainId !== chain) {
+    return { ok: false, error: `Pair is on ${pair.chainId}, not ${chain}` };
+  }
+
+  // Loaded through the real loaders, not hand-rolled empties. An earlier cut
+  // passed `deployerCache: {}` and auditDeployer threw on `cache.profiles`,
+  // taking the whole command down — these structures have shapes, and the
+  // loaders are where those shapes are defined.
+  const [watchlist, blacklist, observations, deployerCache, state] = await Promise.all([
+    loadWatchlist(join(HERE, config.smartMoney.watchlistFile)),
+    loadBlacklist(join(HERE, 'dev_blacklist.json')),
+    loadObservations(join(HERE, '.state', 'wallet_observations.json')),
+    loadDeployerCache(join(HERE, '.state', 'deployers.json')),
+    loadState(join(HERE, '.state', 'snapshots.json')),
+  ]);
+
+  const result = await analyzeToken({
+    pair,
+    config,
+    state,
+    watchlist,
+    deployerCache,
+    blacklist,
+    observations,
+    funderCache: {},
+    discoveredStore: null,
+    screenCache: {},
+    now: new Date(),
+  });
+
+  return { ok: true, pair, result, config };
 }
 
 // Direct invocation (`node scan.mjs …`) still works; index.mjs is the entry

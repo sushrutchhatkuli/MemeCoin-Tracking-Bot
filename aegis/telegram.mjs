@@ -8,7 +8,8 @@
  */
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { fetchLiveHolderDistribution } from './sources.mjs';
 import {
@@ -680,6 +681,262 @@ export function buildDigest({ rows, scanned, noteCount, startedAt, tradeLink }) 
 }
 
 /* ------------------------------------------------------------------ *
+ * Interactive commands
+ * ------------------------------------------------------------------ *
+ *
+ * A long-poll bot so Aegis can be queried on demand: /audit, /insiders,
+ * /status, /help.
+ *
+ * ── AUTHORISATION ──────────────────────────────────────────────────────────
+ * A Telegram bot answers ANYONE who finds it. Its username is discoverable and
+ * the token appears in any config you paste somewhere. Without a check, a
+ * stranger could make this run scans against your RPC quota and read back your
+ * open positions.
+ *
+ * So every update is matched against the configured TELEGRAM_CHAT_ID and
+ * silently ignored otherwise — silently on purpose, since replying "not
+ * authorised" confirms the bot is live and worth probing.
+ *
+ * ── SIDE EFFECTS ───────────────────────────────────────────────────────────
+ * /audit answers a QUESTION. It runs the analysis through auditOnce(), which
+ * writes no note, opens no position and fires no alert. Asking about a token
+ * must never be a way to accidentally enter one.
+ */
+
+const HELP_TEXT = [
+  '🛡 <b>AEGIS COMMANDS</b>',
+  '',
+  '<code>/audit &lt;contract&gt;</code> — full security + score report for one token',
+  '<code>/insiders &lt;contract&gt;</code> — cluster, funder network and bundle detail',
+  '<code>/status</code> — scanner state: positions, watchlist, ledger, floors',
+  '<code>/help</code> — this message',
+  '',
+  '<i>/audit and /insiders are read-only: they never write a note, open a position or send a buy alert.</i>',
+].join('\n');
+
+/** Split "/cmd@botname arg1 arg2" into a command and its arguments. */
+export function parseCommand(text) {
+  if (typeof text !== 'string') return null;
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('/')) return null;
+  const [head, ...args] = trimmed.split(/\s+/);
+  // Group chats append @botname to commands.
+  const command = head.slice(1).split('@')[0].toLowerCase();
+  return command ? { command, args } : null;
+}
+
+const MINT_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+function statusReport({ config, positions, watchlist, observations, alertLog }) {
+  const open = Object.values(positions?.positions ?? {}).filter((p) => p.status === 'OPEN');
+  const wallets = Object.keys(observations?.wallets ?? {}).length;
+  const alertCount = Object.keys(alertLog ?? {}).length;
+  const recent = Object.values(alertLog ?? {})
+    .sort((a, b) => b.sentAt - a.sentAt)
+    .slice(0, 3);
+
+  const lines = [
+    '🛡 <b>AEGIS STATUS</b>',
+    '',
+    `• Open positions: <b>${open.length}</b>`,
+  ];
+  for (const p of open.slice(0, 5)) {
+    const age = ((Date.now() - p.alertedAt) / 3600000).toFixed(1);
+    lines.push(
+      `   ↳ $${esc(p.symbol)} — entry ${usdShort(p.entryMarketCap)}, peak ${usdShort(p.peakMarketCap)}, ${age}h, fired [${esc(p.firedTriggers.join(',') || 'none')}]`
+    );
+  }
+  lines.push(
+    `• Elite watchlist: <b>${watchlist?.entries?.length ?? watchlist?.index?.size ?? 0}</b> wallet(s)`,
+    `• Observation ledger: <b>${wallets.toLocaleString('en-US')}</b> wallet(s)`,
+    `• Alerts on record: <b>${alertCount}</b>`,
+    '',
+    '<b>Active floors</b>',
+    `• Alert score floor: ${config.telegram?.insiderMinScore ?? '?'}`,
+    `• Top-10 cap: ${config.thresholds?.maxTop10Pct ?? '?'}% (up to ${config.thresholds?.dynamicConcentration?.maxTop10Pct ?? '?'}% on proven traction)`,
+    `• Liquidity depth: ${config.thresholds?.minLiqToMcapPct ?? '?'}% of MCap`,
+    `• Holder floor: ${config.thresholds?.minUniqueHolders ?? '?'}`,
+    `• Early-scalp cluster: ≥${config.signalCategories?.insiderEarly?.minInsiderWallets ?? 1} wallet(s)`,
+  );
+  if (recent.length) {
+    lines.push('', '<b>Last alerts</b>');
+    for (const r of recent) {
+      lines.push(`• $${esc(r.symbol)} — ${r.score}/100, ${((Date.now() - r.sentAt) / 3600000).toFixed(1)}h ago`);
+    }
+  }
+  return lines.join('\n');
+}
+
+function auditReport({ pair, result }) {
+  const { verdictInfo, demand, security, audit, signalCategory, clusters, cto, megaRunner } = result;
+  const usd = (n) => (n === null || n === undefined ? '?' : `$${Math.round(n).toLocaleString('en-US')}`);
+
+  const lines = [
+    `🛡 <b>AUDIT: $${esc(pair.baseToken?.symbol ?? '?')}</b>`,
+    `<i>${esc(verdictInfo.verdict)} · ${verdictInfo.score}/100 · security ${esc(audit.status)}</i>`,
+  ];
+  if (signalCategory?.category && signalCategory.category !== 'UNCLASSIFIED') {
+    lines.push(`<b>${esc(signalCategory.label ?? signalCategory.category)}</b>`);
+  } else if (signalCategory?.reason) {
+    lines.push(`<i>Unclassified — ${esc(signalCategory.reason)}</i>`);
+  }
+
+  lines.push(
+    '',
+    '📊 <b>MARKET</b>',
+    `• MCap ${usd(demand.marketCap)} · Liquidity ${usd(demand.liquidityUsd)} (${demand.liqToMcapPct.toFixed(0)}%)`,
+    `• 5m ${demand.m5.buys}/${demand.m5.sells} · 1h vol ${usd(demand.volume.h1)}`,
+    `• Holders ${security?.totalHolders ?? '?'} · Top10 ${security?.top10Pct === null || security?.top10Pct === undefined ? '?' : `${security.top10Pct.toFixed(1)}%`}`,
+    ...(demand.ageHours === null ? [] : [`• Age ${demand.ageHours.toFixed(1)}h`])
+  );
+
+  if (verdictInfo.safetyGateFailed) {
+    lines.push('', `🛑 <b>BLOCKED:</b> ${esc(verdictInfo.safetyGateReason ?? 'safety gate')}`);
+  }
+  if (audit.failures?.length) {
+    lines.push('', '❌ <b>Failed checks</b>');
+    for (const f of audit.failures.slice(0, 4)) lines.push(`• ${esc(f)}`);
+  }
+  if (audit.unknowns?.length) {
+    lines.push('', '⚠️ <b>Unverified</b>');
+    for (const u of audit.unknowns.slice(0, 3)) lines.push(`• ${esc(u)}`);
+  }
+
+  const flags = [
+    clusters?.detected ? `insiders: ${clusters.label ?? 'detected'} (${clusters.insiderCount ?? 0})` : null,
+    cto?.detected ? 'community takeover' : null,
+    megaRunner?.detected ? 'mega-runner volume' : null,
+  ].filter(Boolean);
+  if (flags.length) lines.push('', `🔎 ${esc(flags.join(' · '))}`);
+
+  lines.push(
+    '',
+    `<code>${esc(pair.baseToken.address)}</code>`,
+    `📈 <a href="https://dexscreener.com/${esc(pair.chainId)}/${esc(pair.baseToken.address)}">DexScreener</a>`
+  );
+  return lines.join('\n');
+}
+
+function insiderReport({ pair, result }) {
+  const c = result.clusters;
+  const head = `🕵️ <b>INSIDERS: $${esc(pair.baseToken?.symbol ?? '?')}</b>`;
+  if (!c?.detected) {
+    return [head, '', '<i>No cluster, funder network, oversized buy or same-slot bundle found.</i>',
+      c?.buyersSeen ? `<i>${c.buyersSeen} buyer(s) replayed.</i>` : '',
+      c?.skippedFunderTrace ? `<i>Funder trace skipped — ${esc(c.skippedFunderTrace)}.</i>` : '',
+    ].filter(Boolean).join('\n');
+  }
+
+  const lines = [head, `<b>${esc(c.label ?? 'INSIDER ACTIVITY')}</b> — ${c.insiderCount ?? 0} distinct wallet(s)`];
+  if (c.clusterBuying) lines.push(`• ${c.clusterBuying.size} wallets bought within ${c.clusterBuying.windowSec}s of launch`);
+  if (c.jito?.detected) lines.push(`• 📦 ${esc(c.jito.detail)}`);
+  for (const n of (c.networks ?? []).slice(0, 2)) {
+    lines.push(`• Funder: ${n.size} wallets from <a href="${esc(n.funderSolscan)}">${esc(n.funderShort)}</a>`);
+  }
+  for (const o of (c.oversized ?? []).slice(0, 2)) {
+    lines.push(`• ⚠️ ${esc(o.short)} — ${esc(o.reason)}`);
+  }
+
+  const members = (c.uniqueInsiders ?? c.watchlisted ?? []).slice(0, 5);
+  if (members.length) {
+    lines.push('', '<b>Wallets</b>');
+    members.forEach((m, i) => {
+      const spend = m.solSpent !== null && m.solSpent !== undefined ? `${m.solSpent.toFixed(2)} SOL` : 'spend n/a';
+      lines.push(`${i + 1}. <a href="${esc(m.solscan)}">${esc(m.short)}</a> — ${esc(spend)}`);
+      for (const row of scorecardLines(m.scorecard)) lines.push(row);
+    });
+  }
+  lines.push('', '<i>Coordination signal, not proof of insider knowledge.</i>');
+  return lines.join('\n');
+}
+
+/**
+ * Execute one command and return the HTML reply.
+ *
+ * Pure dispatch plus IO — separated from the polling loop so it can be tested
+ * without a network, and so a thrown error inside a handler cannot kill the
+ * poller.
+ */
+export async function handleCommand({ command, args, deps = {} }) {
+  const loaders = deps;
+  switch (command) {
+    case 'help':
+    case 'start':
+      return HELP_TEXT;
+
+    case 'status': {
+      const state = await loaders.loadStatus();
+      return statusReport(state);
+    }
+
+    case 'audit':
+    case 'insiders': {
+      const address = args[0];
+      if (!address) return `Usage: <code>/${command} &lt;contract address&gt;</code>`;
+      if (!MINT_RE.test(address)) return '❌ That does not look like a Solana contract address.';
+      const res = await loaders.auditOnce(address);
+      if (!res.ok) return `❌ ${esc(res.error)}`;
+      return command === 'audit' ? auditReport(res) : insiderReport(res);
+    }
+
+    default:
+      return `Unknown command <code>/${esc(command)}</code>. Try /help`;
+  }
+}
+
+/**
+ * Long-poll loop. Runs until stopped; every iteration is individually guarded
+ * so one bad update or a transient network failure cannot end the session.
+ */
+export async function runCommandBot({ credentials, deps, log = console.log, signal } = {}) {
+  if (!credentials?.botToken || !credentials?.chatId) {
+    throw new Error('TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID must both be set');
+  }
+  const api = `https://api.telegram.org/bot${credentials.botToken}`;
+  const authorised = String(credentials.chatId);
+  let offset = 0;
+
+  log(`🤖 Aegis command bot listening (authorised chat ${authorised}). /help for commands.`);
+
+  while (!signal?.aborted) {
+    try {
+      const res = await fetch(`${api}/getUpdates?timeout=30&offset=${offset}`, {
+        signal: AbortSignal.timeout(45000),
+      });
+      const body = await res.json().catch(() => ({}));
+      for (const update of body.result ?? []) {
+        offset = update.update_id + 1;
+        const msg = update.message ?? update.channel_post;
+        if (!msg?.text) continue;
+
+        // Silently ignored rather than refused: a "not authorised" reply
+        // confirms the bot is live to anyone probing it.
+        if (String(msg.chat?.id) !== authorised) continue;
+
+        const parsed = parseCommand(msg.text);
+        if (!parsed) continue;
+
+        let reply;
+        try {
+          reply = await handleCommand({ ...parsed, deps });
+        } catch (err) {
+          reply = `❌ ${esc(`Command failed: ${err.message}`.slice(0, 300))}`;
+        }
+        await sendTelegram({ ...credentials, text: reply });
+        log(`   ↳ /${parsed.command} ${parsed.args.join(' ')}`.trim());
+      }
+    } catch (err) {
+      // Long-poll timeouts are normal and expected; anything else gets a
+      // short backoff rather than taking the bot down.
+      if (!/abort|timeout/i.test(err.message)) {
+        log(`   poll error: ${err.message}`);
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * Send
  * ------------------------------------------------------------------ */
 
@@ -885,4 +1142,50 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     return { status: 'sent', reaudit };
   }
   return { status: 'failed', error: sent.error };
+}
+
+/* ------------------------------------------------------------------ *
+ * CLI — node telegram.mjs --bot
+ * ------------------------------------------------------------------ */
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  if (!process.argv.includes('--bot')) {
+    console.log('Usage: node telegram.mjs --bot    (starts the interactive command bot)');
+    process.exit(0);
+  }
+
+  const HERE = dirname(fileURLToPath(import.meta.url));
+  const credentials = await loadEnv(join(HERE, '.env'));
+
+  // Imported lazily: scan.mjs pulls in the whole pipeline, and telegram.mjs is
+  // itself imported BY scan.mjs — loading it at module scope would be circular.
+  const { auditOnce } = await import('./scan.mjs');
+  const { loadPositions } = await import('./sell_notifier.mjs');
+  const { loadWatchlist } = await import('./smart_money.mjs');
+  const { loadObservations } = await import('./wallet_observations.mjs');
+
+  const deps = {
+    auditOnce,
+    loadStatus: async () => {
+      const config = JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'));
+      const [positions, watchlist, observations, alertLog] = await Promise.all([
+        loadPositions(),
+        loadWatchlist(join(HERE, config.smartMoney.watchlistFile)),
+        loadObservations(join(HERE, '.state', 'wallet_observations.json')),
+        loadAlertLog(join(HERE, '.state', 'alerts.json')),
+      ]);
+      return { config, positions, watchlist, observations, alertLog };
+    },
+  };
+
+  const controller = new AbortController();
+  const shutdown = () => {
+    console.log('\n🤖 Command bot stopped.');
+    controller.abort();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  await runCommandBot({ credentials, deps, signal: controller.signal });
 }
