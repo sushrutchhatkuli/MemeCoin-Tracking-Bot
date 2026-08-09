@@ -270,6 +270,7 @@ function resolveAge(pair, security) {
  * ------------------------------------------------------------------ */
 
 export const SIGNAL_CATEGORY = {
+  CTO: 'COMMUNITY TAKEOVER GEM',
   INSIDER_EARLY: 'EARLY-STAGE INSIDER SCALP',
   INSIDER_ESTABLISHED: 'ESTABLISHED INSIDER GEM',
   GEM: 'LONG-TERM GEM',
@@ -282,8 +283,271 @@ const INSIDER_CATEGORIES = new Set([
   SIGNAL_CATEGORY.INSIDER_ESTABLISHED,
 ]);
 
+/** Categories the notifier will dispatch on: the two insider tiers plus CTO. */
+const ALERTABLE_CATEGORIES = new Set([...INSIDER_CATEGORIES, SIGNAL_CATEGORY.CTO]);
+
 /** True for the two insider-backed tiers, which the notifier gates on. */
 export const isInsiderCategory = (category) => INSIDER_CATEGORIES.has(category);
+
+/** True for any category cleared to send a Telegram alert. */
+export const isAlertableCategory = (category) => ALERTABLE_CATEGORIES.has(category);
+
+/* ------------------------------------------------------------------ *
+ * Mandatory anti-rugpull shield
+ * ------------------------------------------------------------------ */
+
+/**
+ * The six hard gates, in one place, as one testable function.
+ *
+ * These were already enforced — spread across runSecurityAudit (mint, freeze,
+ * LP, top 10), scoreToken (holders, depth) and maybeAlert. Collecting them here
+ * does not change what passes; it makes the rule set readable as a unit and
+ * lets a test assert the whole shield rather than three modules interacting.
+ * runSecurityAudit and scoreToken remain the enforcement path, so a bug here
+ * cannot open a hole there.
+ *
+ * ── ON THE CTO EXEMPTION ────────────────────────────────────────────────────
+ * A community takeover is allowed to bypass EXACTLY ONE gate: the liquidity
+ * DEPTH RATIO, and only by satisfying an absolute-dollar floor instead.
+ *
+ * It is not allowed to bypass mint authority, freeze authority, LP burn, top-10
+ * concentration or the holder floor. Those describe what the contract can still
+ * do to you, and a community rallying around a token cannot revoke a mint
+ * authority the developer kept. If anything, an abandoned token with a live
+ * mint authority is MORE dangerous, not less — the crowd is the exit liquidity.
+ *
+ * The ratio carve-out exists because it is the one gate a genuine CTO fails for
+ * a reason unrelated to safety: the pattern is a token whose market cap ran far
+ * ahead of its original pool. $RAVECAT sat at 2.9% liquidity-to-market-cap with
+ * a real $218k pool. Requiring 15% there would not have made anyone safer; it
+ * would only have meant the CTO tier could never fire on the exact pattern it
+ * is named after.
+ */
+export function evaluateSecurityShield({ security, demand, thresholds = {}, cto = null }) {
+  const rows = [];
+  const add = (label, passed, detail) => rows.push({ label, passed: passed === true, detail });
+
+  const evm = security?.chainKind === 'evm';
+  const top10Cap = thresholds.maxTop10Pct ?? 20;
+  const lpFloor = thresholds.minLpLockedPct ?? 99;
+  const holderFloor = thresholds.minUniqueHolders ?? 150;
+  const depthFloorPct = thresholds.minLiqToMcapPct ?? 15;
+  const absoluteFloor = thresholds.minAbsoluteLiquidityUsd ?? 100_000;
+
+  if (evm) {
+    add(
+      'Mint / supply control',
+      security?.isMintable === false,
+      security?.isMintable === false ? 'Supply fixed, not mintable' : 'Mintable or unknown'
+    );
+    add('Freeze authority', true, 'Not applicable on EVM');
+  } else {
+    add(
+      'Mint authority revoked',
+      security?.ok === true && security.mintAuthority === null,
+      security?.ok !== true
+        ? 'Security report unavailable'
+        : security.mintAuthority === null
+          ? 'Revoked / Null'
+          : `ACTIVE — dev can mint infinite supply (${security.mintAuthority})`
+    );
+    add(
+      'Freeze authority revoked',
+      security?.ok === true && security.freezeAuthority === null,
+      security?.ok !== true
+        ? 'Security report unavailable'
+        : security.freezeAuthority === null
+          ? 'Revoked / Null'
+          : `ACTIVE — dev can freeze your wallet (${security.freezeAuthority})`
+    );
+  }
+
+  const lp = security?.lpLockedPct;
+  add(
+    'LP burned / locked',
+    lp !== null && lp !== undefined && lp >= lpFloor,
+    lp === null || lp === undefined
+      ? 'LP lock status not indexed — unknown does not pass'
+      : `${lp.toFixed(1)}% burned / locked (required ≥ ${lpFloor}%)`
+  );
+
+  const top10 = security?.top10Pct;
+  add(
+    'Top 10 non-LP concentration',
+    top10 !== null && top10 !== undefined && top10 < top10Cap,
+    top10 === null || top10 === undefined
+      ? 'Holder distribution not indexed — unknown does not pass'
+      : `Top 10 hold ${top10.toFixed(1)}% (limit ${top10Cap}%)`
+  );
+
+  const holders = security?.ok ? security.totalHolders : null;
+  add(
+    'Minimum unique holders',
+    holders !== null && holders !== undefined && holders >= holderFloor,
+    holders === null || holders === undefined
+      ? 'Holder count unknown — unknown does not pass'
+      : `${holders} holders (floor ${holderFloor})`
+  );
+
+  // Depth: the ratio, or — for a confirmed CTO only — an absolute-dollar pool.
+  const ratio = demand?.liqToMcapPct;
+  const liqUsd = demand?.liquidityUsd ?? 0;
+  const ratioOk = ratio !== null && ratio !== undefined && ratio >= depthFloorPct;
+  const ctoDepthOk = cto?.detected === true && liqUsd >= absoluteFloor;
+  add(
+    'Liquidity depth',
+    ratioOk || ctoDepthOk,
+    ratio === null || ratio === undefined
+      ? 'Liquidity depth unknown — unknown does not pass'
+      : ratioOk
+        ? `${ratio.toFixed(1)}% of market cap (floor ${depthFloorPct}%)`
+        : ctoDepthOk
+          ? `${ratio.toFixed(1)}% of market cap — under the ${depthFloorPct}% ratio, cleared on the $${absoluteFloor.toLocaleString('en-US')} absolute floor (CTO)`
+          : `${ratio.toFixed(1)}% of market cap — below the ${depthFloorPct}% floor`
+  );
+
+  const failures = rows.filter((r) => !r.passed).map((r) => `${r.label}: ${r.detail}`);
+  return {
+    passed: failures.length === 0,
+    checks: rows,
+    failures,
+    ctoDepthWaiver: ctoDepthOk && !ratioOk,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Community Takeover (CTO) engine
+ * ------------------------------------------------------------------ */
+
+/**
+ * Detect a token the community picked up after the developer walked away.
+ *
+ * The four criteria are a proxy for one question: is there a real crowd here,
+ * trading real size, in a pool deep enough to matter, on a token the dev no
+ * longer controls? None of the four is meaningful alone — holders can be
+ * sybilled, volume can be washed, a dev can move funds to a second wallet and
+ * look "exited". Together they are decent evidence, and they are treated as
+ * decent evidence rather than proof.
+ *
+ * WHAT THIS OVERRIDES, precisely:
+ *   - the dev-exit penalty: RugCheck creator-sold style risk flags stop
+ *     counting against the score, because for a CTO the dev being gone is the
+ *     PREMISE, not a warning.
+ *   - the liquidity depth RATIO, replaced by an absolute-dollar floor in
+ *     evaluateSecurityShield.
+ *
+ * WHAT IT DOES NOT OVERRIDE, and must never:
+ *   - mint authority, freeze authority, LP burn, top-10 concentration, the
+ *     holder floor. A crowd cannot revoke an authority the developer kept.
+ *   - a SERIAL RUGGER deployer. A rugger's abandoned token is still a rugger's
+ *     token, and "the community took it over" is the exact story that would be
+ *     told to launder one.
+ *
+ * `devExit` must be supplied by the caller — audit.mjs makes no network calls.
+ * scan.mjs resolves it from chain, and only after the three free criteria pass,
+ * so the RPC read costs nothing on the tokens that were never candidates.
+ */
+export function evaluateCommunityTakeover({ demand, security, deployer, devExit = null, config = {} }) {
+  const cfg = config.communityTakeover ?? {};
+  if (cfg.enabled === false) return { detected: false, checks: [], failures: ['CTO detection disabled'] };
+
+  const rows = [];
+  const add = (label, passed, detail) => rows.push({ label, passed: passed === true, detail });
+
+  const minHolders = cfg.minHolders ?? 500;
+  const minVol1h = cfg.minVolume1hUsd ?? 100_000;
+  const minLiq = cfg.minLiquidityUsd ?? 30_000;
+  const maxDevPct = cfg.maxDevBalancePct ?? 1;
+
+  const holders = security?.ok ? security.totalHolders : null;
+  add(
+    'Community floor',
+    holders !== null && holders !== undefined && holders >= minHolders,
+    holders === null || holders === undefined
+      ? 'Holder count unknown'
+      : `${holders} holders (need ≥ ${minHolders})`
+  );
+
+  const vol1h = demand?.volume?.h1 ?? null;
+  add(
+    '1-hour volume',
+    vol1h !== null && vol1h >= minVol1h,
+    vol1h === null
+      ? 'Volume unavailable'
+      : `$${Math.round(vol1h).toLocaleString('en-US')} in 1h (need ≥ $${minVol1h.toLocaleString('en-US')})`
+  );
+
+  const liq = demand?.liquidityUsd ?? null;
+  add(
+    'Pool depth',
+    liq !== null && liq >= minLiq,
+    liq === null
+      ? 'Liquidity unavailable'
+      : `$${Math.round(liq).toLocaleString('en-US')} pool (need ≥ $${minLiq.toLocaleString('en-US')})`
+  );
+
+  // Dev exit. Unknown is a failure: "we could not find the developer's balance"
+  // is not the same claim as "the developer has gone", and the whole tier rests
+  // on that distinction.
+  const soldFlag = devExit?.sold === true;
+  const pct = devExit?.balancePct;
+  const pctOk = pct !== null && pct !== undefined && pct <= maxDevPct;
+  add(
+    'Developer exited',
+    soldFlag || pctOk,
+    soldFlag
+      ? `Dev sell observed on-chain${pct !== null && pct !== undefined ? ` — holds ${pct.toFixed(2)}%` : ''}`
+      : pct === null || pct === undefined
+        ? 'Developer balance could not be read — unknown does not pass'
+        : `Developer holds ${pct.toFixed(2)}% (need ≤ ${maxDevPct}%)`
+  );
+
+  const failures = rows.filter((r) => !r.passed).map((r) => `${r.label}: ${r.detail}`);
+  const allPassed = failures.length === 0;
+
+  // A serial rugger is disqualifying regardless of how strong the takeover
+  // looks. Checked after the criteria so the report still shows what the token
+  // did and did not meet.
+  const serialRugger = deployer?.status === 'SERIAL RUGGER 🔴';
+  if (allPassed && serialRugger) {
+    return {
+      detected: false,
+      checks: rows,
+      failures: ['Deployer is a serial rugger — a takeover does not launder that'],
+      blockedBySerialRugger: true,
+    };
+  }
+
+  return {
+    detected: allPassed,
+    checks: rows,
+    failures,
+    scoreBoost: allPassed ? (cfg.scoreBoost ?? 20) : 0,
+    devExit: devExit ?? null,
+  };
+}
+
+/**
+ * Bearish catalysts that a confirmed CTO should stop being punished for.
+ *
+ * Only dev-exit wording is neutralised. Every other bearish signal — sell
+ * pressure, price collapse, thin liquidity, danger flags — still counts, so a
+ * CTO label cannot quietly erase the rest of the risk picture.
+ */
+const DEV_EXIT_CATALYST = /creator|deployer|dev\b|dev sold|team sold/i;
+
+export function applyCtoOverride(catalysts, cto) {
+  if (!cto?.detected) return { ...catalysts, ctoNeutralised: [] };
+  const neutralised = catalysts.bearish.filter((b) => DEV_EXIT_CATALYST.test(b));
+  return {
+    bullish: [
+      ...catalysts.bullish,
+      `Community takeover: ${cto.checks.find((c) => c.label === 'Community floor')?.detail ?? 'community floor passed'}, developer exited`,
+    ],
+    bearish: catalysts.bearish.filter((b) => !DEV_EXIT_CATALYST.test(b)),
+    ctoNeutralised: neutralised,
+  };
+}
 
 /**
  * Mandatory security + insider requirements, shared by BOTH insider tiers.
@@ -379,10 +643,18 @@ export function evaluateInsiderRequirements({ audit, security, clusters, thresho
  * Sort a qualifying token into a holding style.
  *
  * Precedence, highest first:
- *   1. 💎 ESTABLISHED INSIDER GEM   insider + $1M-$10M+ + deep liquidity + 1k holders
- *   2. ⚡ EARLY-STAGE INSIDER SCALP  insider + $30k-$500k
- *   3. 💎 ESTABLISHED GEM            mature and deep, no insider requirement
- *   4. ⚡ FAST MOMENTUM SCALP        young and mid-cap
+ *   1. 🚀 COMMUNITY TAKEOVER GEM     all four CTO criteria met
+ *   2. 💎 ESTABLISHED INSIDER GEM   insider + $1M-$10M+ + deep liquidity + 1k holders
+ *   3. ⚡ EARLY-STAGE INSIDER SCALP  insider + $30k-$500k
+ *   4. 💎 ESTABLISHED GEM            mature and deep, no insider requirement
+ *   5. ⚡ FAST MOMENTUM SCALP        young and mid-cap
+ *
+ * CTO leads because it is the most specific and the rarest of the patterns, and
+ * because it changes the risk profile rather than just the size band: there is
+ * no developer left to build OR to rug. A CTO that ALSO carries insider buying
+ * keeps its CTO label — the insider roster still renders inside the alert, so
+ * nothing is hidden by the ordering, and unlike the insider tiers CTO does not
+ * require cluster activity at all.
  *
  * The insider tiers are tested FIRST and legitimately overlap the plain ones: a
  * mature $400k token with cluster activity becomes an EARLY-STAGE INSIDER SCALP
@@ -399,7 +671,7 @@ export function evaluateInsiderRequirements({ audit, security, clusters, thresho
  * profit quickly, which stays sound even if the token turns out older than
  * assumed, so it tolerates an unproven age.
  */
-export function classifySignal({ demand, security, config, clusters = null, audit = null }) {
+export function classifySignal({ demand, security, config, clusters = null, audit = null, cto = null }) {
   const g = config.signalCategories?.gem ?? {};
   const s = config.signalCategories?.scalp ?? {};
   const holders = security?.ok ? security.totalHolders : null;
@@ -407,6 +679,23 @@ export function classifySignal({ demand, security, config, clusters = null, audi
   const mcap = demand.marketCap ?? 0;
   const liq = demand.liquidityUsd ?? 0;
   const age = demand.ageHours;
+
+  if (cto?.detected) {
+    const c = config.signalCategories?.communityTakeover ?? {};
+    return {
+      category: SIGNAL_CATEGORY.CTO,
+      label: c.label ?? '🚀 COMMUNITY TAKEOVER GEM',
+      advice:
+        c.advice ??
+        '🚀 Community takeover — the developer has exited and the crowd is driving. No dev to rug, and no dev to build.',
+      alertHeader: c.alertHeader ?? '🚀 COMMUNITY TAKEOVER (CTO) ALERT 🚀',
+      scoreBoost: cto.scoreBoost ?? c.scoreBoost ?? 20,
+      cto: true,
+      insiderCount: clusters?.insiderCount ?? 0,
+      checks: Object.fromEntries(cto.checks.map((r) => [r.label, r.passed])),
+      ctoChecks: cto.checks,
+    };
+  }
 
   const insiderTier = classifyInsiderTier({
     demand,
@@ -737,9 +1026,19 @@ export function scoreToken({
   // exitable as 15% would. Size your exit to the pool, not the market cap.
   // Scoped to INSIDER_ESTABLISHED deliberately — every other token, including
   // the early insider tier, still faces the full ratio floor.
+  //
+  // COMMUNITY TAKEOVER shares this path for the same structural reason: a CTO
+  // is by definition a token whose market cap ran away from its original pool
+  // ($RAVECAT: 2.9% ratio on a real $218k pool). The absolute floor is the SAME
+  // $100k, deliberately NOT the $30k CTO liquidity criterion — meeting the
+  // criteria makes a token a CTO, it does not make a $30k pool exitable.
   const absoluteDepthFloor = thresholds.minAbsoluteLiquidityUsd ?? 100_000;
+  const depthWaiverCategories = new Set([
+    SIGNAL_CATEGORY.INSIDER_ESTABLISHED,
+    SIGNAL_CATEGORY.CTO,
+  ]);
   const deepPoolWaiver =
-    signalCategory?.category === SIGNAL_CATEGORY.INSIDER_ESTABLISHED &&
+    depthWaiverCategories.has(signalCategory?.category) &&
     (demand.liquidityUsd ?? 0) >= absoluteDepthFloor;
 
   const liquidityGateFailed =

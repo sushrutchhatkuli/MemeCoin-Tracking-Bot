@@ -245,7 +245,9 @@ export function renderNote({
       {
         ...verdictInfo,
         categoryTag:
-          signalCategory?.category === 'ESTABLISHED INSIDER GEM'
+          signalCategory?.category === 'COMMUNITY TAKEOVER GEM'
+            ? 'signal/community-takeover'
+            : signalCategory?.category === 'ESTABLISHED INSIDER GEM'
             ? 'signal/insider-established-gem'
             : signalCategory?.category === 'EARLY-STAGE INSIDER SCALP'
               ? 'signal/insider-early-scalp'

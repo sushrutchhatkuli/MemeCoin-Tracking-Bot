@@ -11,7 +11,26 @@
     "start": "node aegis/index.mjs",
     "scan": "node aegis/index.mjs",
     "watch": "node aegis/index.mjs --watch 12",
+    "loop": "node aegis/loop.mjs",
+    "listen": "node aegis/telegram_listener.mjs",
+    "listen:login": "node aegis/telegram_listener.mjs --login",
+    "listen:channels": "node aegis/telegram_listener.mjs --channels",
+    "test": "node --test aegis/test/",
     "test:telegram": "node aegis/index.mjs --test-telegram"
   },
-  "dependencies": {}
+  "_dependencyNote": [
+    "The scanner itself stays dependency-free and runs on Node built-ins alone.",
+    "`telegram` (GramJS) is required ONLY by telegram_listener.mjs, because",
+    "MTProto is a custom binary protocol with its own crypto — it cannot be",
+    "spoken with fetch. Every other entry point still works with node_modules",
+    "absent, and the listener loads it lazily so a missing install produces an",
+    "instruction rather than a crash.",
+    "",
+    "GramJS is archived upstream. `teleproto` is a largely API-compatible",
+    "maintained fork; loadGramJs() in telegram_listener.mjs is the only place",
+    "the import would need to change."
+  ],
+  "dependencies": {
+    "telegram": "^2.26.22"
+  }
 }

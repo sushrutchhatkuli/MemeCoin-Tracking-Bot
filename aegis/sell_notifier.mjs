@@ -74,7 +74,7 @@ export async function savePositions(store, path = POSITIONS_PATH) {
  * Record a position when a BUY alert goes out. Insider balances are captured
  * here because a baseline taken later would already include any selling.
  */
-export function openPosition(store, { pair, demand, clusters, rpcBalances = {} }) {
+export function openPosition(store, { pair, demand, clusters, rpcBalances = {}, category = null }) {
   const key = `${pair.chainId}:${pair.baseToken.address}`;
   if (store.positions[key]?.status === 'OPEN') return false;
 
@@ -97,10 +97,28 @@ export function openPosition(store, { pair, demand, clusters, rpcBalances = {} }
     peakMarketCap: demand.marketCap ?? 0,
     alertedAt: Date.now(),
     insiders,
+    // The tier the alert was sent under. Stored on the position rather than
+    // looked up later, so a position keeps the stop-loss it was OPENED with
+    // even if the config is retuned underneath it mid-trade.
+    category,
     firedTriggers: [],
     status: 'OPEN',
   };
   return true;
+}
+
+/**
+ * Stop-loss for a position, tightened per category.
+ *
+ * Exists because the early-tier alert text promises a "-15% stop-loss" while
+ * the global floor is 20% — the alert was asking for a tighter stop than the
+ * notifier would actually send. The category is read off the position, so this
+ * resolves the contradiction without changing the stop on any other tier.
+ */
+export function stopLossPctFor(position, cfg) {
+  const byCategory = cfg.stopLossPctByCategory ?? {};
+  const specific = position?.category ? byCategory[position.category] : undefined;
+  return specific ?? cfg.stopLossPct ?? 20;
 }
 
 /* ------------------------------------------------------------------ *
@@ -148,7 +166,7 @@ export function evaluateTriggers(position, currentMcap, insiderStates, cfg) {
 
   const exitPct = cfg.insiderExitPct ?? 40;
   const tpMultiple = cfg.takeProfitMultiple ?? 2;
-  const slPct = cfg.stopLossPct ?? 20;
+  const slPct = stopLossPctFor(position, cfg);
 
   // --- Trigger 1: insider exit -------------------------------------
   if (!fired.has(TRIGGER.INSIDER_EXIT)) {

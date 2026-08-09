@@ -11,7 +11,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { fetchLiveHolderDistribution } from './sources.mjs';
-import { concentrationCapFor, isInsiderCategory } from './audit.mjs';
+import { concentrationCapFor, isAlertableCategory, evaluateSecurityShield } from './audit.mjs';
 import { formatSmartMoneyLine } from './smart_money.mjs';
 
 /* ------------------------------------------------------------------ *
@@ -50,6 +50,12 @@ export async function loadEnv(path) {
     botToken: pick('TELEGRAM_BOT_TOKEN'),
     chatId: pick('TELEGRAM_CHAT_ID'),
     rpcOverride: pick('SOLANA_RPC_URL'),
+    // MTProto credentials for telegram_listener.mjs. Separate from the bot
+    // token because a bot cannot read channels it does not administer — the
+    // listener needs a USER session, which is a far more sensitive credential.
+    tgApiId: pick('TELEGRAM_API_ID'),
+    tgApiHash: pick('TELEGRAM_API_HASH'),
+    tgSession: pick('TELEGRAM_SESSION'),
   };
 }
 
@@ -385,7 +391,39 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney }) {
   ];
 }
 
-export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters }) {
+/**
+ * Community takeover block. Shows the four criteria as measured values rather
+ * than ticks, because "512 holders" and "1,400 holders" are the same tick and
+ * very different tokens.
+ */
+function renderCto(cto) {
+  if (!cto?.detected) return [];
+  const lines = ['', '🚀 <b>COMMUNITY TAKEOVER CONFIRMED:</b>'];
+  for (const c of cto.checks) {
+    lines.push(`• ${esc(c.label)}: ${esc(c.detail)} ✅`);
+  }
+  lines.push(
+    '<i>The developer is gone, so there is nobody to rug — and nobody to build. Community momentum is the whole thesis; if it fades there is no team to carry it.</i>'
+  );
+  return lines;
+}
+
+/** The six mandatory gates, itemised. Only reached on a token that passed. */
+function renderShield(shield) {
+  if (!shield?.checks?.length) return [];
+  const lines = ['', '🛡️ <b>ANTI-RUGPULL SHIELD:</b>'];
+  for (const c of shield.checks) {
+    lines.push(`• ${esc(c.label)}: ${esc(c.detail)} ${c.passed ? '✅' : '❌'}`);
+  }
+  if (shield.ctoDepthWaiver) {
+    lines.push(
+      '<i>Depth cleared on the absolute-dollar floor rather than the 15% ratio — a CTO exemption. Size your exit to the pool, not the market cap.</i>'
+    );
+  }
+  return lines;
+}
+
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds }) {
   const symbol = pair.baseToken?.symbol ?? 'UNKNOWN';
   const address = pair.baseToken.address;
   const usd = (n) =>
@@ -419,8 +457,12 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
       ? ['', `<b>${esc(migration.label)}</b>`, `<i>${esc(migration.detail)}</i>`]
       : []),
     ...(signalCategory?.advice ? ['', `<b>${esc(signalCategory.advice)}</b>`] : []),
+    ...renderCto(cto),
     ...renderClusters(clusters),
     ...renderWhales(smartMoney),
+    ...renderShield(
+      evaluateSecurityShield({ security, demand, thresholds: thresholds ?? {}, cto })
+    ),
     '',
     '🔒 <b>SAFETY &amp; DENSITY AUDIT:</b>',
     ...(signalCategory?.insiderRequirements
@@ -429,7 +471,10 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
         ]
       : []),
     `• Holders: ${security?.totalHolders ?? '?'} Wallets (${verdictInfo.holderGate?.passed ? `Passed ${verdictInfo.holderGate.floor}+ Floor ✅` : 'Floor NOT passed ❌'})`,
-    `• Top 10 Concentration: ${security?.top10Pct === null || security?.top10Pct === undefined ? '?' : `${security.top10Pct.toFixed(1)}%`}${reaudit?.ran ? ` (re-checked live: ${reaudit.now?.toFixed(1)}%, cap ${reaudit.cap}% ✅)` : ` (cap ${esc(String(concentrationCapFor(demand?.ageHours ?? null, { maxTop10Pct: 25, maxTop10PctYoung: 20 }).cap))}% ✅)`}`,
+    // Cap read from the live thresholds, not hardcoded. It used to say 25 while
+    // the configured cap was 20, which put two different numbers for the same
+    // limit in one message once the shield block began printing alongside it.
+    `• Top 10 Concentration: ${security?.top10Pct === null || security?.top10Pct === undefined ? '?' : `${security.top10Pct.toFixed(1)}%`}${reaudit?.ran ? ` (re-checked live: ${reaudit.now?.toFixed(1)}%, cap ${reaudit.cap}% ✅)` : ` (cap ${esc(String(concentrationCapFor(demand?.ageHours ?? null, thresholds ?? {}).cap))}% ✅)`}`,
     `• Holder Data: ${security?.distributionSource === 'rpc-live' ? 'live on-chain ✅' : 'cached indexer ⚠️'}${reaudit?.ran ? '' : reaudit?.reason ? ` · re-audit skipped (${esc(String(reaudit.reason).slice(0, 60))})` : ''}`,
     `• Security Status: ${verdictInfo.securityStatus === 'PASSED' ? 'PASSED ALL AUDITS ✅' : esc(verdictInfo.securityStatus ?? '?')}`,
     `• Deployer: ${esc(devLine)}`,
@@ -508,7 +553,8 @@ export function buildDigest({ rows, scanned, noteCount, startedAt, tradeLink }) 
           `liq ${r.liqPct.toFixed(0)}%`,
         ];
         if (r.smartMoney) extras.push(`🐋x${r.smartMoney}`);
-        if (r.category === 'ESTABLISHED INSIDER GEM') extras.push('💎INSIDER-GEM');
+        if (r.category === 'COMMUNITY TAKEOVER GEM') extras.push('🚀CTO');
+        else if (r.category === 'ESTABLISHED INSIDER GEM') extras.push('💎INSIDER-GEM');
         else if (r.category === 'EARLY-STAGE INSIDER SCALP') extras.push('⚡INSIDER-SCALP');
         else if (r.category === 'LONG-TERM GEM') extras.push('💎GEM');
         else if (r.category === 'FAST SCALP') extras.push('⚡SCALP');
@@ -653,7 +699,11 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
   // sitting at WATCH (demand ratio under 2x), and requiring both would filter
   // out most real insider entries — which is the opposite of the intent.
   if (config.telegram.insiderOnly !== false) {
-    if (!result.clusters?.detected) return { status: 'no-insider-activity' };
+    // A community takeover is an independent reason to alert. It has no insider
+    // requirement by design — the pattern is a crowd, not a cabal — so it is
+    // the one thing allowed past the insider-activity gate.
+    const isCto = result.cto?.detected === true;
+    if (!result.clusters?.detected && !isCto) return { status: 'no-insider-activity' };
 
     // ---- Dual insider tier gate -----------------------------------
     //
@@ -668,7 +718,7 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     // not depend on one call site staying correct.
     if (config.telegram.insiderTiersOnly !== false) {
       const category = result.signalCategory?.category;
-      if (!isInsiderCategory(category)) {
+      if (!isAlertableCategory(category)) {
         return {
           status: 'outside-insider-tiers',
           reason:
@@ -677,8 +727,8 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
         };
       }
       const req = result.signalCategory?.insiderRequirements;
-      if (!req?.passed) {
-        return { status: 'blocked-insider-requirements', reason: req?.failures?.[0] ?? 'unknown' };
+      if (req && !req.passed) {
+        return { status: 'blocked-insider-requirements', reason: req.failures?.[0] ?? 'unknown' };
       }
     }
 
@@ -721,6 +771,8 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     signalCategory: result.signalCategory,
     migration: result.migration,
     clusters: result.clusters,
+    cto: result.cto,
+    thresholds: config.thresholds,
   });
 
   const sent = await sendTelegram({ ...credentials, text });

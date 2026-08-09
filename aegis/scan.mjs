@@ -27,6 +27,8 @@ import {
   detectCatalysts,
   scoreToken,
   classifySignal,
+  evaluateCommunityTakeover,
+  applyCtoOverride,
 } from './audit.mjs';
 import { renderNote, noteFilename } from './note.mjs';
 import { loadState, saveState, computeVelocity, recordSnapshot } from './state.mjs';
@@ -331,10 +333,36 @@ async function analyzeToken({
 
   if (clusters?.detected) clusters.scoreBonus = clusterScoreBonus(clusters, config);
 
-  // Classification runs AFTER cluster detection, because the two insider tiers
-  // are defined by it — the plain GEM / SCALP bands never needed that input, so
+  // --- Community takeover -------------------------------------------
+  //
+  // Two-phase on purpose. The three cheap criteria (holders, 1h volume, pool
+  // depth) are evaluated from data already in hand; only if all three pass do
+  // we spend an RPC call reading the creator's live balance. On a normal scan
+  // almost nothing reaches phase two, so the CTO engine is close to free.
+  let cto = evaluateCommunityTakeover({ demand, security, deployer, devExit: null, config });
+  const cheapCriteriaPassed = cto.checks
+    .filter((c) => c.label !== 'Developer exited')
+    .every((c) => c.passed);
+
+  if (cheapCriteriaPassed && pair.chainId === 'solana' && security?.ok && security.creator) {
+    const devExit = await readDevExit({
+      rpcUrl: config.rpcUrl,
+      creator: security.creator,
+      mint: address,
+      totalSupply: security.totalSupply,
+    });
+    cto = evaluateCommunityTakeover({ demand, security, deployer, devExit, config });
+    if (cto.detected) {
+      console.log(
+        `   🚀 Community takeover confirmed for ${pair.baseToken.symbol} — dev holds ${devExit.balancePct?.toFixed(2) ?? '?'}%`
+      );
+    }
+  }
+
+  // Classification runs AFTER cluster and CTO detection, because the tiers are
+  // defined by them — the plain GEM / SCALP bands never needed that input, so
   // this used to sit further up.
-  const signalCategory = classifySignal({ demand, security, config, clusters, audit });
+  const signalCategory = classifySignal({ demand, security, config, clusters, audit, cto });
 
   // Network discovery reuses the funder cache the cluster pass just warmed, so
   // it costs little extra. Gated on a cluster having fired: expanding the net
@@ -364,12 +392,16 @@ async function analyzeToken({
     }
   }
 
-  const catalysts = detectCatalysts(pair, security, demand, velocity, config.thresholds, {
+  const rawCatalysts = detectCatalysts(pair, security, demand, velocity, config.thresholds, {
     smartMoney,
     deployer,
     social,
     blacklistHit,
   });
+  // A confirmed takeover stops being punished for the developer having left —
+  // that is the premise of the pattern, not a warning about it. Every other
+  // bearish signal survives, so the label cannot erase the rest of the risk.
+  const catalysts = applyCtoOverride(rawCatalysts, cto);
   const verdictInfo = scoreToken({
     audit,
     security,
@@ -400,6 +432,32 @@ async function analyzeToken({
     signalCategory,
     migration,
     clusters,
+    cto,
+  };
+}
+
+/**
+ * Read the creator's live token balance as a share of supply.
+ *
+ * Deliberately from chain rather than from the provider's cached
+ * `creatorBalance`: this decides whether a token qualifies as a takeover, and a
+ * stale balance would let a dev who is still holding pass as departed. Returns
+ * balancePct null on any failure — the caller treats unknown as NOT exited.
+ */
+async function readDevExit({ rpcUrl, creator, mint, totalSupply }) {
+  if (!rpcUrl || !creator || !totalSupply) {
+    return { sold: null, balancePct: null, source: 'unavailable' };
+  }
+  const balance = await walletTokenBalance(rpcUrl, creator, mint);
+  if (balance === null) return { sold: null, balancePct: null, source: 'rpc-failed' };
+
+  const balancePct = totalSupply > 0 ? (balance / totalSupply) * 100 : null;
+  return {
+    sold: null, // no sell event is claimed; the balance is the evidence
+    balancePct,
+    balance,
+    creator,
+    source: 'rpc-live',
   };
 }
 
@@ -514,6 +572,13 @@ export async function runScan(args = {}) {
     console.log(`🔎 Deep-dive: ${args.token}`);
     const pair = await fetchSinglePair(args.token);
     if (!pair) {
+      // The listener feeds in addresses scraped from channel text, most of
+      // which are wallets, pools or plain noise. That is the normal case, not
+      // an error, and it must never take the process down — so a programmatic
+      // caller gets an empty result and only the CLI exits non-zero.
+      if (args.fromListener) {
+        return { scanned: 0, written: [], alerts: [], skipped: ['no tradeable pair'] };
+      }
       console.error('❌ No DexScreener pair found for that address.');
       process.exit(1);
     }
@@ -598,7 +663,9 @@ export async function runScan(args = {}) {
           : '';
     const smTag = smartMoney?.detected ? ` 🐋x${smartMoney.count}` : '';
     const catTag =
-      result.signalCategory?.category === 'ESTABLISHED INSIDER GEM'
+      result.signalCategory?.category === 'COMMUNITY TAKEOVER GEM'
+        ? ' 🚀CTO'
+        : result.signalCategory?.category === 'ESTABLISHED INSIDER GEM'
         ? ' 💎INSIDER-GEM'
         : result.signalCategory?.category === 'EARLY-STAGE INSIDER SCALP'
           ? ' ⚡INSIDER-SCALP'
@@ -659,7 +726,13 @@ export async function runScan(args = {}) {
       for (const m of result.clusters?.clusterBuying?.members ?? result.clusters?.watchlisted ?? []) {
         balances[m.wallet] = await walletTokenBalance(config.rpcUrl, m.wallet, pair.baseToken.address);
       }
-      if (openPosition(positions, { pair, demand, clusters: result.clusters, rpcBalances: balances })) {
+      if (openPosition(positions, {
+        pair,
+        demand,
+        clusters: result.clusters,
+        rpcBalances: balances,
+        category: result.signalCategory?.category ?? null,
+      })) {
         console.log(`   📌 Position opened for ${symbol} at ${Math.round(demand.marketCap).toLocaleString('en-US')} — sell triggers armed`);
       }
     } else if (alert.status === 'failed') {

@@ -110,6 +110,17 @@
       "minLpLockedPct": 99,
       "scoreFloor": 68
     },
+    "communityTakeover": {
+      "_note": [
+        "Classification shown for a confirmed CTO. Detection thresholds live in",
+        "the top-level communityTakeover block; this is only the label, advice",
+        "and alert header."
+      ],
+      "label": "🚀 COMMUNITY TAKEOVER GEM",
+      "advice": "🚀 Community takeover — the developer has exited and the crowd is driving. No dev to rug, and no dev to build.",
+      "alertHeader": "🚀 COMMUNITY TAKEOVER (CTO) ALERT 🚀",
+      "scoreBoost": 20
+    },
     "insiderEstablished": {
       "_note": [
         "maxMarketCapUsd is null on purpose: the tier is specified as",
@@ -161,6 +172,40 @@
       "label": "⚡ FAST MOMENTUM SCALP",
       "advice": "⚡ Fast momentum trade — take initial profit at +50% to +100%!"
     }
+  },
+  "communityTakeover": {
+    "_note": [
+      "Community Takeover detection — the $RAVECAT pattern: developer walks",
+      "away, the crowd keeps trading, and the token survives without them.",
+      "",
+      "All four criteria must pass. None is meaningful alone: holders can be",
+      "sybilled, volume can be washed, and a dev can move funds to a second",
+      "wallet and look 'exited'. Together they are decent evidence, and they",
+      "are treated as evidence rather than proof.",
+      "",
+      "maxDevBalancePct is read from chain (the creator's live token balance as",
+      "a share of supply), NOT from a provider flag, and only after the three",
+      "free criteria pass — so the extra RPC call costs nothing on tokens that",
+      "were never candidates. An unreadable balance FAILS the criterion: 'we",
+      "could not find the dev's balance' is not 'the dev has gone'.",
+      "",
+      "WHAT A CONFIRMED CTO OVERRIDES: the dev-exit penalty (creator-sold risk",
+      "flags stop counting, since a departed dev is the premise) and the",
+      "liquidity depth RATIO, replaced by the $100k absolute floor in",
+      "thresholds.minAbsoluteLiquidityUsd.",
+      "",
+      "WHAT IT NEVER OVERRIDES: mint authority, freeze authority, LP burn,",
+      "top-10 concentration, the 150-holder floor, or a SERIAL RUGGER deployer.",
+      "A crowd cannot revoke an authority the developer kept, and 'the",
+      "community took it over' is exactly the story that would be told to",
+      "launder a rugger's token."
+    ],
+    "enabled": true,
+    "minHolders": 500,
+    "minVolume1hUsd": 100000,
+    "minLiquidityUsd": 30000,
+    "maxDevBalancePct": 1,
+    "scoreBoost": 20
   },
   "insiderCluster": {
     "_note": [
@@ -412,6 +457,18 @@
     "insiderExitPct": 40,
     "takeProfitMultiple": 1.5,
     "stopLossPct": 20,
+    "stopLossPctByCategory": {
+      "EARLY-STAGE INSIDER SCALP": 15
+    },
+    "_stopLossByCategoryNote": [
+      "Resolves a contradiction shipped on 2026-08-08: the early-tier advice",
+      "text says 'enforce tight -15% stop-loss' while stopLossPct was a global",
+      "20, so the alert asked for a tighter stop than the notifier would send.",
+      "",
+      "The category is captured on the position when the BUY alert fires, so a",
+      "position keeps the stop it was opened under even if this config changes",
+      "underneath it. Anything not listed here uses stopLossPct."
+    ],
     "maxMonitorHours": 48,
     "_takeProfitNote": [
       "Lowered 2.0 -> 1.5 on 2026-08-08 from measured behaviour, not preference.",
@@ -420,6 +477,41 @@
       "-20%. $NEEGY peaked at +99% — one point short of the 2x trigger.",
       "At 1.5x those same five fire near their highs: 5/10 instead of 0/10."
     ]
+  },
+  "telegramListener": {
+    "_note": [
+      "Channel listener (telegram_listener.mjs). Reads public signal channels",
+      "over MTProto and feeds any Solana mint it sees into the ordinary audit",
+      "pipeline.",
+      "",
+      "SECURITY MODEL: channel text is DATA, never instruction. The listener",
+      "extracts base58 mints with a regex and discards everything else — it",
+      "does not follow links, act on commands, or trust any claim a channel",
+      "makes about a token. Every address goes through the same audit, shield",
+      "and insider pipeline as a discovered one, so a channel posting a rug",
+      "gets the rug verdict, not an alert.",
+      "",
+      "requiresLogin: MTProto needs a USER session, not a bot token — bots",
+      "cannot read channels they do not administer. Run 'node",
+      "telegram_listener.mjs --login' yourself to produce a session string;",
+      "it asks for your phone, an SMS code and your 2FA password. Nobody else",
+      "should ever run that for you, and the session string it prints grants",
+      "full access to your Telegram account — treat it like a password.",
+      "",
+      "channels: @usernames, t.me links or numeric ids. An empty list means",
+      "the listener watches every chat the session can see, which is noisy;",
+      "name the channels you actually want."
+    ],
+    "enabled": true,
+    "channels": [
+      "Soul Sniper",
+      "Whale Trending",
+      "Solana Early Trending"
+    ],
+    "minSecondsBetweenScans": 4,
+    "dedupeWindowMinutes": 90,
+    "maxQueueLength": 40,
+    "auditOnSight": true
   },
   "realtime": {
     "_note": [
