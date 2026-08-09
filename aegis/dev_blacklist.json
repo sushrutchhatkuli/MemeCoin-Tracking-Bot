@@ -2632,6 +2632,12 @@
       "reason": "Post-mortem: $BARKS fell -99% within 1.06h",
       "added": "2026-08-09",
       "source": "post-mortem"
+    },
+    {
+      "address": "AXA94SXX7gQ6mAKX7d2nkQqCmJGja3cgaaneao1CvgZH",
+      "reason": "Post-mortem: $MONKE fell -85.5% within 3.12h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
     }
   ],
   "mints": [
