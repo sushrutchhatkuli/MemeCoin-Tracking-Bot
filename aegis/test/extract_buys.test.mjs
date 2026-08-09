@@ -34,7 +34,9 @@ import {
   SIGNAL_CATEGORY,
 } from '../audit.mjs';
 import { alertHeaderLines } from '../telegram.mjs';
-import { stopLossPctFor } from '../sell_notifier.mjs';
+import { stopLossPctFor, armedTrailingLock, evaluateTriggers, TRIGGER } from '../sell_notifier.mjs';
+import { walletScorecard } from '../wallet_observations.mjs';
+import { detectJitoBundles } from '../insider_cluster.mjs';
 import { capEnrichmentShortlist } from '../auto_top_whales.mjs';
 import { extractMints, channelMatches, SeenCache } from '../telegram_listener.mjs';
 
@@ -889,6 +891,224 @@ test('the early insider tier gets the -15% stop its own alert text promises', ()
   assert.equal(stopLossPctFor({ category: 'COMMUNITY TAKEOVER GEM' }, cfg), 20);
   assert.equal(stopLossPctFor({}, cfg), 20, 'positions opened before this existed');
   assert.equal(stopLossPctFor({ category: 'X' }, {}), 20, 'default with no config');
+});
+
+/* ------------------------------------------------------------------ *
+ * Dynamic trailing profit lock
+ * ------------------------------------------------------------------ */
+
+const trailCfg = {
+  stopLossPct: 20,
+  takeProfitMultiple: 1.5,
+  insiderExitPct: 40,
+  trailingStop: {
+    enabled: true,
+    tiers: [
+      { peakGainPct: 50, lockGainPct: 20 },
+      { peakGainPct: 100, lockGainPct: 60 },
+    ],
+  },
+};
+const position = (peakMult, over = {}) => ({
+  entryMarketCap: 100_000,
+  peakMarketCap: 100_000 * peakMult,
+  firedTriggers: [],
+  insiders: [],
+  ...over,
+});
+
+test('the trailing lock arms at +50% and ratchets at +100%', () => {
+  assert.equal(armedTrailingLock(position(1.4), trailCfg), null, 'below the first tier');
+  assert.equal(armedTrailingLock(position(1.5), trailCfg).lockGainPct, 20);
+  assert.equal(armedTrailingLock(position(1.99), trailCfg).lockGainPct, 20);
+  assert.equal(armedTrailingLock(position(2.0), trailCfg).lockGainPct, 60);
+  assert.equal(armedTrailingLock(position(5.0), trailCfg).lockGainPct, 60, 'highest tier holds');
+});
+
+test('the armed level is derived from the peak, so it can never walk back down', () => {
+  // The ratchet is structural: peakMarketCap only rises, so the lock only
+  // rises. No stored state to migrate, and a restart cannot lose it.
+  const p = position(2.5);
+  assert.equal(armedTrailingLock(p, trailCfg).lockGainPct, 60);
+  p.peakMarketCap = 300_000; // peak never falls in practice, but assert anyway
+  assert.equal(armedTrailingLock(p, trailCfg).lockGainPct, 60);
+});
+
+test('falling through the armed floor fires TRAILING_PROFIT_LOCKED and closes', () => {
+  const p = position(1.8); // peaked +80% -> +20% floor armed
+  const above = evaluateTriggers(p, 130_000, [], trailCfg);
+  assert.equal(above.find((t) => t.trigger === TRIGGER.TRAILING_LOCK), undefined, '+30% is above the floor');
+
+  const through = evaluateTriggers(p, 118_000, [], trailCfg);
+  const fired = through.find((t) => t.trigger === TRIGGER.TRAILING_LOCK);
+  assert.ok(fired, 'fires at +18%, below the +20% floor');
+  assert.match(fired.headline, /TRAILING PROFIT LOCKED/);
+  assert.equal(fired.closes, true);
+  assert.match(fired.reason, /Peaked at \+80%/);
+});
+
+test('an armed trailing lock suppresses the fixed stop-loss', () => {
+  // Both would otherwise fire on a hard reversal, sending two alerts for one
+  // exit — the second reporting a loss on a trade that closed in profit.
+  const p = position(2.2); // +60% floor armed
+  const out = evaluateTriggers(p, 70_000, [], trailCfg); // -30%, through both
+  assert.equal(out.filter((t) => t.trigger === TRIGGER.STOP_LOSS).length, 0);
+  assert.equal(out.filter((t) => t.trigger === TRIGGER.TRAILING_LOCK).length, 1);
+});
+
+test('a position that never ran keeps the ordinary stop-loss', () => {
+  const p = position(1.1);
+  const out = evaluateTriggers(p, 75_000, [], trailCfg);
+  assert.ok(out.find((t) => t.trigger === TRIGGER.STOP_LOSS), 'no lock armed, stop-loss applies');
+  assert.equal(out.find((t) => t.trigger === TRIGGER.TRAILING_LOCK), undefined);
+});
+
+test('a delisted pair still reports even with a lock armed', () => {
+  // Liquidity being pulled is not a profitable exit and must never be
+  // suppressed by the trailing logic.
+  const p = position(2.5);
+  const out = evaluateTriggers(p, null, [], trailCfg);
+  const sl = out.find((t) => t.trigger === TRIGGER.STOP_LOSS);
+  assert.ok(sl);
+  assert.match(sl.headline, /DELISTED/);
+});
+
+test('a gap straight through the floor reads as a signed loss, not "+-30%"', () => {
+  const p = position(2.2);
+  const fired = evaluateTriggers(p, 70_000, [], trailCfg).find((t) => t.trigger === TRIGGER.TRAILING_LOCK);
+  assert.match(fired.reason, /fell back to -30%/);
+  assert.doesNotMatch(fired.reason, /\+-/);
+  assert.match(fired.action, /no longer a profitable exit/);
+});
+
+test('the trailing lock fires at most once per position', () => {
+  const p = position(1.8, { firedTriggers: [TRIGGER.TRAILING_LOCK] });
+  const out = evaluateTriggers(p, 110_000, [], trailCfg);
+  assert.equal(out.find((t) => t.trigger === TRIGGER.TRAILING_LOCK), undefined);
+});
+
+test('trailing can be disabled entirely', () => {
+  const off = { ...trailCfg, trailingStop: { enabled: false } };
+  assert.equal(armedTrailingLock(position(3), off), null);
+  const out = evaluateTriggers(position(3), 70_000, [], off);
+  assert.ok(out.find((t) => t.trigger === TRIGGER.STOP_LOSS), 'falls back to the fixed stop');
+});
+
+/* ------------------------------------------------------------------ *
+ * Insider scorecard
+ * ------------------------------------------------------------------ */
+
+const DAY = 86_400_000;
+const NOW = Date.UTC(2026, 7, 9);
+const buy = (daysAgo, outcome, changePct = null, solSpent = 1) => ({
+  token: `T${daysAgo}${outcome}`, ts: NOW - daysAgo * DAY, outcome, changePct, solSpent,
+});
+
+test('the scorecard counts only buys inside the rolling window', () => {
+  const entry = {
+    buys: [
+      buy(2, 'WIN', 100), buy(10, 'WIN', 50), buy(20, 'FAIL', -80),
+      buy(45, 'WIN', 900), // outside 30d — must not inflate the win rate
+    ],
+  };
+  const sc = walletScorecard(entry, { solUsd: 100, windowDays: 30, now: NOW });
+  assert.equal(sc.gradedBuys, 3);
+  assert.equal(sc.wins, 2);
+  assert.equal(Math.round(sc.winRatePct), 67);
+});
+
+test('NEUTRAL and ungraded buys are excluded from the win rate', () => {
+  const entry = { buys: [buy(1, 'WIN', 10), buy(2, 'NEUTRAL', 0), buy(3, null, null)] };
+  const sc = walletScorecard(entry, { solUsd: 100, now: NOW });
+  assert.equal(sc.gradedBuys, 1);
+  assert.equal(sc.winRatePct, 100);
+  assert.equal(sc.observedBuys, 3, 'still reported as observed');
+});
+
+test('profit is estimated from priced buys and is null when none are priced', () => {
+  const priced = walletScorecard({ buys: [buy(1, 'WIN', 100, 2)] }, { solUsd: 50, now: NOW });
+  assert.equal(Math.round(priced.estimatedProfitUsd), 100, '2 SOL x $50 x +100%');
+
+  const unpriced = walletScorecard({ buys: [buy(1, 'WIN', null, null)] }, { solUsd: 50, now: NOW });
+  assert.equal(unpriced.estimatedProfitUsd, null, 'never zero — unknown is not break-even');
+});
+
+test('holding duration is reported as unavailable, never guessed', () => {
+  // Nothing in the pipeline records an exit, so this cannot be computed. The
+  // flag exists so no caller can mistake a missing field for zero hours.
+  const sc = walletScorecard({ buys: [buy(1, 'WIN', 10)] }, { solUsd: 50, now: NOW });
+  assert.equal(sc.holdingDurationHours, null);
+  assert.equal(sc.holdingDurationAvailable, false);
+  assert.ok(sc.trackedForHours > 0, 'time on radar is measurable and is a different thing');
+});
+
+test('a wallet with no history yields a null win rate rather than 0%', () => {
+  const sc = walletScorecard({ buys: [] }, { solUsd: 50, now: NOW });
+  assert.equal(sc.winRatePct, null, '0% would read as "always loses"');
+  assert.equal(sc.gradedBuys, 0);
+});
+
+/* ------------------------------------------------------------------ *
+ * Jito / same-slot bundle tracer
+ * ------------------------------------------------------------------ */
+
+const slotBuyer = (i, slot, secondsAfterLaunch = 5) => ({
+  wallet: `Buyer${String(i).padStart(3, '0')}xxxxxxxxxxxxxxxxxxxxxxxxxxx`,
+  slot, secondsAfterLaunch, signature: `sig${i}`, solSpent: 1,
+});
+
+test('3+ wallets in one slot is a bundle; 2 is not', () => {
+  const three = [slotBuyer(1, 500), slotBuyer(2, 500), slotBuyer(3, 500), slotBuyer(4, 900)];
+  const r = detectJitoBundles(three, { minBundleWallets: 3 }, { confirm: false });
+  return r.then((res) => {
+    assert.equal(res.detected, true);
+    assert.equal(res.size, 3);
+    assert.equal(res.slot, 500);
+    assert.equal(res.confirmed, false, 'unconfirmed without the API');
+    assert.match(res.label, /SAME-SLOT/);
+  });
+});
+
+test('two wallets in a slot do not qualify', async () => {
+  const r = await detectJitoBundles(
+    [slotBuyer(1, 500), slotBuyer(2, 500), slotBuyer(3, 900)],
+    { minBundleWallets: 3 },
+    { confirm: false }
+  );
+  assert.equal(r.detected, false);
+});
+
+test('one wallet with several legs in a slot is one participant, not three', async () => {
+  // Otherwise a single busy trader manufactures a "three-wallet cabal".
+  const same = slotBuyer(1, 500);
+  const r = await detectJitoBundles(
+    [same, { ...same }, { ...same }, slotBuyer(2, 500)],
+    { minBundleWallets: 3 },
+    { confirm: false }
+  );
+  assert.equal(r.detected, false, 'two distinct wallets after de-duplication');
+});
+
+test('buyers without a slot are ignored rather than grouped together', async () => {
+  const r = await detectJitoBundles(
+    [slotBuyer(1, null), slotBuyer(2, null), slotBuyer(3, null)],
+    { minBundleWallets: 3 },
+    { confirm: false }
+  );
+  assert.equal(r.detected, false, 'null slots must not collide into one group');
+});
+
+test('the launch window excludes late same-slot buyers', async () => {
+  const late = [slotBuyer(1, 500, 4000), slotBuyer(2, 500, 4000), slotBuyer(3, 500, 4000)];
+  assert.equal(
+    (await detectJitoBundles(late, { minBundleWallets: 3, bundleLaunchWindowSeconds: 300 }, { confirm: false })).detected,
+    false
+  );
+  const early = late.map((b) => ({ ...b, secondsAfterLaunch: 12 }));
+  assert.equal(
+    (await detectJitoBundles(early, { minBundleWallets: 3, bundleLaunchWindowSeconds: 300 }, { confirm: false })).detected,
+    true
+  );
 });
 
 /* ------------------------------------------------------------------ *

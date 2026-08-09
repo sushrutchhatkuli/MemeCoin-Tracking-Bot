@@ -439,7 +439,16 @@ export async function fetchRecentBuyers({ rpcUrl, poolAddress, mint, cfg, screen
 
     for (const b of extractBuys(tx.result, { mint, poolAddress })) {
       const existing = buyers.get(b.wallet);
-      const entry = { ...b, blockTime: sig.blockTime ?? 0, signature: sig.signature };
+      // `slot` rides along for the bundle tracer: transactions in one Jito
+      // bundle land in the same slot, so the slot is the on-chain fingerprint
+      // of atomic co-execution. It costs nothing — getSignaturesForAddress
+      // already returns it in the same response.
+      const entry = {
+        ...b,
+        blockTime: sig.blockTime ?? 0,
+        slot: sig.slot ?? null,
+        signature: sig.signature,
+      };
       // Keep the EARLIEST buy per wallet — entry timing is the interesting fact.
       if (!existing || entry.blockTime < existing.blockTime) buyers.set(b.wallet, entry);
     }

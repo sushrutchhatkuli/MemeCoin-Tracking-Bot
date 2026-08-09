@@ -320,6 +320,38 @@
       "reach 90 on insider count alone — four wallets buying something illiquid",
       "is a reason to look, not a reason to override the market data."
     ],
+    "_jitoBundleNote": [
+      "PILLAR 4 — same-slot co-execution, the on-chain fingerprint of a Jito",
+      "bundle. Transactions in one bundle execute atomically and land in the",
+      "same slot; standard RPC exposes the slot but NOT a bundle id, so the",
+      "slot match is the strongest thing derivable without a second provider.",
+      "",
+      "It is genuinely strong: a Solana slot is ~400ms, and several fresh",
+      "wallets independently choosing to buy a minutes-old token inside the",
+      "same 400ms is not plausible coincidence. It is not conclusive — a busy",
+      "slot on a hot launch can hold unrelated buyers — which is why the",
+      "threshold is 3 wallets rather than 2, and why the boost is forfeited on",
+      "any safety-gate failure like every other multiplier.",
+      "",
+      "confirmViaJitoApi upgrades 'same slot' to 'confirmed bundle' by asking",
+      "bundles.jito.wtf which bundle a signature belongs to. That endpoint is",
+      "live and answers with structured JSON, but it is a third party outside",
+      "this pipeline, so it is best-effort: a timeout or an error downgrades",
+      "the result to 'same slot, unconfirmed' instead of discarding it. Costs",
+      "up to maxBundleLookups HTTP calls, and only on tokens that already have",
+      "a slot match.",
+      "",
+      "Unlike the funder trace, slot analysis runs on EVERY buyer rather than",
+      "being gated behind a watchlist hit — a bundle of three fresh wallets is",
+      "precisely the case where none of them is watchlisted yet, so gating it",
+      "would blind the tracer to the cabals it exists to catch. It needs no",
+      "extra RPC: the slot arrives with the signature listing."
+    ],
+    "minBundleWallets": 3,
+    "bundleScoreBonus": 25,
+    "bundleLaunchWindowSeconds": 300,
+    "confirmViaJitoApi": true,
+    "maxBundleLookups": 4,
     "insiderScaleTiers": {
       "1": 15,
       "2": 25,
@@ -475,6 +507,26 @@
       "insider-detected token regardless of band, or widen insiderEarly's",
       "maxMarketCapUsd to 1000000 to close the upper gap."
     ],
+    "scorecardWindowDays": 30,
+    "_scorecardNote": [
+      "Rolling window for the per-insider scorecard shown in BUY alerts.",
+      "",
+      "WHAT IT CAN AND CANNOT SHOW. The win rate is real but is computed over",
+      "AEGIS-OBSERVED buys only — the tokens this scanner happened to scan —",
+      "not the wallet's market-wide record, and the sample skews optimistic",
+      "because buyer replay reads tokens with a live pool. Profit is ESTIMATED",
+      "(spend x later price change, assuming the wallet still holds); Aegis",
+      "never observes exits, so realized P&L is not derivable.",
+      "",
+      "AVERAGE HOLDING DURATION IS NOT SHOWN. Nothing in the pipeline records",
+      "an exit timestamp, so it cannot be computed. It is omitted rather than",
+      "approximated, because a plausible number there would be invented.",
+      "",
+      "Real 30-day win rate, realized P&L and holding time are what GMGN and",
+      "Birdeye sell, and both are gated (403 Cloudflare / 401 without a paid",
+      "key) — verified repeatedly, see the networkDiscovery notes. The alert",
+      "links out to them for exactly this reason."
+    ],
     "insiderMinScore": 68,
     "_insiderMinScoreNote": [
       "Set to 68 on 2026-08-08 after measuring against the overnight run.",
@@ -551,6 +603,36 @@
     "stopLossPct": 20,
     "stopLossPctByCategory": {
       "EARLY-STAGE INSIDER SCALP": 15
+    },
+    "trailingStop": {
+      "_note": [
+        "Tiered trailing profit lock. Once a position's PEAK clears a tier, the",
+        "exit floor rises to that tier's lockGainPct, expressed as a percentage",
+        "above the alert market cap.",
+        "",
+        "  peak +50%  -> floor +20%",
+        "  peak +100% -> floor +60%",
+        "",
+        "The armed level is derived from peakMarketCap on every check rather",
+        "than stored, so the ratchet is free: the peak only rises, so the floor",
+        "can only rise. No migration onto existing positions, and no way for a",
+        "restart or a mid-trade config edit to walk a lock back down.",
+        "",
+        "An armed trailing lock SUPPRESSES the fixed stop-loss, because the lock",
+        "sits above entry and the fixed stop below it — firing both would send",
+        "two alerts for one exit, the second reporting a loss on a trade that",
+        "closed in profit. A DELISTED pair is the exception and still reports",
+        "through the stop-loss: liquidity being pulled is not a profitable exit.",
+        "",
+        "This is measurement of the token, not of your position. Aegis does not",
+        "know your fill, so '+20% locked' means the market cap is 20% above",
+        "where the alert fired, not that you made 20%."
+      ],
+      "enabled": true,
+      "tiers": [
+        { "peakGainPct": 50, "lockGainPct": 20 },
+        { "peakGainPct": 100, "lockGainPct": 60 }
+      ]
     },
     "_stopLossByCategoryNote": [
       "Resolves a contradiction shipped on 2026-08-08: the early-tier advice",

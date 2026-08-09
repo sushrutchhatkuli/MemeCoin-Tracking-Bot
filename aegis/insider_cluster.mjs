@@ -111,6 +111,122 @@ export async function traceFunder(wallet, rpcUrl, cache = {}, cfg = {}) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Jito bundle / same-slot co-execution
+ * ------------------------------------------------------------------ */
+
+/**
+ * Detect wallets that bought in the SAME SLOT — the on-chain fingerprint of a
+ * Jito bundle.
+ *
+ * ── WHAT A SLOT MATCH DOES AND DOES NOT PROVE ───────────────────────────────
+ * A Jito bundle is a set of transactions submitted for atomic, ordered
+ * execution, and they land together in one slot. Standard RPC exposes the slot
+ * but NOT a bundle id, so same-slot co-buying is the strongest thing derivable
+ * without a second provider — and it is genuinely strong: a Solana slot is
+ * ~400ms, and several fresh wallets independently choosing to buy a
+ * minutes-old token inside the same 400ms is not plausible coincidence.
+ *
+ * It is not conclusive on its own. A busy slot on a hot launch can contain
+ * unrelated buyers who happened to land together, which is exactly why the
+ * threshold is 3+ wallets and not 2, and why the boost is gated on the audit
+ * passing like every other multiplier.
+ *
+ * `confirmBundles` upgrades a slot match to a CONFIRMED bundle by asking Jito's
+ * public bundle API which bundle a signature belongs to. That endpoint is live
+ * (it answers with structured JSON, 404 + {"error":"Bundle not found"} for an
+ * unbundled signature), but it is a third-party service outside this pipeline's
+ * control, so it is best-effort: a failure or a timeout downgrades the result
+ * to "same slot, unconfirmed" rather than discarding it.
+ */
+const JITO_BUNDLE_API = 'https://bundles.jito.wtf/api/v1/bundles/transaction';
+
+async function fetchBundleId(signature, timeoutMs = 8000) {
+  try {
+    const res = await fetch(`${JITO_BUNDLE_API}/${signature}`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return null;
+    const body = await res.json().catch(() => null);
+    // The shape has moved around between Jito revisions; accept the documented
+    // variants rather than pinning to one and silently reading undefined.
+    const row = Array.isArray(body) ? body[0] : body;
+    return row?.bundle_id ?? row?.bundleId ?? row?.bundle?.bundle_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function detectJitoBundles(annotated, cfg = {}, { confirm = true } = {}) {
+  const minWallets = cfg.minBundleWallets ?? 3;
+  const launchWindowSec = cfg.bundleLaunchWindowSeconds ?? null;
+
+  const eligible = annotated.filter(
+    (a) =>
+      a.slot !== null &&
+      a.slot !== undefined &&
+      (launchWindowSec === null ||
+        a.secondsAfterLaunch === null ||
+        a.secondsAfterLaunch === undefined ||
+        a.secondsAfterLaunch <= launchWindowSec)
+  );
+  if (eligible.length < minWallets) return { detected: false, groups: [] };
+
+  const bySlot = new Map();
+  for (const a of eligible) {
+    if (!bySlot.has(a.slot)) bySlot.set(a.slot, []);
+    bySlot.get(a.slot).push(a);
+  }
+
+  // De-duplicate by wallet inside a slot: one wallet with two legs in the same
+  // slot is one participant, not two, and counting legs would manufacture a
+  // three-wallet "cabal" out of a single busy trader.
+  const groups = [...bySlot.entries()]
+    .map(([slot, members]) => {
+      const unique = [...new Map(members.map((m) => [m.wallet, m])).values()];
+      return { slot, members: unique, size: unique.length };
+    })
+    .filter((g) => g.size >= minWallets)
+    .sort((a, b) => b.size - a.size || a.slot - b.slot);
+
+  if (!groups.length) return { detected: false, groups: [] };
+
+  // Best-effort Jito confirmation on the largest group only — one API call per
+  // wallet, and the marginal value of confirming a second group is low.
+  let bundleId = null;
+  let confirmed = false;
+  if (confirm && cfg.confirmViaJitoApi !== false) {
+    const ids = new Map();
+    for (const m of groups[0].members.slice(0, cfg.maxBundleLookups ?? 4)) {
+      if (!m.signature) continue;
+      const id = await fetchBundleId(m.signature);
+      if (id) ids.set(id, (ids.get(id) ?? 0) + 1);
+    }
+    for (const [id, count] of ids) {
+      if (count >= minWallets) {
+        bundleId = id;
+        confirmed = true;
+        break;
+      }
+    }
+  }
+
+  const lead = groups[0];
+  return {
+    detected: true,
+    confirmed,
+    bundleId,
+    slot: lead.slot,
+    size: lead.size,
+    groups,
+    scoreBonus: cfg.bundleScoreBonus ?? 25,
+    label: confirmed ? 'JITO BUNDLE CONFIRMED' : 'SAME-SLOT CO-EXECUTION',
+    detail: confirmed
+      ? `${lead.size} wallets in Jito bundle ${String(bundleId).slice(0, 12)}… (slot ${lead.slot})`
+      : `${lead.size} wallets executed in the same slot (${lead.slot}) — bundle id not confirmed`,
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Detector
  * ------------------------------------------------------------------ */
 
@@ -159,9 +275,20 @@ export async function detectInsiderClusters({
       usdSpent,
       tokensBought: b.amount,
       blockTime: b.blockTime,
+      slot: b.slot ?? null,
+      signature: b.signature ?? null,
       secondsAfterLaunch,
       entryMarketCapUsd: b.entryMarketCapUsd ?? null,
     };
+  });
+
+  // Slot analysis runs on EVERY buyer, before the watchlist/oversize gate that
+  // guards funder tracing. It needs no extra RPC — the slot arrived with the
+  // signature listing — and a bundle of three fresh wallets is exactly the case
+  // where none of them is watchlisted yet, so gating it would blind the tracer
+  // to the cabals it exists to catch.
+  const jito = await detectJitoBundles(annotated, cfg, {
+    confirm: cfg.confirmViaJitoApi !== false,
   });
 
   // ---- PILLAR 2: non-routine sizing --------------------------------
@@ -189,12 +316,13 @@ export async function detectInsiderClusters({
   const watchlistedBuyers = annotated.filter((a) => a.watchlisted);
   const worthTracing = watchlistedBuyers.length > 0 || oversized.length > 0;
 
-  if (!worthTracing) {
+  if (!worthTracing && !jito.detected) {
     return {
       ...empty,
       buyersSeen: annotated.length,
       oversized,
       watchlisted: [],
+      jito,
       skippedFunderTrace: 'no watchlist match or oversized buy to corroborate',
     };
   }
@@ -260,11 +388,15 @@ export async function detectInsiderClusters({
 
   // Pillar 2 counts on its own: a buy far larger than the pool can absorb is a
   // signal in itself, with or without a cluster around it.
+  // A confirmed same-slot bundle counts on its own, like non-routine size does.
+  // Several fresh wallets executing inside one ~400ms slot is coordination by
+  // construction, whether or not any of them is already on a watchlist.
   const detected =
     Boolean(clusterBuying) ||
     networks.length > 0 ||
     watchlistedAny.length > 0 ||
-    oversized.length > 0;
+    oversized.length > 0 ||
+    jito.detected;
 
   // Single authoritative roster of DISTINCT insider wallets. The three sources
   // overlap heavily — a watchlisted wallet that also bought early and shares a
@@ -276,12 +408,18 @@ export async function detectInsiderClusters({
   for (const n of networks) {
     for (const a of n.members) if (!insiderRoster.has(a.wallet)) insiderRoster.set(a.wallet, a);
   }
+  for (const g of jito.groups ?? []) {
+    for (const a of g.members) if (!insiderRoster.has(a.wallet)) insiderRoster.set(a.wallet, a);
+  }
   const uniqueInsiders = [...insiderRoster.values()].sort(
     (a, b) => (b.solSpent ?? 0) - (a.solSpent ?? 0)
   );
 
   let label = null;
-  if (uniqueInsiders.length >= 4) label = 'CABAL SWARM';
+  // A slot-level bundle outranks the count-based labels: it is the most
+  // specific structural claim the tracer can make about how the buys happened.
+  if (jito.detected) label = jito.confirmed ? 'JITO BLOCK #0 CABAL BUNDLE' : 'SAME-SLOT CABAL BUNDLE';
+  else if (uniqueInsiders.length >= 4) label = 'CABAL SWARM';
   else if (clusterBuying && networks.length) label = 'CABAL BUNDLE NETWORK';
   else if (clusterBuying) label = 'INSIDER CLUSTER';
   else if (networks.length) label = 'SHARED FUNDER NETWORK';
@@ -299,6 +437,7 @@ export async function detectInsiderClusters({
     insiderCount: uniqueInsiders.length,
     tracedWallets: traced,
     buyersSeen: annotated.length,
+    jito,
   };
 }
 
@@ -330,6 +469,12 @@ export function clusterScoreBonus(clusters, config) {
   const cfg = config.insiderCluster ?? {};
   const tiers = cfg.insiderScaleTiers ?? { 1: 15, 2: 25, 3: 35, 4: 50 };
 
+  // Same-slot execution is additive to the wallet-count multiplier: "how many
+  // insiders" and "did they execute atomically" are different facts, and a
+  // bundle is the stronger of the two. Clamped by the caller along with every
+  // other bonus.
+  const bundleBonus = clusters.jito?.detected ? (cfg.bundleScoreBonus ?? 25) : 0;
+
   const count = clusters.insiderCount ?? 0;
   if (count >= 1) {
     const keys = Object.keys(tiers)
@@ -337,13 +482,13 @@ export function clusterScoreBonus(clusters, config) {
       .sort((a, b) => a - b);
     let bonus = 0;
     for (const k of keys) if (count >= k) bonus = tiers[k];
-    return bonus;
+    return bonus + bundleBonus;
   }
 
   // No identified insider wallets, but a non-routine buy size still counts —
   // it is Pillar 2 standing alone.
-  if (clusters.oversized?.length) return cfg.bonusOversized ?? 5;
-  return 0;
+  if (clusters.oversized?.length) return (cfg.bonusOversized ?? 5) + bundleBonus;
+  return bundleBonus;
 }
 
 /** Human-readable tier name for the alert header. */

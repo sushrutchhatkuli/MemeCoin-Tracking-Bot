@@ -212,6 +212,54 @@ export function buildSellMessage({
 }
 
 /**
+ * Rolling scorecard for one insider wallet.
+ *
+ * Every number is labelled with where it came from, because the honest version
+ * of this block is much weaker than the one that was asked for and the gap
+ * matters when money is on it:
+ *
+ *   WIN RATE   real, but over AEGIS-OBSERVED buys only — the tokens this
+ *              scanner happened to scan, not the wallet's market-wide record.
+ *              The sample skews optimistic: buyer replay reads tokens with a
+ *              live pool, so survivors are over-represented.
+ *   PROFIT     ESTIMATED, not realized. Spend x later price change, which
+ *              assumes the wallet still holds. Aegis never sees exits.
+ *   DURATION   omitted. There is no exit timestamp anywhere in the pipeline,
+ *              so an average holding time cannot be computed — and a
+ *              plausible-looking number in its place would be fabricated.
+ *
+ * The GMGN and Birdeye links below the roster are where the real figures live;
+ * both are gated (403/401), which is why they are links and not numbers.
+ */
+function scorecardLines(sc) {
+  if (!sc) return ['   ↳ <i>no observation history for this wallet yet</i>'];
+  if (!sc.gradedBuys) {
+    return [
+      `   ↳ <i>${sc.observedBuys} buy(s) seen in ${sc.windowDays}d, none graded yet — no win rate available</i>`,
+    ];
+  }
+
+  const bits = [
+    `${sc.winRatePct.toFixed(0)}% win rate (${sc.wins}/${sc.gradedBuys} graded)`,
+    sc.estimatedProfitUsd !== null
+      ? `~${sc.estimatedProfitUsd >= 0 ? '+' : '-'}$${Math.abs(Math.round(sc.estimatedProfitUsd)).toLocaleString('en-US')} est.`
+      : 'P&amp;L not estimable',
+  ];
+  if (sc.trackedForHours !== null) {
+    bits.push(
+      sc.trackedForHours >= 48
+        ? `tracked ${Math.round(sc.trackedForHours / 24)}d`
+        : `tracked ${Math.round(sc.trackedForHours)}h`
+    );
+  }
+
+  return [
+    `   ↳ <b>${sc.windowDays}d scorecard:</b> ${esc(bits.join(' · '))}`,
+    '   ↳ <i>Aegis-observed only, profit estimated (exits are never seen), holding time not measurable — tap GMGN/Birdeye for the real record.</i>',
+  ];
+}
+
+/**
  * Insider cluster block. Only ever reached on a token that cleared every safety
  * gate — coordinated buying of a rug is still a rug, so this never appears on a
  * blocked token.
@@ -235,7 +283,17 @@ function renderClusters(clusters) {
   if (clusters.clusterBuying) bits.push(`${clusters.clusterBuying.size} wallets in launch window`);
   if (clusters.networks.length) bits.push('same funder network');
   if (clusters.oversized.length) bits.push(`${clusters.oversized.length} oversized buy(s)`);
+  if (clusters.jito?.detected) bits.push(`${clusters.jito.size} wallets in one slot`);
   if (bits.length) lines.push(`• Signals: ${esc(bits.join(' + '))} ✅`);
+
+  if (clusters.jito?.detected) {
+    lines.push(`• 📦 <b>Bundle:</b> ${esc(clusters.jito.detail)}`);
+    lines.push(
+      clusters.jito.confirmed
+        ? '<i>Confirmed against Jito’s bundle API — these buys were submitted for atomic execution together.</i>'
+        : '<i>Same-slot execution (~400ms window). Jito could not confirm a bundle id, so this is a strong structural tell rather than proof of one bundle.</i>'
+    );
+  }
 
   // The deduplicated roster, largest spend first. Falls back to the older lists
   // if an upstream caller has not populated it.
@@ -260,6 +318,7 @@ function renderClusters(clusters) {
       `• <b>Insider #${i + 1}</b> (${esc(m.short)}): ${esc(spend + mc + timing)} | ` +
         `🔗 <a href="${esc(m.solscan)}">Solscan</a>`
     );
+    for (const row of scorecardLines(m.scorecard)) lines.push(row);
   });
 
   for (const n of clusters.networks.slice(0, 2)) {
@@ -377,8 +436,17 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
   const viral =
     megaRunner?.detected && megaRunnerHeader ? [`<b>${esc(megaRunnerHeader)}</b>`] : [];
 
+  // A slot-level bundle leads everything: it is the most specific structural
+  // claim available about HOW the buys happened, and it is the one an operator
+  // most wants to see before deciding whether this is a cabal entry.
+  const bundle = clusters?.jito?.detected
+    ? [
+        `<b>📦 ${esc(clusters.jito.confirmed ? 'JITO BLOCK #0 CABAL BUNDLE DETECTED' : 'SAME-SLOT CABAL BUNDLE DETECTED')} 📦</b>`,
+      ]
+    : [];
+
   if (tierHeader) {
-    const lines = [...viral, `<b>${esc(tierHeader)}</b>`];
+    const lines = [...bundle, ...viral, `<b>${esc(tierHeader)}</b>`];
     if (count >= 4) lines.push(`🔥 <b>CABAL SWARM — ${count} unique insider wallets</b>`);
     else if (count >= 2) lines.push(`🔥 <b>MULTI-INSIDER — ${count} unique wallets</b>`);
     return lines;
@@ -387,6 +455,7 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
   // Fallback chain, unchanged. Reached when telegram.insiderTiersOnly is off
   // and a token alerts from outside both bands, or on a non-insider signal.
   return [
+    ...bundle,
     ...viral,
     count >= 4
       ? '🚀 <b>CABAL SWARM BUY ALERT</b> 🚀'

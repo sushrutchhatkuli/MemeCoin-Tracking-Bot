@@ -65,6 +65,7 @@ import {
   saveObservations,
   recordBuys,
   pruneObservations,
+  walletScorecard,
 } from './wallet_observations.mjs';
 import { loadBlacklist, checkBlacklist } from './blacklist.mjs';
 import {
@@ -337,6 +338,19 @@ async function analyzeToken({
       : { detected: false, label: null, clusterBuying: null, oversized: [], networks: [], watchlisted: [] };
 
   if (clusters?.detected) clusters.scoreBonus = clusterScoreBonus(clusters, config);
+
+  // Attach each insider's rolling scorecard from Aegis's own ledger. Free —
+  // the observations are already in memory — and it is the only performance
+  // data that exists: GMGN and Birdeye, which sell the real thing, are gated.
+  if (clusters?.detected && observations) {
+    const windowDays = config.telegram?.scorecardWindowDays ?? 30;
+    for (const m of clusters.uniqueInsiders ?? clusters.watchlisted ?? []) {
+      const entry = observations.wallets?.[m.wallet];
+      m.scorecard = entry
+        ? walletScorecard(entry, { solUsd, windowDays, now: now.getTime() })
+        : null;
+    }
+  }
 
   // --- Community takeover -------------------------------------------
   //

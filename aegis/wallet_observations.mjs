@@ -107,6 +107,70 @@ export function pruneObservations(store, now = Date.now()) {
  * from the token's price move against the attributed spend, and only when that
  * spend was attributable at all.
  */
+/**
+ * Rolling-window scorecard for a single wallet.
+ *
+ * ── WHAT THIS IS, AND WHAT IT IS NOT ────────────────────────────────────────
+ * Every figure here comes from AEGIS'S OWN OBSERVATION LEDGER — the buys this
+ * scanner happened to witness, on the tokens it happened to scan, graded by its
+ * own post-mortem. It is not the wallet's market-wide record.
+ *
+ * Two consequences worth stating before anyone trades on this:
+ *
+ *   1. The sample is biased upward. Buyer replay only reads tokens with a live
+ *      pool, so wallets are credited for surviving tokens far more often than
+ *      they are debited for dead ones. config.json's eliteWhales notes record
+ *      this measurement directly.
+ *   2. Profit is ESTIMATED, not realized. It is derived from each buy's SOL
+ *      spend multiplied by the token's later price change — it assumes the
+ *      wallet still holds and has not taken anything off. Aegis never sees
+ *      exits, so it cannot know otherwise.
+ *
+ * HOLDING DURATION IS NOT RETURNED, deliberately. The ledger records a buy
+ * timestamp and nothing else; there is no exit timestamp anywhere in the
+ * pipeline, so an average holding time cannot be computed from it. Emitting a
+ * plausible-looking number there would be inventing a statistic.
+ *
+ * Real 30-day win rate, realized P&L and holding duration are what GMGN and
+ * Birdeye sell, and both are gated (403/401) — verified repeatedly, see
+ * config.json networkDiscovery notes. The alert links out to them instead.
+ */
+export function walletScorecard(entry, { solUsd = 0, windowDays = 30, now = Date.now() } = {}) {
+  const buys = entry?.buys ?? [];
+  const cutoff = now - windowDays * 86_400_000;
+  const inWindow = buys.filter((b) => typeof b.ts === 'number' && b.ts >= cutoff);
+
+  const graded = inWindow.filter((b) => b.outcome && b.outcome !== 'NEUTRAL');
+  const wins = graded.filter((b) => b.outcome === 'WIN');
+
+  let estProfitUsd = 0;
+  let pricedBuys = 0;
+  for (const b of graded) {
+    if (!b.solSpent || !solUsd || b.changePct === null || b.changePct === undefined) continue;
+    pricedBuys++;
+    estProfitUsd += b.solSpent * solUsd * (b.changePct / 100);
+  }
+
+  // Time since first observed buy in the window. This is NOT holding duration —
+  // it is how long this wallet has been on Aegis's radar, and it is labelled
+  // that way wherever it is displayed.
+  const firstSeen = inWindow.length ? Math.min(...inWindow.map((b) => b.ts)) : null;
+
+  return {
+    windowDays,
+    observedBuys: inWindow.length,
+    gradedBuys: graded.length,
+    wins: wins.length,
+    winRatePct: graded.length ? (wins.length / graded.length) * 100 : null,
+    estimatedProfitUsd: pricedBuys ? estProfitUsd : null,
+    pricedBuys,
+    trackedForHours: firstSeen === null ? null : (now - firstSeen) / 3.6e6,
+    // Explicit so no caller can mistake absence for zero.
+    holdingDurationHours: null,
+    holdingDurationAvailable: false,
+  };
+}
+
 export function walletStats(entry, solUsd = 0) {
   const graded = entry.buys.filter((b) => b.outcome && b.outcome !== 'NEUTRAL');
   const wins = graded.filter((b) => b.outcome === 'WIN');

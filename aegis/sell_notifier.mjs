@@ -50,7 +50,52 @@ export const TRIGGER = {
   INSIDER_EXIT: 'INSIDER_EXIT',
   TAKE_PROFIT: 'TAKE_PROFIT',
   STOP_LOSS: 'STOP_LOSS',
+  TRAILING_LOCK: 'TRAILING_LOCK',
 };
+
+/**
+ * The trailing stop currently armed for a position, as a percentage ABOVE entry.
+ *
+ * Derived from peakMarketCap rather than stored, which makes the ratchet free:
+ * the peak only ever rises, so the armed level can only ever rise with it. There
+ * is no state to migrate onto existing positions and no way for a restart or a
+ * mid-trade config edit to walk a lock back down.
+ *
+ * Returns null before the first tier is reached, which is what keeps the plain
+ * stop-loss in charge on a position that never ran.
+ */
+export function armedTrailingLock(position, cfg) {
+  const trailing = cfg.trailingStop ?? {};
+  if (trailing.enabled === false) return null;
+
+  const entry = position?.entryMarketCap ?? 0;
+  const peak = position?.peakMarketCap ?? 0;
+  if (entry <= 0 || peak <= 0) return null;
+
+  const peakGainPct = ((peak - entry) / entry) * 100;
+  const tiers = trailing.tiers ?? [
+    { peakGainPct: 50, lockGainPct: 20 },
+    { peakGainPct: 100, lockGainPct: 60 },
+  ];
+
+  let armed = null;
+  for (const t of tiers) {
+    if (peakGainPct >= t.peakGainPct && (armed === null || t.lockGainPct > armed.lockGainPct)) {
+      armed = t;
+    }
+  }
+  if (!armed) return null;
+
+  // tierPeakPct is the THRESHOLD that armed this lock; peakGainPct is how far
+  // the position actually ran. Keeping both separate matters — an earlier cut
+  // spread the tier and then overwrote peakGainPct with the live peak, losing
+  // the threshold the alert needs to explain itself.
+  return {
+    lockGainPct: armed.lockGainPct,
+    tierPeakPct: armed.peakGainPct,
+    peakGainPct,
+  };
+}
 
 /* ------------------------------------------------------------------ *
  * State
@@ -190,8 +235,47 @@ export function evaluateTriggers(position, currentMcap, insiderStates, cfg) {
     }
   }
 
+  // --- Trailing profit lock ----------------------------------------
+  //
+  // Evaluated BEFORE the fixed stop-loss and suppressing it when armed. Once a
+  // position has run far enough to arm a lock, that lock sits above entry while
+  // the fixed stop sits below it, so the trailing level is always the one that
+  // should fire. Letting both run would send two exit alerts for one exit, and
+  // the second would report a loss on a trade that closed in profit.
+  const lock = armedTrailingLock(position, cfg);
+  let trailingFired = false;
+
+  if (lock && !fired.has(TRIGGER.TRAILING_LOCK) && currentMcap !== null && entry > 0) {
+    const floor = entry * (1 + lock.lockGainPct / 100);
+    if (currentMcap <= floor) {
+      const nowPct = ((currentMcap - entry) / entry) * 100;
+      // Signed explicitly. A position can gap straight through the floor to
+      // below entry, and "+-30%" is not a number anyone should have to parse
+      // while deciding whether to sell.
+      const signed = `${nowPct >= 0 ? '+' : ''}${nowPct.toFixed(0)}%`;
+      trailingFired = true;
+      out.push({
+        trigger: TRIGGER.TRAILING_LOCK,
+        headline: '💰 TRAILING PROFIT LOCKED',
+        reason:
+          `Peaked at +${lock.peakGainPct.toFixed(0)}% and fell back to ${signed}, ` +
+          `through the +${lock.lockGainPct}% floor armed at the +${lock.tierPeakPct}% tier`,
+        action:
+          nowPct > 0
+            ? 'Exit now — the run has reversed and this closes the position above your entry rather than below it.'
+            : 'Exit now. The move gapped through the trailing floor, so this is no longer a profitable exit — take what is left.',
+        closes: true,
+        lockGainPct: lock.lockGainPct,
+        peakGainPct: lock.peakGainPct,
+      });
+    }
+  }
+
   // --- Trigger 3 first: a delisted pair is the urgent case ----------
-  if (!fired.has(TRIGGER.STOP_LOSS)) {
+  // A delisted pair still reports through the stop-loss even when a trailing
+  // lock is armed: liquidity being pulled is not a profitable exit, and it is
+  // the one thing that must never be suppressed.
+  if (!fired.has(TRIGGER.STOP_LOSS) && (!trailingFired || currentMcap === null)) {
     if (currentMcap === null) {
       out.push({
         trigger: TRIGGER.STOP_LOSS,
