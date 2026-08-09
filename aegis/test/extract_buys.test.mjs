@@ -27,6 +27,8 @@ import {
   evaluateSecurityShield,
   evaluateCommunityTakeover,
   applyCtoOverride,
+  detectMegaRunner,
+  tractionFrom,
   isInsiderCategory,
   isAlertableCategory,
   SIGNAL_CATEGORY,
@@ -429,7 +431,14 @@ const insiderConfig = {
   },
 };
 
-/** A contract that satisfies every mandatory requirement. */
+/**
+ * A contract that satisfies every mandatory requirement.
+ *
+ * Carries insiderPct, risks and distributionSource even though the shield does
+ * not read them: runSecurityAudit does, and a fixture thinner than what
+ * fetchSolanaSecurity actually returns fails inside the audit rather than at
+ * the assertion, which is a confusing way to learn the fixture was wrong.
+ */
 const cleanSecurity = (over = {}) => ({
   ok: true,
   chainKind: 'solana',
@@ -438,6 +447,10 @@ const cleanSecurity = (over = {}) => ({
   lpLockedPct: 100,
   top10Pct: 12,
   totalHolders: 2_500,
+  insiderPct: 0,
+  risks: [],
+  rugged: false,
+  distributionSource: 'rpc-live',
   ...over,
 });
 
@@ -876,6 +889,197 @@ test('the early insider tier gets the -15% stop its own alert text promises', ()
   assert.equal(stopLossPctFor({ category: 'COMMUNITY TAKEOVER GEM' }, cfg), 20);
   assert.equal(stopLossPctFor({}, cfg), 20, 'positions opened before this existed');
   assert.equal(stopLossPctFor({ category: 'X' }, {}), 20, 'default with no config');
+});
+
+/* ------------------------------------------------------------------ *
+ * Dynamic concentration cap + mega-runner boost
+ * ------------------------------------------------------------------ */
+
+const dynThresholds = {
+  maxTop10Pct: 20,
+  maxTop10PctYoung: 20,
+  minLpLockedPct: 99,
+  minUniqueHolders: 150,
+  minLiqToMcapPct: 15,
+  minAbsoluteLiquidityUsd: 100_000,
+  dynamicConcentration: { enabled: true, minHolders: 300, minVolume1hUsd: 50_000, maxTop10Pct: 30 },
+};
+const viral = { holders: 3_500, volume1h: 250_000 };
+
+test('the cap widens to 30% only when BOTH traction inputs clear their floors', () => {
+  assert.equal(concentrationCapFor(10, dynThresholds, viral).cap, 30);
+  assert.equal(concentrationCapFor(10, dynThresholds, viral).widened, true);
+
+  for (const [what, t] of [
+    ['too few holders', { holders: 299, volume1h: 250_000 }],
+    ['too little volume', { holders: 3_500, volume1h: 49_999 }],
+    ['holders unknown', { holders: null, volume1h: 250_000 }],
+    ['volume unknown', { holders: 3_500, volume1h: null }],
+    ['no traction supplied', null],
+  ]) {
+    assert.equal(concentrationCapFor(10, dynThresholds, t).cap, 20, `${what} keeps the base cap`);
+  }
+});
+
+test('the widened cap can be disabled and never narrows an already-looser cap', () => {
+  const off = { ...dynThresholds, dynamicConcentration: { ...dynThresholds.dynamicConcentration, enabled: false } };
+  assert.equal(concentrationCapFor(10, off, viral).cap, 20);
+
+  // A config whose base cap already exceeds the widened value must not be cut.
+  const loose = { ...dynThresholds, maxTop10Pct: 40, maxTop10PctYoung: 40 };
+  assert.equal(concentrationCapFor(10, loose, viral).cap, 40);
+});
+
+test('a 25% token passes the audit on traction and fails without it', () => {
+  const sec = cleanSecurity({ top10Pct: 25, totalHolders: 3_500 });
+  const viralDemand = { ageHours: 10, volume: { h1: 250_000 } };
+  const quietDemand = { ageHours: 10, volume: { h1: 4_000 } };
+
+  const hot = runSecurityAudit(sec, dynThresholds, {
+    ageHours: 10,
+    traction: tractionFrom(sec, viralDemand),
+  });
+  assert.equal(hot.status, 'PASSED');
+
+  const cold = runSecurityAudit(sec, dynThresholds, {
+    ageHours: 10,
+    traction: tractionFrom(sec, quietDemand),
+  });
+  assert.equal(cold.status, 'FAILED');
+});
+
+test('all four cap derivations agree — audit, shield, insider gate, re-audit', () => {
+  // The cap is computed in four places. When they drift, the alert states one
+  // limit while a different one is enforced. This escaped review once already:
+  // the audit passed a 25% token at the widened cap while the insider-tier
+  // gate still hardcoded 20 and rejected it, so the widening silently did
+  // nothing for the tier that produces most alerts.
+  const sec = cleanSecurity({ top10Pct: 25, totalHolders: 3_500 });
+  const demand = {
+    ageHours: 10, volume: { h1: 250_000 },
+    liqToMcapPct: 30, liquidityUsd: 200_000, marketCap: 660_000,
+  };
+
+  const audit = runSecurityAudit(sec, dynThresholds, {
+    ageHours: 10, traction: tractionFrom(sec, demand),
+  });
+  assert.equal(audit.status, 'PASSED', 'contract audit');
+
+  const shield = evaluateSecurityShield({ security: sec, demand, thresholds: dynThresholds });
+  assert.equal(shield.passed, true, 'shield');
+  assert.match(
+    shield.checks.find((c) => c.label === 'Top 10 non-LP concentration').detail,
+    /limit 30%/
+  );
+
+  const req = evaluateInsiderRequirements({
+    audit, security: sec, clusters: insiders(2), thresholds: dynThresholds, demand,
+  });
+  assert.equal(req.passed, true, 'insider-tier requirements must use the same cap');
+  assert.match(req.checks.find((c) => c.label === 'Top 10 concentration').detail, /limit 30%/);
+
+  // The re-audit derives its cap the same way (telegram.mjs passes the same
+  // traction); assert the shared helper agrees rather than re-deriving here.
+  assert.equal(concentrationCapFor(10, dynThresholds, tractionFrom(sec, demand)).cap, 30);
+});
+
+test('a viral token reaches an insider tier instead of being blocked at 20%', () => {
+  const sec = cleanSecurity({ top10Pct: 25, totalHolders: 3_500 });
+  const demand = {
+    marketCap: 420_000, liquidityUsd: 95_000, ageHours: 6, ageIsLowerBound: false,
+    volume: { h1: 640_000 }, m5: { buys: 210, sells: 45 },
+  };
+  const audit = runSecurityAudit(sec, dynThresholds, {
+    ageHours: 6, traction: tractionFrom(sec, demand),
+  });
+  const r = classifySignal({
+    demand, security: sec,
+    config: { ...insiderConfig, thresholds: dynThresholds },
+    clusters: insiders(2), audit,
+  });
+  assert.equal(r.category, SIGNAL_CATEGORY.INSIDER_EARLY);
+  assert.equal(isAlertableCategory(r.category), true);
+});
+
+test('the mega-runner boost needs volume AND a 3x ratio AND real buy count', () => {
+  const cfg = { megaRunner: { minVolume1hUsd: 50_000, minBuySellRatio: 3, minBuys: 10, scoreBoost: 25 } };
+  const hit = detectMegaRunner({
+    demand: { volume: { h1: 120_000 }, m5: { buys: 90, sells: 20 } },
+    config: cfg,
+  });
+  assert.equal(hit.detected, true);
+  assert.equal(hit.scoreBoost, 25);
+
+  for (const [what, demand] of [
+    ['volume short', { volume: { h1: 49_999 }, m5: { buys: 90, sells: 20 } }],
+    ['ratio short', { volume: { h1: 120_000 }, m5: { buys: 50, sells: 20 } }],
+    ['too few buys', { volume: { h1: 120_000 }, m5: { buys: 6, sells: 1 } }],
+    ['no volume data', { volume: {}, m5: { buys: 90, sells: 20 } }],
+  ]) {
+    assert.equal(detectMegaRunner({ demand, config: cfg }).detected, false, what);
+  }
+});
+
+test('zero sells does not hand out a boost on a single buy', () => {
+  // demand.m5.ratio is Infinity when sells are zero, which clears any threshold
+  // on its own — so the ratio is recomputed here behind the buy-count floor.
+  const cfg = { megaRunner: { minVolume1hUsd: 50_000, minBuySellRatio: 3, minBuys: 10, scoreBoost: 25 } };
+  const one = detectMegaRunner({
+    demand: { volume: { h1: 80_000 }, m5: { buys: 1, sells: 0 } },
+    config: cfg,
+  });
+  assert.equal(one.detected, false, '1 buy / 0 sells is not viral demand');
+
+  const many = detectMegaRunner({
+    demand: { volume: { h1: 80_000 }, m5: { buys: 40, sells: 0 } },
+    config: cfg,
+  });
+  assert.equal(many.detected, true, '40 buys / 0 sells is');
+});
+
+test('the mega-runner boost is forfeited unless the audit affirmatively PASSED', () => {
+  const base = {
+    security: { ok: true, totalHolders: 5_000, top10Pct: 10 },
+    demand: strongDemand,
+    velocity: null,
+    catalysts: { bullish: [], bearish: [] },
+    thresholds,
+    megaRunner: { detected: true, scoreBoost: 25 },
+  };
+  const passed = scoreToken({ ...base, audit: PASSED });
+  assert.equal(passed.breakdown.megaRunner, 25);
+
+  // UNVERIFIED means the gates could not be checked, which is not "passed".
+  const unverified = scoreToken({
+    ...base,
+    audit: { status: 'UNVERIFIED', checks: [], failures: [], unknowns: ['x'] },
+  });
+  assert.equal(unverified.breakdown.megaRunner, 0, 'wash volume cannot buy 25 points on an unverified contract');
+
+  const failed = scoreToken({
+    ...base,
+    audit: { status: 'FAILED', checks: [], failures: ['Mint Authority: ACTIVE'], unknowns: [] },
+  });
+  assert.equal(failed.breakdown.megaRunner, 0);
+});
+
+test('the viral banner leads the alert but does not replace the tier header', () => {
+  const lines = alertHeaderLines({
+    signalCategory: { alertHeader: '💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎' },
+    clusters: insiders(1),
+    megaRunner: { detected: true },
+    megaRunnerHeader: '🔥 380x MEGA-RUNNER VIRAL ALERT ($50k+ Vol & High Demand!) 🔥',
+  });
+  assert.match(lines[0], /MEGA-RUNNER VIRAL ALERT/);
+  assert.match(lines[1], /ESTABLISHED INSIDER GEM/, 'holding style must survive');
+
+  const quiet = alertHeaderLines({
+    signalCategory: { alertHeader: '💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎' },
+    clusters: insiders(1),
+    megaRunner: { detected: false },
+    megaRunnerHeader: '🔥 380x MEGA-RUNNER VIRAL ALERT 🔥',
+  });
+  assert.match(quiet[0], /ESTABLISHED INSIDER GEM/, 'no banner when it did not fire');
 });
 
 /* ------------------------------------------------------------------ *

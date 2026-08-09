@@ -11,7 +11,12 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { fetchLiveHolderDistribution } from './sources.mjs';
-import { concentrationCapFor, isAlertableCategory, evaluateSecurityShield } from './audit.mjs';
+import {
+  concentrationCapFor,
+  isAlertableCategory,
+  evaluateSecurityShield,
+  tractionFrom,
+} from './audit.mjs';
 import { formatSmartMoneyLine } from './smart_money.mjs';
 
 /* ------------------------------------------------------------------ *
@@ -361,12 +366,19 @@ function renderWhales(smartMoney) {
  * the tier header does not carry. At a single wallet it would just restate the
  * header, and the full roster appears in the cluster block below regardless.
  */
-export function alertHeaderLines({ signalCategory, clusters, smartMoney }) {
+export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader }) {
   const count = clusters?.insiderCount ?? 0;
   const tierHeader = signalCategory?.alertHeader ?? null;
 
+  // The viral-volume banner leads when it fires, because it is the reason the
+  // token is moving right now. The tier header stays below it rather than being
+  // replaced — band and holding style are still what decide how to hold the
+  // trade, and losing that would make the alert less actionable, not more.
+  const viral =
+    megaRunner?.detected && megaRunnerHeader ? [`<b>${esc(megaRunnerHeader)}</b>`] : [];
+
   if (tierHeader) {
-    const lines = [`<b>${esc(tierHeader)}</b>`];
+    const lines = [...viral, `<b>${esc(tierHeader)}</b>`];
     if (count >= 4) lines.push(`🔥 <b>CABAL SWARM — ${count} unique insider wallets</b>`);
     else if (count >= 2) lines.push(`🔥 <b>MULTI-INSIDER — ${count} unique wallets</b>`);
     return lines;
@@ -375,6 +387,7 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney }) {
   // Fallback chain, unchanged. Reached when telegram.insiderTiersOnly is off
   // and a token alerts from outside both bands, or on a non-insider signal.
   return [
+    ...viral,
     count >= 4
       ? '🚀 <b>CABAL SWARM BUY ALERT</b> 🚀'
       : count >= 2
@@ -423,7 +436,18 @@ function renderShield(shield) {
   return lines;
 }
 
-export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds }) {
+/** Viral-volume detail. Shows the two measured figures, not just the banner. */
+function renderMegaRunner(megaRunner) {
+  if (!megaRunner?.detected) return [];
+  return [
+    '',
+    '🔥 <b>MEGA-RUNNER VIRAL VOLUME:</b>',
+    ...megaRunner.reasons.map((r) => `• ${esc(r)} ✅`),
+    '<i>Volume and buy/sell counts can both be manufactured — a wash trader cycling SOL between their own wallets produces this exact signature, deliberately, because it is what scanners look for.</i>',
+  ];
+}
+
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader }) {
   const symbol = pair.baseToken?.symbol ?? 'UNKNOWN';
   const address = pair.baseToken.address;
   const usd = (n) =>
@@ -448,7 +472,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     demand.m5.sells > 0 ? (demand.m5.buys / demand.m5.sells).toFixed(1) : '∞';
 
   return [
-    ...alertHeaderLines({ signalCategory, clusters, smartMoney }),
+    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader }),
     `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
     `<i>Score ${verdictInfo.score}/100</i>${clusters?.label ? ` | <b>${esc(clusters.label)}</b>` : ''}`,
     // Placed above the advice: if the buy button is locked, the trading advice
@@ -457,6 +481,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
       ? ['', `<b>${esc(migration.label)}</b>`, `<i>${esc(migration.detail)}</i>`]
       : []),
     ...(signalCategory?.advice ? ['', `<b>${esc(signalCategory.advice)}</b>`] : []),
+    ...renderMegaRunner(megaRunner),
     ...renderCto(cto),
     ...renderClusters(clusters),
     ...renderWhales(smartMoney),
@@ -474,7 +499,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     // Cap read from the live thresholds, not hardcoded. It used to say 25 while
     // the configured cap was 20, which put two different numbers for the same
     // limit in one message once the shield block began printing alongside it.
-    `• Top 10 Concentration: ${security?.top10Pct === null || security?.top10Pct === undefined ? '?' : `${security.top10Pct.toFixed(1)}%`}${reaudit?.ran ? ` (re-checked live: ${reaudit.now?.toFixed(1)}%, cap ${reaudit.cap}% ✅)` : ` (cap ${esc(String(concentrationCapFor(demand?.ageHours ?? null, thresholds ?? {}).cap))}% ✅)`}`,
+    `• Top 10 Concentration: ${security?.top10Pct === null || security?.top10Pct === undefined ? '?' : `${security.top10Pct.toFixed(1)}%`}${reaudit?.ran ? ` (re-checked live: ${reaudit.now?.toFixed(1)}%, cap ${reaudit.cap}% ✅)` : ` (cap ${esc(String(concentrationCapFor(demand?.ageHours ?? null, thresholds ?? {}, tractionFrom(security, demand)).cap))}% ✅)`}`,
     `• Holder Data: ${security?.distributionSource === 'rpc-live' ? 'live on-chain ✅' : 'cached indexer ⚠️'}${reaudit?.ran ? '' : reaudit?.reason ? ` · re-audit skipped (${esc(String(reaudit.reason).slice(0, 60))})` : ''}`,
     `• Security Status: ${verdictInfo.securityStatus === 'PASSED' ? 'PASSED ALL AUDITS ✅' : esc(verdictInfo.securityStatus ?? '?')}`,
     `• Deployer: ${esc(devLine)}`,
@@ -654,7 +679,15 @@ export async function preDispatchReaudit({ result, pair, config }) {
     return { ran: false, reason: live.error, pass: !config.telegram.requireLiveReaudit };
   }
 
-  const { cap, tier } = concentrationCapFor(result.demand?.ageHours ?? null, config.thresholds);
+  // MUST use the same traction context the original audit used. A re-audit on
+  // the base cap would cancel exactly the high-volume alerts the widened cap
+  // was added to let through — the token would pass the audit at 30% and then
+  // be killed at dispatch by a 20% recheck.
+  const { cap, tier } = concentrationCapFor(
+    result.demand?.ageHours ?? null,
+    config.thresholds,
+    tractionFrom(security, result.demand)
+  );
   const before = security.top10Pct;
   const nowPct = live.topNPct;
   const pass = nowPct !== null && nowPct < cap;
@@ -773,6 +806,8 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     clusters: result.clusters,
     cto: result.cto,
     thresholds: config.thresholds,
+    megaRunner: result.megaRunner,
+    megaRunnerHeader: config.megaRunner?.alertHeader ?? null,
   });
 
   const sent = await sendTelegram({ ...credentials, text });

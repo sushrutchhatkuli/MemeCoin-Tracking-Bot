@@ -32,28 +32,80 @@ const ratio = (a, b) => (b > 0 ? a / b : a > 0 ? Infinity : 0);
  * than exotic; defaulting to the loose cap would quietly hand the buffer back
  * to exactly the newest tokens it exists to protect against.
  */
-export function concentrationCapFor(ageHours, thresholds) {
+/**
+ * The traction context that can widen the concentration cap.
+ *
+ * Built in ONE place because four call sites derive the cap — the contract
+ * audit, the shield, the insider-tier requirements and the pre-dispatch
+ * re-audit — and if any of them computed it differently the alert would state
+ * one limit while a different one was enforced. The re-audit is the dangerous
+ * one: a stricter cap there would cancel alerts the audit had already cleared.
+ */
+export function tractionFrom(security, demand) {
+  return {
+    holders: security?.ok ? (security.totalHolders ?? null) : null,
+    volume1h: demand?.volume?.h1 ?? null,
+  };
+}
+
+export function concentrationCapFor(ageHours, thresholds, traction = null) {
   const strict = thresholds.maxTop10PctYoung ?? 20;
   const standard = thresholds.maxTop10Pct ?? 20;
 
   // A single flat cap by default. The age-tiered variant is retained only for
   // configs that still set a looser `maxTop10Pct`, and even then the strict cap
   // applies whenever age cannot be proven.
-  if (strict === standard) return { cap: strict, tier: 'all tokens' };
-
   const youngHours = thresholds.youngTokenHours ?? 2;
-  if (ageHours === null || ageHours === undefined) {
-    return { cap: strict, tier: 'age unknown — strict cap applied' };
-  }
-  return ageHours < youngHours
-    ? { cap: strict, tier: `young (<${youngHours}h)` }
-    : { cap: standard, tier: `established (≥${youngHours}h)` };
+  const base =
+    strict === standard
+      ? { cap: strict, tier: 'all tokens' }
+      : ageHours === null || ageHours === undefined
+        ? { cap: strict, tier: 'age unknown — strict cap applied' }
+        : ageHours < youngHours
+          ? { cap: strict, tier: `young (<${youngHours}h)` }
+          : { cap: standard, tier: `established (≥${youngHours}h)` };
+
+  // ---- Dynamic widening for tokens with proven traction ------------
+  //
+  // A token with thousands of holders and real turnover is a different animal
+  // from a fresh launch where ten wallets hold everything: the float is being
+  // actively traded, so a higher top-10 share is less likely to be a bundle
+  // sitting on the supply waiting to exit into you.
+  //
+  // "Less likely" is the honest strength of this. Both inputs are cheap to
+  // fake — volume by wash trading between wallets you control, holder count by
+  // dusting — and neither is evidence that the top ten will not sell. This
+  // widens a SAFETY gate on the strength of two metrics a motivated scammer
+  // can manufacture, which is why it is opt-out via
+  // thresholds.dynamicConcentration.enabled and why both inputs must be
+  // affirmatively known: unknown holders or unknown volume keep the base cap.
+  const dyn = thresholds.dynamicConcentration ?? {};
+  if (dyn.enabled === false || !traction) return base;
+
+  const { holders, volume1h } = traction;
+  const holderFloor = dyn.minHolders ?? 300;
+  const volumeFloor = dyn.minVolume1hUsd ?? 50_000;
+  const widened = dyn.maxTop10Pct ?? 30;
+
+  const qualifies =
+    holders !== null && holders !== undefined && holders >= holderFloor &&
+    volume1h !== null && volume1h !== undefined && volume1h >= volumeFloor;
+
+  // Never narrows. If the base cap is already looser, keep it.
+  if (!qualifies || widened <= base.cap) return base;
+
+  return {
+    cap: widened,
+    tier: `high-volume (${holders} holders, $${Math.round(volume1h).toLocaleString('en-US')} 1h vol)`,
+    widened: true,
+    baseCap: base.cap,
+  };
 }
 
-export function runSecurityAudit(security, thresholds, { ageHours = null } = {}) {
+export function runSecurityAudit(security, thresholds, { ageHours = null, traction = null } = {}) {
   const checks = [];
   const add = (label, passed, detail) => checks.push({ label, passed, detail });
-  const { cap: top10Cap, tier: ageTier } = concentrationCapFor(ageHours, thresholds);
+  const { cap: top10Cap, tier: ageTier } = concentrationCapFor(ageHours, thresholds, traction);
 
   if (!security?.ok) {
     add('Security data', null, `Unavailable — ${security?.error ?? 'unknown error'}`);
@@ -328,7 +380,14 @@ export function evaluateSecurityShield({ security, demand, thresholds = {}, cto 
   const add = (label, passed, detail) => rows.push({ label, passed: passed === true, detail });
 
   const evm = security?.chainKind === 'evm';
-  const top10Cap = thresholds.maxTop10Pct ?? 20;
+  // Same dynamic cap the contract audit applied, derived from the same helper.
+  // Hardcoding maxTop10Pct here would print a 20% limit in the alert while the
+  // audit had enforced 30%.
+  const { cap: top10Cap, widened: capWidened } = concentrationCapFor(
+    demand?.ageHours ?? null,
+    thresholds,
+    tractionFrom(security, demand)
+  );
   const lpFloor = thresholds.minLpLockedPct ?? 99;
   const holderFloor = thresholds.minUniqueHolders ?? 150;
   const depthFloorPct = thresholds.minLiqToMcapPct ?? 15;
@@ -377,7 +436,7 @@ export function evaluateSecurityShield({ security, demand, thresholds = {}, cto 
     top10 !== null && top10 !== undefined && top10 < top10Cap,
     top10 === null || top10 === undefined
       ? 'Holder distribution not indexed — unknown does not pass'
-      : `Top 10 hold ${top10.toFixed(1)}% (limit ${top10Cap}%)`
+      : `Top 10 hold ${top10.toFixed(1)}% (limit ${top10Cap}%${capWidened ? ', widened for proven traction' : ''})`
   );
 
   const holders = security?.ok ? security.totalHolders : null;
@@ -527,6 +586,66 @@ export function evaluateCommunityTakeover({ demand, security, deployer, devExit 
   };
 }
 
+/* ------------------------------------------------------------------ *
+ * Mega-runner viral volume
+ * ------------------------------------------------------------------ */
+
+/**
+ * Detect the viral-volume signature: real money moving through the pool while
+ * buyers heavily outnumber sellers in the last five minutes.
+ *
+ * The 5-minute window is the point — it catches the token WHILE the imbalance
+ * is happening rather than after, which is also why it is the noisiest signal
+ * in the engine. Two guards keep it from firing on nothing:
+ *
+ *   - a minimum buy count, because a 3:1 ratio off 3 buys and 1 sell is not
+ *     demand, it is rounding. This mirrors detectCatalysts, which has required
+ *     `m5.buys >= 10` alongside every ratio test since the beginning.
+ *   - an infinite ratio (zero sells) still needs that buy count, so a single
+ *     buy into a dead pool cannot score.
+ *
+ * WHAT THIS CANNOT TELL YOU: volume and buy/sell counts are both cheap to
+ * manufacture. A wash trader cycling SOL between their own wallets produces
+ * exactly this signature, and produces it deliberately because it is what
+ * scanners like this one look for. Treat it as "something is happening here",
+ * not as "the something is organic".
+ */
+export function detectMegaRunner({ demand, config = {} }) {
+  const cfg = config.megaRunner ?? {};
+  if (cfg.enabled === false) return { detected: false, scoreBoost: 0, reasons: [] };
+
+  const minVol = cfg.minVolume1hUsd ?? 50_000;
+  const minRatio = cfg.minBuySellRatio ?? 3;
+  const minBuys = cfg.minBuys ?? 10;
+
+  const vol1h = demand?.volume?.h1 ?? null;
+  const buys = demand?.m5?.buys ?? 0;
+  const sells = demand?.m5?.sells ?? 0;
+  // Recompute rather than trusting demand.m5.ratio, which is Infinity when
+  // sells are zero and would otherwise clear any threshold on its own.
+  const ratio = sells > 0 ? buys / sells : buys > 0 ? Infinity : 0;
+
+  const volumeOk = vol1h !== null && vol1h >= minVol;
+  const demandOk = buys >= minBuys && ratio >= minRatio;
+  const detected = volumeOk && demandOk;
+
+  return {
+    detected,
+    scoreBoost: detected ? (cfg.scoreBoost ?? 25) : 0,
+    ratio,
+    volume1h: vol1h,
+    buys,
+    sells,
+    reasons: detected
+      ? [
+          `$${Math.round(vol1h).toLocaleString('en-US')} traded in 1h (floor $${minVol.toLocaleString('en-US')})`,
+          `${buys} buys vs ${sells} sells in 5m (${ratio === Infinity ? '∞' : ratio.toFixed(1)}x, floor ${minRatio}x)`,
+        ]
+      : [],
+    checks: { volume: volumeOk, demand: demandOk, minBuys: buys >= minBuys },
+  };
+}
+
 /**
  * Bearish catalysts that a confirmed CTO should stop being punished for.
  *
@@ -563,11 +682,19 @@ export function applyCtoOverride(catalysts, cto) {
  * so their preconditions are stated once more where they can be read and tested
  * on their own, rather than inferred from the interaction of three modules.
  */
-export function evaluateInsiderRequirements({ audit, security, clusters, thresholds = {} }) {
+export function evaluateInsiderRequirements({ audit, security, clusters, thresholds = {}, demand = null }) {
   const rows = [];
   const add = (label, passed, detail) => rows.push({ label, passed: passed === true, detail });
 
-  const top10Cap = thresholds.maxTop10Pct ?? 20;
+  // The dynamic cap, same as everywhere else. Hardcoding 20 here meant the
+  // contract audit could pass a high-volume token at 30% while this gate
+  // rejected it at 20% — so the widened cap silently did nothing for insider
+  // tiers, which is where most alerts come from.
+  const { cap: top10Cap, widened: capWidened } = concentrationCapFor(
+    demand?.ageHours ?? null,
+    thresholds,
+    tractionFrom(security, demand)
+  );
   const lpFloor = thresholds.minLpLockedPct ?? 99;
   const evm = security?.chainKind === 'evm';
 
@@ -632,7 +759,7 @@ export function evaluateInsiderRequirements({ audit, security, clusters, thresho
     top10 !== null && top10 !== undefined && top10 < top10Cap,
     top10 === null || top10 === undefined
       ? 'Holder distribution not indexed — unknown does not qualify'
-      : `Top 10 hold ${top10.toFixed(1)}% (limit ${top10Cap}%)`
+      : `Top 10 hold ${top10.toFixed(1)}% (limit ${top10Cap}%${capWidened ? ', widened for proven traction' : ''})`
   );
 
   const failures = rows.filter((r) => !r.passed).map((r) => `${r.label}: ${r.detail}`);
@@ -827,6 +954,7 @@ function classifyInsiderTier({ demand, security, config, clusters, audit, holder
     security,
     clusters,
     thresholds: { ...(config.thresholds ?? {}), ...shared },
+    demand,
   });
   if (!requirements.passed) {
     // Deliberately NOT a downgrade to the plain tiers. A token that matched an
@@ -969,6 +1097,7 @@ export function scoreToken({
   blacklistHit,
   signalCategory,
   clusters,
+  megaRunner,
 }) {
   // Demand — 30 pts
   const demandScore =
@@ -1074,6 +1203,13 @@ export function scoreToken({
   const gatesFullyPassed = audit.status === 'PASSED' && !safetyGateFailed;
   const clusterBonus = gatesFullyPassed ? (clusters?.scoreBonus ?? 0) : 0;
 
+  // Mega-runner viral volume. Held to the SAME standard as the cluster bonus —
+  // an affirmatively PASSED audit, not merely "not failed" — because it is the
+  // easiest bonus in the engine to manufacture. Wash trading produces this
+  // signature on purpose; without the gate it would be a way to buy 25 points
+  // on a token whose contract was never verified.
+  const megaRunnerBonus = gatesFullyPassed ? (megaRunner?.scoreBoost ?? 0) : 0;
+
   let score = Math.round(
     demandScore +
       depthScore +
@@ -1083,7 +1219,8 @@ export function scoreToken({
       smartBonus +
       socialBonus +
       categoryBonus +
-      clusterBonus
+      clusterBonus +
+      megaRunnerBonus
   );
   score -= catalysts.bearish.length * 4;
   score = clamp(score, 0, 100);
@@ -1229,6 +1366,7 @@ export function scoreToken({
       social: socialBonus,
       category: categoryBonus,
       insiderCluster: clusterBonus,
+      megaRunner: megaRunnerBonus,
       bearishPenalty: catalysts.bearish.length * 4,
     },
   };

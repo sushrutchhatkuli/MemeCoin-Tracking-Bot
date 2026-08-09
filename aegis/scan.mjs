@@ -29,6 +29,8 @@ import {
   classifySignal,
   evaluateCommunityTakeover,
   applyCtoOverride,
+  detectMegaRunner,
+  tractionFrom,
 } from './audit.mjs';
 import { renderNote, noteFilename } from './note.mjs';
 import { loadState, saveState, computeVelocity, recordSnapshot } from './state.mjs';
@@ -207,7 +209,10 @@ async function analyzeToken({
   const security = await fetchSecurity(pair.chainId, address, { rpcUrl: config.rpcUrl });
   const demand = analyzeDemand(pair, security);
   // Age drives the concentration cap, so demand must be computed first.
-  let audit = runSecurityAudit(security, config.thresholds, { ageHours: demand.ageHours });
+  let audit = runSecurityAudit(security, config.thresholds, {
+    ageHours: demand.ageHours,
+    traction: tractionFrom(security, demand),
+  });
 
   const observation = {
     holders: security?.totalHolders ?? null,
@@ -402,6 +407,7 @@ async function analyzeToken({
   // that is the premise of the pattern, not a warning about it. Every other
   // bearish signal survives, so the label cannot erase the rest of the risk.
   const catalysts = applyCtoOverride(rawCatalysts, cto);
+  const megaRunner = detectMegaRunner({ demand, config });
   const verdictInfo = scoreToken({
     audit,
     security,
@@ -416,6 +422,7 @@ async function analyzeToken({
     blacklistHit,
     signalCategory,
     clusters,
+    megaRunner,
   });
 
   return {
@@ -433,6 +440,7 @@ async function analyzeToken({
     migration,
     clusters,
     cto,
+    megaRunner,
   };
 }
 
