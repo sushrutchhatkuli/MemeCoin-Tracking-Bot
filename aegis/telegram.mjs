@@ -13,9 +13,11 @@ import { fileURLToPath } from 'node:url';
 
 import { fetchLiveHolderDistribution } from './sources.mjs';
 import {
+  auditFailuresAreBypassable,
   concentrationCapFor,
   isAlertableCategory,
   evaluateSecurityShield,
+  resolveInsiderBypass,
   tractionFrom,
 } from './audit.mjs';
 import { formatSmartMoneyLine } from './smart_money.mjs';
@@ -454,9 +456,15 @@ function renderWhales(smartMoney) {
  * the tier header does not carry. At a single wallet it would just restate the
  * header, and the full roster appears in the cluster block below regardless.
  */
-export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social }) {
+export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass }) {
   const count = clusters?.insiderCount ?? 0;
   const tierHeader = signalCategory?.alertHeader ?? null;
+
+  // The bypass notice leads EVERYTHING, above the bundle and news banners. Once
+  // the shield has been overridden, the first thing a reader needs to know is
+  // that the alert in front of them cleared fewer checks than an alert normally
+  // does — every other line below is describing a token that failed a gate.
+  const bypassBanner = insiderBypass?.applied === true ? renderInsiderBypassBanner(insiderBypass) : [];
 
   // The viral-volume banner leads when it fires, because it is the reason the
   // token is moving right now. The tier header stays below it rather than being
@@ -485,7 +493,7 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
     : [];
 
   if (tierHeader) {
-    const lines = [...newsBanner, ...bundle, ...viral, ...socialBanner, `<b>${esc(tierHeader)}</b>`];
+    const lines = [...bypassBanner, ...newsBanner, ...bundle, ...viral, ...socialBanner, `<b>${esc(tierHeader)}</b>`];
     if (count >= 4) lines.push(`<b>CABAL SWARM — ${count} unique insider wallets</b>`);
     else if (count >= 2) lines.push(`<b>MULTI-INSIDER — ${count} unique wallets</b>`);
     return lines;
@@ -494,6 +502,7 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
   // Fallback chain, unchanged. Reached when telegram.insiderTiersOnly is off
   // and a token alerts from outside both bands, or on a non-insider signal.
   return [
+    ...bypassBanner,
     ...newsBanner,
     ...bundle,
     ...viral,
@@ -531,16 +540,45 @@ function renderCto(cto) {
   return lines;
 }
 
+/**
+ * The high-risk notice shown when the shield was overridden.
+ *
+ * Deliberately the loudest block in the message and deliberately specific: it
+ * names the gates that were waived and the score that waived them, because
+ * "shield bypassed" without the list reads as a formality. The token in this
+ * alert failed a check that normally stops the alert being sent at all.
+ */
+function renderInsiderBypassBanner(bypass) {
+  const gates = bypass?.gates?.length ? bypass.gates.join(', ') : 'standard anti-rug gates';
+  const who = bypass?.label ? `${bypass.label} · ` : '';
+  const wallet = bypass?.wallet ? `${bypass.wallet.slice(0, 6)}…${bypass.wallet.slice(-4)}` : 'unknown wallet';
+  return [
+    '🔴 <b>HIGH-RISK NOTICE: ANTI-RUG SHIELD BYPASSED BY HIGH-CONVICTION INSIDER</b>',
+    `• Matched Insider Score: <b>${esc(String(bypass?.score ?? '?'))}</b> — ${esc(String(bypass?.floor ?? '?'))}+ required (High-Alpha Override)`,
+    `• Insider: ${esc(who)}<code>${esc(wallet)}</code>`,
+    `• Gates waived: <b>${esc(gates)}</b>`,
+    '<i>These gates failed on measured data and were overridden by configuration, not cleared. An unburned LP is the developer keeping the ability to withdraw the pool; a concentrated top 10 is who will be selling into you; a thin holder base is the absence of anyone to sell to. A high-scoring buyer changes none of that, and a developer can buy their own token from a high-scoring wallet.</i>',
+    '<i>Mint authority, freeze authority, rug flags, a serial-rugger deployer, the blacklist and liquidity depth were NOT bypassed and still passed.</i>',
+  ];
+}
+
 /** The six mandatory gates, itemised. Only reached on a token that passed. */
 function renderShield(shield) {
   if (!shield?.checks?.length) return [];
   const lines = ['', '<b>ANTI-RUGPULL SHIELD:</b>'];
   for (const c of shield.checks) {
-    lines.push(`• ${esc(c.label)}: ${esc(c.detail)} ${c.passed ? '' : ''}`);
+    // No tag appended for a bypassed row — evaluateSecurityShield already wrote
+    // [BYPASSED] into the detail, and adding a second one printed it twice.
+    lines.push(`• ${esc(c.label)}: ${esc(c.detail)} `);
   }
   if (shield.ctoDepthWaiver) {
     lines.push(
       '<i>Depth cleared on the absolute-dollar floor rather than the 15% ratio — a CTO exemption. Size your exit to the pool, not the market cap.</i>'
+    );
+  }
+  if (shield.insiderBypassApplied) {
+    lines.push(
+      '<i>The figures on the [BYPASSED] rows are the real measured values. Those gates failed and were overridden; they were not met.</i>'
     );
   }
   return lines;
@@ -597,6 +635,9 @@ function renderMegaRunner(megaRunner) {
 }
 
 export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader, news, social, sizerConfig }) {
+  // Read off the verdict rather than re-derived: this is a rendering decision,
+  // and the scorer is the only thing entitled to decide a gate was overridden.
+  const insiderBypass = verdictInfo?.insiderBypass?.applied === true ? verdictInfo.insiderBypass : null;
   const symbol = pair.baseToken?.symbol ?? 'UNKNOWN';
   const address = pair.baseToken.address;
   const usd = (n) =>
@@ -636,7 +677,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     : [];
 
   return [
-    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social }),
+    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass }),
     `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
     `<i>Score ${verdictInfo.score}/100</i>${clusters?.label ? ` | <b>${esc(clusters.label)}</b>` : ''}`,
     // Placed above the advice: if the buy button is locked, the trading advice
@@ -652,7 +693,16 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     ...renderClusters(clusters),
     ...renderWhales(smartMoney),
     ...renderShield(
-      evaluateSecurityShield({ security, demand, thresholds: thresholds ?? {}, cto, holderFloorOverride: verdictInfo?.holderGate?.floor ?? null })
+      evaluateSecurityShield({
+        security,
+        demand,
+        thresholds: thresholds ?? {},
+        cto,
+        holderFloorOverride: verdictInfo?.holderGate?.floor ?? null,
+        // `allowed` because the shield re-tests the gates itself; `applied`
+        // above is the scorer's record that a gate actually needed overriding.
+        insiderBypass: insiderBypass ? { ...insiderBypass, allowed: true } : null,
+      })
     ),
     '',
     '<b>SAFETY &amp; DENSITY AUDIT:</b>',
@@ -1141,7 +1191,38 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
   if (verdictInfo.safetyGateFailed) {
     return { status: 'blocked-safety', reason: verdictInfo.safetyGateReason };
   }
-  if (audit.status !== 'PASSED') return { status: 'blocked-audit-not-passed' };
+
+  // ---- High-conviction insider bypass, re-checked at dispatch ------
+  //
+  // The scorer already decided this; the bypass is re-derived here from config
+  // and the live cluster roster rather than trusted from the verdict, for the
+  // same reason the safety block above is checked twice. THREE things must all
+  // hold before a failed audit is allowed to send:
+  //   1. the scorer recorded a bypass,
+  //   2. config + the matched insiders still authorise one right now,
+  //   3. every failing audit row is one of the two the override covers.
+  // Any of the three missing and the alert is blocked exactly as before.
+  //
+  // UNVERIFIED never reaches this path: auditFailuresAreBypassable requires at
+  // least one FAILED row, and an audit that only has unknowns has none. Missing
+  // provider data is not something an insider score is allowed to vouch for.
+  if (audit.status !== 'PASSED') {
+    const dispatchBypass = resolveInsiderBypass({
+      clusters: result.clusters,
+      smartMoney,
+      config,
+    });
+    const bypassOk =
+      verdictInfo.insiderBypass?.applied === true &&
+      dispatchBypass.allowed === true &&
+      auditFailuresAreBypassable(audit);
+    if (!bypassOk) {
+      return {
+        status: 'blocked-audit-not-passed',
+        reason: verdictInfo.insiderBypass?.applied ? dispatchBypass.reason : undefined,
+      };
+    }
+  }
 
   // ---- Strict insider-only filter ---------------------------------
   //

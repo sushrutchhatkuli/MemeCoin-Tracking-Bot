@@ -30,6 +30,7 @@ import {
   evaluateCommunityTakeover,
   applyCtoOverride,
   detectMegaRunner,
+  resolveInsiderBypass,
   tractionFrom,
 } from './audit.mjs';
 import { renderNote, noteFilename } from './note.mjs';
@@ -417,8 +418,20 @@ async function analyzeToken({
       m.scorecard = entry
         ? walletScorecard(entry, { solUsd, windowDays, now: now.getTime() })
         : null;
+      // Earned alpha points from the multiplier engine, decayed forward by every
+      // graded trade since. This is the number the safety bypass is keyed on, so
+      // it is attached here rather than looked up twice; a wallet with no ledger
+      // entry stays null, and null never clears the floor.
+      m.insiderScore = entry?.alpha?.points ?? null;
     }
   }
+
+  // --- High-conviction insider bypass -------------------------------
+  //
+  // Resolved once, then handed to BOTH classification and scoring so the two
+  // cannot disagree about whether a gate was overridden. Off entirely unless
+  // config.smartMoney.allowInsiderSafetyBypass is true.
+  const insiderBypass = resolveInsiderBypass({ clusters, smartMoney, config });
 
   // --- Community takeover -------------------------------------------
   //
@@ -449,7 +462,7 @@ async function analyzeToken({
   // Classification runs AFTER cluster and CTO detection, because the tiers are
   // defined by them — the plain GEM / SCALP bands never needed that input, so
   // this used to sit further up.
-  const signalCategory = classifySignal({ demand, security, config, clusters, audit, cto });
+  const signalCategory = classifySignal({ demand, security, config, clusters, audit, cto, insiderBypass });
 
   // Network discovery reuses the funder cache the cluster pass just warmed, so
   // it costs little extra. Gated on a cluster having fired: expanding the net
@@ -517,7 +530,16 @@ async function analyzeToken({
     megaRunner,
     socialHype,
     config,
+    insiderBypass,
   });
+
+  if (verdictInfo.insiderBypass?.applied) {
+    console.log(
+      `   🔴 [WARN] ${pair.baseToken.symbol} anti-rug shield BYPASSED by insider score ` +
+        `${verdictInfo.insiderBypass.score} (floor ${verdictInfo.insiderBypass.floor}) — ` +
+        `waived: ${verdictInfo.insiderBypass.gates.join(', ')}`
+    );
+  }
 
   return {
     security,

@@ -381,6 +381,140 @@ export function resolveHolderFloor({ signalCategory, config = {}, thresholds = n
 }
 
 /* ------------------------------------------------------------------ *
+ * High-conviction insider bypass
+ * ------------------------------------------------------------------ */
+
+/**
+ * OPT-IN OVERRIDE OF THE ANTI-RUG SHIELD. Read this before enabling it.
+ *
+ * When `smartMoney.allowInsiderSafetyBypass` is true and a matched insider
+ * carries a score at or above `smartMoney.insiderBypassScoreFloor`, three gates
+ * stop blocking that token: LP burn/lock, top-10 concentration, and the unique
+ * holder floor. Nothing else moves.
+ *
+ * ── WHAT THIS IS TRADING AWAY ───────────────────────────────────────────────
+ * Those three gates are not bureaucracy. An unburned LP is the developer's
+ * ability to withdraw the pool; a concentrated top 10 is the wallets who will
+ * be selling into you; a thin holder base is the absence of anyone to sell to.
+ * A wallet with a high alpha score buying the token does not alter any of the
+ * three — it is a statement about the buyer, not about the contract.
+ *
+ * The comment on the security-first gate in scoreToken names the exact attack
+ * this opens: "A malicious dev can trivially buy their own scam from a wallet
+ * on someone's alpha list; if smart money could lift the score, that would be a
+ * way to walk a rug straight past the audit." That path is now open by
+ * configuration. The bar is the score floor and nothing else, and an alpha
+ * score is earned by being present at one winning token — see the selection-bias
+ * warning in multiplier_engine.mjs, which is a warning about this exact number.
+ *
+ * ── WHAT IS DELIBERATELY NOT BYPASSABLE ─────────────────────────────────────
+ *   - MINT and FREEZE authority. No score makes a live mint authority safe;
+ *     the dev can print supply or freeze your wallet regardless of who bought.
+ *   - RUG / DANGER flags and a SERIAL RUGGER deployer. A rugger's token with a
+ *     high-alpha buyer is a rugger's token with a high-alpha buyer.
+ *   - The BLACKLIST.
+ *   - LIQUIDITY DEPTH. Not in the specified set, and left alone: a pool you
+ *     cannot exit is untradeable no matter who else is in it.
+ *   - UNVERIFIED audits. A bypass overrides a gate that FAILED on known data.
+ *     It never converts missing data into a pass — "we could not check" is not
+ *     "an insider vouched for it", and every other unknown in this pipeline
+ *     fails closed for the same reason.
+ */
+
+/**
+ * Contract-audit rows a high-conviction insider may override, by label.
+ *
+ * Matched against `audit.checks[].label` from runSecurityAudit rather than
+ * against the failure strings, because the labels are stable and the details
+ * carry interpolated numbers.
+ */
+const BYPASSABLE_AUDIT_CHECKS = new Set(['Liquidity Pool', 'Insider Concentration']);
+
+/** Shield gate keys the bypass may clear. */
+export const BYPASSABLE_SHIELD_GATES = new Set(['lp', 'concentration', 'holders']);
+
+/**
+ * True only when the audit failed AND every failing row is one of the two the
+ * bypass covers.
+ *
+ * The `every` is what keeps this narrow: a token failing LP burn *and* mint
+ * authority returns false, so one bypassable failure can never carry a
+ * non-bypassable one through with it. An audit with no failures at all (i.e.
+ * UNVERIFIED, which fails on unknowns) returns false — there is nothing to
+ * bypass, and unknown data is not a gate the override is allowed to touch.
+ */
+export function auditFailuresAreBypassable(audit) {
+  const failed = (audit?.checks ?? []).filter((c) => c.passed === false);
+  return failed.length > 0 && failed.every((c) => BYPASSABLE_AUDIT_CHECKS.has(c.label));
+}
+
+/**
+ * The score attached to one matched insider, or null when it carries none.
+ *
+ * Two real sources, in priority order:
+ *   `insiderScore` — attached by scan.mjs from the observation ledger's alpha
+ *                    points (multiplier_engine's earned score, decayed forward
+ *                    by every graded trade since).
+ *   `score`        — a hand-set field on a smart_wallets.json entry, for a
+ *                    wallet you rate yourself.
+ *
+ * ABSENCE IS NOT ZERO AND IS NOT A PASS. A wallet with no score returns null
+ * and cannot clear the floor, so an insider Aegis knows nothing about never
+ * unlocks a bypass.
+ */
+const insiderScoreOf = (m) => {
+  for (const v of [m?.insiderScore, m?.alphaPoints, m?.alpha?.points, m?.score]) {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return null;
+};
+
+/**
+ * Resolve whether this token's insiders unlock the safety bypass.
+ *
+ * Pure and side-effect free, so both the scorer and the notifier can call it
+ * independently — the notifier re-derives it at dispatch rather than trusting
+ * the verdict, the same double-check the hard safety block already uses.
+ */
+export function resolveInsiderBypass({ clusters = null, smartMoney = null, config = {} } = {}) {
+  const cfg = config.smartMoney ?? {};
+  const floor = cfg.insiderBypassScoreFloor ?? 85;
+  const enabled = cfg.allowInsiderSafetyBypass === true;
+  const base = { enabled, allowed: false, floor, score: null, wallet: null, label: null };
+
+  if (!enabled) return { ...base, reason: 'insider safety bypass is disabled' };
+  if (!clusters?.detected) return { ...base, reason: 'no insider activity to bypass on' };
+
+  // The deduplicated roster, plus any smart-money holder matches. Both are
+  // "matched insiders" for this purpose; neither counts without a score.
+  const roster = [
+    ...(clusters.uniqueInsiders ?? clusters.watchlisted ?? []),
+    ...(smartMoney?.matches ?? []),
+  ];
+
+  let best = null;
+  for (const m of roster) {
+    const score = insiderScoreOf(m);
+    if (score === null) continue;
+    if (!best || score > best.score) {
+      best = {
+        score,
+        wallet: m.wallet ?? m.address ?? null,
+        label: m.label ?? m.displayLabel ?? null,
+      };
+    }
+  }
+
+  if (!best) {
+    return { ...base, reason: 'no matched insider carries a score — unscored does not clear the floor' };
+  }
+  if (best.score < floor) {
+    return { ...base, ...best, reason: `top insider scores ${best.score}, under the ${floor} floor` };
+  }
+  return { ...base, ...best, allowed: true, reason: null };
+}
+
+/* ------------------------------------------------------------------ *
  * Mandatory anti-rugpull shield
  * ------------------------------------------------------------------ */
 
@@ -410,10 +544,25 @@ export function resolveHolderFloor({ signalCategory, config = {}, thresholds = n
  * a real $218k pool. Requiring 15% there would not have made anyone safer; it
  * would only have meant the CTO tier could never fire on the exact pattern it
  * is named after.
+ *
+ * ── ON THE HIGH-CONVICTION INSIDER BYPASS ───────────────────────────────────
+ * An `insiderBypass` with `allowed: true` clears the LP, concentration and
+ * holder rows — three of the six — when they failed. The rows are NOT hidden:
+ * each keeps its real measured detail, is marked `bypassed`, and the reason is
+ * appended, so the alert states what was overridden rather than reporting a
+ * clean shield. See resolveInsiderBypass above for what that costs.
  */
-export function evaluateSecurityShield({ security, demand, thresholds = {}, cto = null, holderFloorOverride = null }) {
+export function evaluateSecurityShield({
+  security,
+  demand,
+  thresholds = {},
+  cto = null,
+  holderFloorOverride = null,
+  insiderBypass = null,
+}) {
   const rows = [];
-  const add = (label, passed, detail) => rows.push({ label, passed: passed === true, detail });
+  const add = (gate, label, passed, detail) =>
+    rows.push({ gate, label, passed: passed === true, detail });
 
   const evm = security?.chainKind === 'evm';
   // Same dynamic cap the contract audit applied, derived from the same helper.
@@ -434,13 +583,15 @@ export function evaluateSecurityShield({ security, demand, thresholds = {}, cto 
 
   if (evm) {
     add(
+      'mint',
       'Mint / supply control',
       security?.isMintable === false,
       security?.isMintable === false ? 'Supply fixed, not mintable' : 'Mintable or unknown'
     );
-    add('Freeze authority', true, 'Not applicable on EVM');
+    add('freeze', 'Freeze authority', true, 'Not applicable on EVM');
   } else {
     add(
+      'mint',
       'Mint authority revoked',
       security?.ok === true && security.mintAuthority === null,
       security?.ok !== true
@@ -450,6 +601,7 @@ export function evaluateSecurityShield({ security, demand, thresholds = {}, cto 
           : `ACTIVE — dev can mint infinite supply (${security.mintAuthority})`
     );
     add(
+      'freeze',
       'Freeze authority revoked',
       security?.ok === true && security.freezeAuthority === null,
       security?.ok !== true
@@ -462,6 +614,7 @@ export function evaluateSecurityShield({ security, demand, thresholds = {}, cto 
 
   const lp = security?.lpLockedPct;
   add(
+    'lp',
     'LP burned / locked',
     lp !== null && lp !== undefined && lp >= lpFloor,
     lp === null || lp === undefined
@@ -471,6 +624,7 @@ export function evaluateSecurityShield({ security, demand, thresholds = {}, cto 
 
   const top10 = security?.top10Pct;
   add(
+    'concentration',
     'Top 10 non-LP concentration',
     top10 !== null && top10 !== undefined && top10 < top10Cap,
     top10 === null || top10 === undefined
@@ -480,6 +634,7 @@ export function evaluateSecurityShield({ security, demand, thresholds = {}, cto 
 
   const holders = security?.ok ? security.totalHolders : null;
   add(
+    'holders',
     'Minimum unique holders',
     holders !== null && holders !== undefined && holders >= holderFloor,
     holders === null || holders === undefined
@@ -493,6 +648,7 @@ export function evaluateSecurityShield({ security, demand, thresholds = {}, cto 
   const ratioOk = ratio !== null && ratio !== undefined && ratio >= depthFloorPct;
   const ctoDepthOk = cto?.detected === true && liqUsd >= absoluteFloor;
   add(
+    'depth',
     'Liquidity depth',
     ratioOk || ctoDepthOk,
     ratio === null || ratio === undefined
@@ -504,12 +660,34 @@ export function evaluateSecurityShield({ security, demand, thresholds = {}, cto 
           : `${ratio.toFixed(1)}% of market cap — below the ${depthFloorPct}% floor`
   );
 
+  // High-conviction insider override, applied AFTER every row is measured so the
+  // alert can print what the token actually is alongside what was waived. A row
+  // that already passed is never touched, so `bypassedGates` lists only gates
+  // that genuinely failed and were overridden.
+  const bypass = insiderBypass?.allowed === true ? insiderBypass : null;
+  const bypassedGates = [];
+  if (bypass) {
+    for (const r of rows) {
+      if (r.passed || !BYPASSABLE_SHIELD_GATES.has(r.gate)) continue;
+      r.passed = true;
+      r.bypassed = true;
+      // The marker lives in the detail rather than only on the flag, so a row
+      // read on its own — a log line, a failures array — still says it did not
+      // pass. The renderer prints the detail verbatim and adds no second tag.
+      r.detail = `${r.detail} — [BYPASSED] did not pass, overridden by insider score ${bypass.score} ≥ floor ${bypass.floor}`;
+      bypassedGates.push(r.label);
+    }
+  }
+
   const failures = rows.filter((r) => !r.passed).map((r) => `${r.label}: ${r.detail}`);
   return {
     passed: failures.length === 0,
     checks: rows,
     failures,
     ctoDepthWaiver: ctoDepthOk && !ratioOk,
+    insiderBypassApplied: bypassedGates.length > 0,
+    bypassedGates,
+    insiderBypass: bypassedGates.length > 0 ? bypass : null,
   };
 }
 
@@ -720,6 +898,14 @@ export function applyCtoOverride(catalysts, cto) {
  * That repetition is the point — the tiers are the loudest alerts Aegis sends,
  * so their preconditions are stated once more where they can be read and tested
  * on their own, rather than inferred from the interaction of three modules.
+ *
+ * The high-conviction insider bypass reaches THIS gate as well as the shield,
+ * and it has to: classification is what awards the tier, and the notifier only
+ * dispatches on a tier. Overriding the shield alone would unblock a token and
+ * then drop it at `outside-insider-tiers`, i.e. a switch that does nothing. The
+ * three overridable rows are the same three — contract audit (only when every
+ * failing row is LP or concentration), LP burn, top-10 concentration. Insider
+ * detection, the multi-wallet requirement, mint and freeze are never waived.
  */
 export function evaluateInsiderRequirements({
   audit,
@@ -728,9 +914,11 @@ export function evaluateInsiderRequirements({
   thresholds = {},
   demand = null,
   minInsiderWallets = 1,
+  insiderBypass = null,
 }) {
   const rows = [];
-  const add = (label, passed, detail) => rows.push({ label, passed: passed === true, detail });
+  const add = (label, passed, detail, gate = null) =>
+    rows.push({ gate, label, passed: passed === true, detail });
 
   // The dynamic cap, same as everywhere else. Hardcoding 20 here meant the
   // contract audit could pass a high-volume token at 30% while this gate
@@ -801,7 +989,11 @@ export function evaluateInsiderRequirements({
     audit?.status === 'PASSED',
     audit?.status === 'PASSED'
       ? 'All contract checks passed'
-      : `Audit status is ${audit?.status ?? 'unknown'} — only PASSED qualifies`
+      : `Audit status is ${audit?.status ?? 'unknown'} — only PASSED qualifies`,
+    // Overridable only when every failing row is one the bypass covers, which
+    // auditFailuresAreBypassable decides below. UNVERIFIED has no failing rows
+    // at all and therefore stays blocked.
+    auditFailuresAreBypassable(audit) ? 'audit' : null
   );
 
   if (evm) {
@@ -839,7 +1031,8 @@ export function evaluateInsiderRequirements({
     lp !== null && lp !== undefined && lp >= lpFloor,
     lp === null || lp === undefined
       ? 'LP lock status not indexed — unknown does not qualify'
-      : `${lp.toFixed(1)}% burned / locked (required ≥ ${lpFloor}%)`
+      : `${lp.toFixed(1)}% burned / locked (required ≥ ${lpFloor}%)`,
+    'lp'
   );
 
   const top10 = security?.top10Pct;
@@ -848,11 +1041,37 @@ export function evaluateInsiderRequirements({
     top10 !== null && top10 !== undefined && top10 < top10Cap,
     top10 === null || top10 === undefined
       ? 'Holder distribution not indexed — unknown does not qualify'
-      : `Top 10 hold ${top10.toFixed(1)}% (limit ${top10Cap}%${capWidened ? ', widened for proven traction' : ''})`
+      : `Top 10 hold ${top10.toFixed(1)}% (limit ${top10Cap}%${capWidened ? ', widened for proven traction' : ''})`,
+    'concentration'
   );
 
+  // Same shape as the shield: measured first, overridden second, and the row
+  // keeps its real detail so the alert never claims a gate passed when it did
+  // not. `audit` joins lp/concentration here because a tier cannot be awarded
+  // while the aggregate audit status is still FAILED.
+  const bypass = insiderBypass?.allowed === true ? insiderBypass : null;
+  const bypassedGates = [];
+  if (bypass) {
+    for (const r of rows) {
+      if (r.passed || !(r.gate === 'audit' || BYPASSABLE_SHIELD_GATES.has(r.gate))) continue;
+      r.passed = true;
+      r.bypassed = true;
+      // The marker lives in the detail rather than only on the flag, so a row
+      // read on its own — a log line, a failures array — still says it did not
+      // pass. The renderer prints the detail verbatim and adds no second tag.
+      r.detail = `${r.detail} — [BYPASSED] did not pass, overridden by insider score ${bypass.score} ≥ floor ${bypass.floor}`;
+      bypassedGates.push(r.label);
+    }
+  }
+
   const failures = rows.filter((r) => !r.passed).map((r) => `${r.label}: ${r.detail}`);
-  return { passed: failures.length === 0, checks: rows, failures };
+  return {
+    passed: failures.length === 0,
+    checks: rows,
+    failures,
+    insiderBypassApplied: bypassedGates.length > 0,
+    bypassedGates,
+  };
 }
 
 /**
@@ -887,7 +1106,7 @@ export function evaluateInsiderRequirements({
  * profit quickly, which stays sound even if the token turns out older than
  * assumed, so it tolerates an unproven age.
  */
-export function classifySignal({ demand, security, config, clusters = null, audit = null, cto = null }) {
+export function classifySignal({ demand, security, config, clusters = null, audit = null, cto = null, insiderBypass = null }) {
   const g = config.signalCategories?.gem ?? {};
   const s = config.signalCategories?.scalp ?? {};
   const holders = security?.ok ? security.totalHolders : null;
@@ -920,6 +1139,7 @@ export function classifySignal({ demand, security, config, clusters = null, audi
     clusters,
     audit,
     holders,
+    insiderBypass,
   });
   if (insiderTier) return insiderTier;
 
@@ -982,7 +1202,7 @@ export function classifySignal({ demand, security, config, clusters = null, audi
  * future widening of the early band cannot silently demote a deep-liquidity,
  * thousand-holder token into the tight-stop scalp tier.
  */
-function classifyInsiderTier({ demand, security, config, clusters, audit, holders }) {
+function classifyInsiderTier({ demand, security, config, clusters, audit, holders, insiderBypass = null }) {
   if (!clusters?.detected) return null;
 
   const cats = config.signalCategories ?? {};
@@ -1000,13 +1220,23 @@ function classifyInsiderTier({ demand, security, config, clusters, audit, holder
   const est = cats.insiderEstablished ?? {};
   const early = cats.insiderEarly ?? {};
 
+  // The per-tier holder floor is a holder floor, so the bypass covers it too.
+  // Leaving it out would make the override self-cancelling: scoreToken would
+  // clear the global floor, classification would then refuse the tier, and the
+  // notifier would drop the token at `outside-insider-tiers` having bypassed a
+  // gate for nothing. Note this is the one bypassed check that can also change
+  // WHICH tier is awarded, not just whether one is.
+  const holdersBypassed = insiderBypass?.allowed === true;
+  const holderFloorMet = (required) =>
+    holdersBypassed ||
+    (holders !== null && holders !== undefined && holders >= required);
+
   const estChecks = {
     marketCap: inBand(est, 1_000_000, null),
     liquidity: liq >= (est.minLiquidityUsd ?? 100_000),
     // Holder count must be KNOWN, not merely "not below the floor". Missing
     // distribution data cannot be read as a thousand holders.
-    holders:
-      holders !== null && holders !== undefined && holders >= (est.minHolders ?? 1_000),
+    holders: holderFloorMet(est.minHolders ?? 1_000),
   };
   // Holder count must be KNOWN and at or above the tier's own floor. Same
   // asymmetry as the established tier: missing distribution data is not a
@@ -1014,9 +1244,7 @@ function classifyInsiderTier({ demand, security, config, clusters, audit, holder
   // so it cannot rest on an unread number.
   const earlyChecks = {
     marketCap: inBand(early, 30_000, 500_000),
-    holders:
-      early.minHolders === undefined ||
-      (holders !== null && holders !== undefined && holders >= early.minHolders),
+    holders: early.minHolders === undefined || holderFloorMet(early.minHolders),
   };
 
   const tier = Object.values(estChecks).every(Boolean)
@@ -1058,6 +1286,7 @@ function classifyInsiderTier({ demand, security, config, clusters, audit, holder
     // its own floors (>=$1M cap, >=$100k liquidity, >=1000 holders) already
     // exclude the launch-sniping noise this is aimed at.
     minInsiderWallets: tier.cfg.minInsiderWallets ?? shared.minInsiderWallets ?? 1,
+    insiderBypass,
   });
   if (!requirements.passed) {
     // Deliberately NOT a downgrade to the plain tiers. A token that matched an
@@ -1203,6 +1432,7 @@ export function scoreToken({
   megaRunner,
   socialHype,
   config,
+  insiderBypass = null,
 }) {
   // Demand — 30 pts
   const demandScore =
@@ -1288,8 +1518,32 @@ export function scoreToken({
     demand.marketCap > 0 &&
     demand.liqToMcapPct < depthFloorPct;
 
+  // --- High-conviction insider bypass ------------------------------
+  //
+  // Config-gated override of exactly three gates. See resolveInsiderBypass for
+  // what it costs and what it deliberately cannot reach.
+  //
+  // `securityBypassed` requires auditFailuresAreBypassable, so a token that
+  // failed LP burn AND mint authority is not bypassed at all — one bypassable
+  // failure never carries a non-bypassable one through with it. Liquidity depth
+  // and the blacklist stay outside the override entirely and keep their place
+  // in this expression.
+  const bypass = insiderBypass?.allowed === true ? insiderBypass : null;
+  const securityBypassed = Boolean(bypass) && securityFailed && auditFailuresAreBypassable(audit);
+  const holderBypassed = Boolean(bypass) && holderFloorFailed;
+  const bypassedGates = [
+    ...(securityBypassed
+      ? (audit.checks ?? []).filter((c) => c.passed === false).map((c) => c.label)
+      : []),
+    ...(holderBypassed ? ['Minimum unique holders'] : []),
+  ];
+  const bypassApplied = bypassedGates.length > 0;
+
   const safetyGateFailed =
-    securityFailed || holderFloorFailed || liquidityGateFailed || Boolean(blacklistHit?.listed);
+    (securityFailed && !securityBypassed) ||
+    (holderFloorFailed && !holderBypassed) ||
+    liquidityGateFailed ||
+    Boolean(blacklistHit?.listed);
 
   // Smart money — additive bonus, and explicitly forfeited when safety fails.
   const smartBonus =
@@ -1311,7 +1565,14 @@ export function scoreToken({
   // let a 4-wallet swarm add +50 to a token whose contract was never verified.
   // The score cap on UNVERIFIED hid the effect, which is exactly why it needed
   // fixing: a later change to that cap would have silently reopened it.
-  const gatesFullyPassed = audit.status === 'PASSED' && !safetyGateFailed;
+  //
+  // A bypassed audit counts as passed HERE, and that is a real widening rather
+  // than an oversight. Without it the bypass would be decorative: a token whose
+  // concentration gate was overridden loses most of its distribution score, and
+  // stripping the cluster, mega-runner and hype bonuses on top leaves it far
+  // under telegram.insiderMinScore, so the alert it was unblocked for would
+  // never be sent. The bypass either lets the token score or it does nothing.
+  const gatesFullyPassed = (audit.status === 'PASSED' || securityBypassed) && !safetyGateFailed;
   const clusterBonus = gatesFullyPassed ? (clusters?.scoreBonus ?? 0) : 0;
 
   // Mega-runner viral volume. Held to the SAME standard as the cluster bonus —
@@ -1390,7 +1651,7 @@ export function scoreToken({
     verdict = 'SCAM/AVOID';
     impact = 'NEUTRAL';
     score = 0;
-  } else if (audit.status === 'FAILED') {
+  } else if (audit.status === 'FAILED' && !securityBypassed) {
     // Score 0, not a cap: a failed contract audit is disqualifying outright.
     verdict = 'SCAM/AVOID';
     impact = 'NEUTRAL';
@@ -1402,7 +1663,7 @@ export function scoreToken({
     verdict = 'THIN LIQUIDITY';
     impact = 'NEUTRAL';
     score = 0;
-  } else if (lowHolders) {
+  } else if (lowHolders && !holderBypassed) {
     // Score 0 and alerts blocked, same as a security failure — but kept under a
     // DISTINCT verdict label. A 140-holder token is early and illiquid, which is
     // not the same claim as "this is a scam". Merging them would put every fresh
@@ -1445,13 +1706,25 @@ export function scoreToken({
     safetyGateFailed,
     safetyGateReason: blacklistHit?.listed
       ? 'Blacklisted deployer or mint'
-      : securityFailed
+      : securityFailed && !securityBypassed
         ? audit.failures?.[0] ?? 'Contract audit failed'
-        : holderFloorFailed
+        : holderFloorFailed && !holderBypassed
           ? `Only ${security?.totalHolders} holders — below the ${effectiveHolderFloor} floor`
           : liquidityGateFailed
             ? `Liquidity is ${demand.liqToMcapPct.toFixed(1)}% of market cap — below the ${depthFloorPct}% slippage floor`
             : null,
+    // Null unless a gate genuinely failed AND was overridden, so the notifier
+    // and the note can state the override rather than reporting a clean pass.
+    insiderBypass: bypassApplied
+      ? {
+          applied: true,
+          floor: bypass.floor,
+          score: bypass.score,
+          wallet: bypass.wallet,
+          label: bypass.label,
+          gates: bypassedGates,
+        }
+      : null,
     smartMoneyForfeited: Boolean(smartMoney?.detected && safetyGateFailed),
     liquidityGate: {
       floorPct: depthFloorPct,

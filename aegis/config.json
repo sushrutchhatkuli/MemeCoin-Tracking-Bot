@@ -70,8 +70,8 @@
   "newsSentinel": {
     "_note": [
       "Breaking-news correlation. MEASURED source availability:",
-      "  CoinDesk / Cointelegraph / Decrypt / The Block RSS  200 ✅ no key",
-      "  CryptoPanic API                                     403 ❌ needs a key",
+      "  CoinDesk / Cointelegraph / Decrypt / The Block RSS  200 [OK]   no key",
+      "  CryptoPanic API                                     403 [FAIL] needs a key",
       "So RSS is the backbone; set CRYPTOPANIC_TOKEN in .env to add CryptoPanic.",
       "Dead sources are named in the scan log rather than silently dropped.",
       "",
@@ -110,9 +110,9 @@
   "socialTracer": {
     "_note": [
       "Search-spike tracking. MEASURED availability:",
-      "  CoinGecko /search/trending   200 ✅ no key, 15 coins",
-      "  CoinGecko /coins/{id}        200 ✅ no key, gives per-chain contracts",
-      "  Twitter/X API v2             401 ❌ paid bearer token required",
+      "  CoinGecko /search/trending   200 [OK]   no key, 15 coins",
+      "  CoinGecko /coins/{id}        200 [OK]   no key, gives per-chain contracts",
+      "  Twitter/X API v2             401 [FAIL] paid bearer token required",
       "So SEARCH SPIKE is real and MENTION VELOCITY is not. Twitter code is",
       "written and inert until TWITTER_BEARER_TOKEN is set.",
       "",
@@ -168,7 +168,7 @@
     "minBuySellRatio": 3,
     "minBuys": 10,
     "scoreBoost": 25,
-    "alertHeader": "🔥 380x MEGA-RUNNER VIRAL ALERT ($50k+ Vol & High Demand!) 🔥",
+    "alertHeader": "380x MEGA-RUNNER VIRAL ALERT ($50k+ Vol & High Demand!)",
     "_alertHeaderNote": [
       "The '380x' is a fixed string in the header, not a computed figure —",
       "Aegis has no way to project a multiple and does not try. It will read as",
@@ -178,7 +178,7 @@
       "movement 'from the alert market cap, not your P&L' precisely so a number",
       "is never mistaken for a promise. This header is the one place that",
       "convention is broken, at explicit request. A neutral alternative:",
-      "  '🔥 MEGA-RUNNER VIRAL ALERT ($50k+ Vol & High Demand!) 🔥'",
+      "  'MEGA-RUNNER VIRAL ALERT ($50k+ Vol & High Demand!)'",
       "Change this one string to switch; nothing else depends on it."
     ]
   },
@@ -262,9 +262,9 @@
         "the top-level communityTakeover block; this is only the label, advice",
         "and alert header."
       ],
-      "label": "🚀 COMMUNITY TAKEOVER GEM",
-      "advice": "🚀 Community takeover — the developer has exited and the crowd is driving. No dev to rug, and no dev to build.",
-      "alertHeader": "🚀 COMMUNITY TAKEOVER (CTO) ALERT 🚀",
+      "label": "COMMUNITY TAKEOVER GEM",
+      "advice": "Community takeover — the developer has exited and the crowd is driving. No dev to rug, and no dev to build.",
+      "alertHeader": "COMMUNITY TAKEOVER (CTO) ALERT",
       "scoreBoost": 20
     },
     "insiderEstablished": {
@@ -278,9 +278,9 @@
       "minLiquidityUsd": 100000,
       "minHolders": 1000,
       "scoreBoost": 10,
-      "label": "💎 ESTABLISHED INSIDER GEM",
-      "advice": "💎 Established insider accumulation — high 90%+ survival rate & deep liquidity.",
-      "alertHeader": "💎 ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC) 💎"
+      "label": "ESTABLISHED INSIDER GEM",
+      "advice": "Established insider accumulation — high 90%+ survival rate & deep liquidity.",
+      "alertHeader": "ESTABLISHED INSIDER GEM ALERT ($1M–$10M MC)"
     },
     "insiderEarly": {
       "_note": [
@@ -349,9 +349,9 @@
         "this targets. Set minInsiderWallets there too if you want it."
       ],
       "scoreBoost": 0,
-      "label": "⚡ EARLY-STAGE INSIDER SCALP",
-      "advice": "⚡ Early insider entry — massive upside potential. Enforce tight -15% stop-loss!",
-      "alertHeader": "🚀 EARLY INSIDER SCALP ALERT ($30k–$500k MC) 🚀"
+      "label": "EARLY-STAGE INSIDER SCALP",
+      "advice": "Early insider entry — massive upside potential. Enforce tight -15% stop-loss!",
+      "alertHeader": "EARLY INSIDER SCALP ALERT ($30k–$500k MC)"
     },
     "gem": {
       "minMarketCapUsd": 300000,
@@ -359,15 +359,15 @@
       "minAgeHours": 12,
       "minHolders": 0,
       "scoreBoost": 10,
-      "label": "💎 ESTABLISHED GEM / ACCUMULATION",
-      "advice": "💎 Long-term accumulation setup — suitable for holding over days/weeks."
+      "label": "ESTABLISHED GEM / ACCUMULATION",
+      "advice": "Long-term accumulation setup — suitable for holding over days/weeks."
     },
     "scalp": {
       "minMarketCapUsd": 15000,
       "maxMarketCapUsd": 1000000,
       "maxAgeHours": 24,
-      "label": "⚡ FAST MOMENTUM SCALP",
-      "advice": "⚡ Fast momentum trade — take initial profit at +50% to +100%!"
+      "label": "FAST MOMENTUM SCALP",
+      "advice": "Fast momentum trade — take initial profit at +50% to +100%!"
     }
   },
   "communityTakeover": {
@@ -538,6 +538,56 @@
     "buyerRetries": 2,
     "rpcBackoffMs": 700,
     "rpcDelayMs": 220,
+    "allowInsiderSafetyBypass": true,
+    "insiderBypassScoreFloor": 85,
+    "_insiderBypassNote": [
+      "HIGH-CONVICTION INSIDER ANTI-RUG BYPASS. This is a switch that turns OFF",
+      "safety checks. Read the whole note before leaving it on.",
+      "",
+      "WHAT IT DOES. When a matched insider carries a score >= the floor, three",
+      "gates stop blocking that token: LP burn/lock, top-10 concentration, and",
+      "the unique-holder floor (global AND the per-tier one). The token is then",
+      "scored, classified into an insider tier and alerted as though those gates",
+      "had passed, and the alert carries a HIGH-RISK NOTICE naming each waived",
+      "gate with its real measured value.",
+      "",
+      "WHAT IT CANNOT REACH, by construction, not by configuration:",
+      "  mint authority, freeze authority, rug/danger flags, a SERIAL RUGGER",
+      "  deployer, the blacklist, and liquidity depth. Also UNVERIFIED audits —",
+      "  the override clears gates that FAILED on known data, never gates that",
+      "  could not be checked. And a token failing a bypassable gate AND a",
+      "  non-bypassable one is not bypassed at all.",
+      "",
+      "WHAT YOU ARE TRADING AWAY, plainly. An unburned LP is the developer still",
+      "holding the ability to withdraw the pool. A concentrated top 10 is the",
+      "list of wallets that will be selling into you. A thin holder base is the",
+      "absence of anyone to sell to when you want out. A high-scoring buyer",
+      "changes none of the three — it is a fact about the buyer, not about the",
+      "contract.",
+      "",
+      "THIS OPENS AN ATTACK THE REST OF THE ENGINE WAS BUILT TO CLOSE. audit.mjs",
+      "states it directly at the security-first gate: a malicious dev can buy",
+      "their own scam from a wallet on an alpha list, and if that could lift the",
+      "verdict it would be a way to walk a rug past the audit. Every bonus in the",
+      "engine — smart money, cluster, mega-runner, social hype — is forfeited on",
+      "a gate failure for exactly this reason. This switch is the exception.",
+      "",
+      "ON THE FLOOR ITSELF. The score is multiplier_engine alpha points, which",
+      "are awarded at pointsPerMultiplier (2.5) per x of a harvested recap win",
+      "and then moved by forward results (+5 win, -8 loss, floor -50). So 85",
+      "means roughly a 34x launch buy, or a smaller win plus a good forward run.",
+      "That is a real bar and a small population. But those points are awarded",
+      "BECAUSE a wallet was present at a token that won — selection on the",
+      "outcome — and multiplierEngine._note explains at length why that is a",
+      "reason to watch a wallet rather than evidence about it. A wallet can also",
+      "carry a hand-set 'score' field in smart_wallets.json; a wallet with no",
+      "score at all is null and never clears the floor.",
+      "",
+      "Set allowInsiderSafetyBypass to false to restore the normal behaviour: the",
+      "gates are absolute and no score overrides them. Raising",
+      "insiderBypassScoreFloor narrows how many wallets can trigger it; there is",
+      "no setting that makes a bypassed token as safe as an unbypassed one."
+    ],
     "screening": {
       "maxWalletSol": 100000,
       "maxTokenAccounts": 1000,

@@ -22,10 +22,13 @@ import {
   scoreToken,
   concentrationCapFor,
   runSecurityAudit,
+  applyDeployerVerdict,
   classifySignal,
   evaluateInsiderRequirements,
   evaluateSecurityShield,
   evaluateCommunityTakeover,
+  resolveInsiderBypass,
+  auditFailuresAreBypassable,
   applyCtoOverride,
   detectMegaRunner,
   tractionFrom,
@@ -34,7 +37,7 @@ import {
   resolveHolderFloor,
   SIGNAL_CATEGORY,
 } from '../audit.mjs';
-import { alertHeaderLines, parseCommand, handleCommand } from '../telegram.mjs';
+import { alertHeaderLines, buildMessage, maybeAlert, parseCommand, handleCommand } from '../telegram.mjs';
 import { stopLossPctFor, armedTrailingLock, evaluateTriggers, detectLiquidityDrain, TRIGGER } from '../sell_notifier.mjs';
 import { walletScorecard } from '../wallet_observations.mjs';
 import { detectJitoBundles } from '../insider_cluster.mjs';
@@ -777,6 +780,512 @@ test('a CTO waives the depth RATIO but no other gate', () => {
     });
     assert.equal(r.passed, false, `CTO must not waive ${Object.keys(secOver)[0]}`);
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * High-conviction insider anti-rug bypass
+ *
+ * This is the one feature in the engine that turns safety gates OFF, so the
+ * tests are written from both directions: every assertion that the bypass WORKS
+ * is paired with one that it stays contained. The containment half is the more
+ * important of the two — a bug that lets the override reach mint authority, an
+ * UNVERIFIED audit or the blacklist is a bug that walks a rug into an alert.
+ * ------------------------------------------------------------------ */
+
+const bypassConfig = (over = {}) => ({
+  smartMoney: { allowInsiderSafetyBypass: true, insiderBypassScoreFloor: 85, ...over },
+});
+
+/** A cluster whose top insider carries `score` alpha points. */
+const scoredInsiders = (score, count = 2) => ({
+  detected: true,
+  insiderCount: count,
+  label: 'INSIDER CLUSTER',
+  // Present and empty, matching what detectInsiderClusters always returns —
+  // renderClusters reads both, and a thinner fixture fails inside the renderer
+  // rather than at the assertion.
+  networks: [],
+  oversized: [],
+  uniqueInsiders: [
+    { wallet: 'InsiderWalletAaaaaaaaaaaaaaaaaaaaaaaaaaaaa', label: 'Elite Whale #1', insiderScore: score },
+    { wallet: 'InsiderWalletBbbbbbbbbbbbbbbbbbbbbbbbbbbbb', insiderScore: 10 },
+  ],
+});
+
+const allowedBypass = (score = 105) =>
+  resolveInsiderBypass({ clusters: scoredInsiders(score), config: bypassConfig() });
+
+/** A real FAILED audit whose only failing row is one the bypass covers. */
+const lpFailedAudit = (over = {}) =>
+  runSecurityAudit(cleanSecurity({ lpLockedPct: 40, ...over }), {
+    minLpLockedPct: 99,
+    maxTop10Pct: 25,
+    maxTotalTaxPct: 5,
+  });
+
+test('the bypass unlocks only when it is enabled AND an insider clears the floor', () => {
+  const cfg = bypassConfig();
+
+  assert.equal(resolveInsiderBypass({ clusters: scoredInsiders(105), config: cfg }).allowed, true);
+  assert.equal(resolveInsiderBypass({ clusters: scoredInsiders(85), config: cfg }).allowed, true, 'the floor is inclusive');
+  assert.equal(resolveInsiderBypass({ clusters: scoredInsiders(84.9), config: cfg }).allowed, false);
+
+  // The switch itself.
+  const off = resolveInsiderBypass({
+    clusters: scoredInsiders(105),
+    config: bypassConfig({ allowInsiderSafetyBypass: false }),
+  });
+  assert.equal(off.allowed, false);
+  assert.equal(off.enabled, false);
+
+  // Absent key is off, not on. A loosening must be opted into explicitly.
+  assert.equal(resolveInsiderBypass({ clusters: scoredInsiders(105), config: {} }).allowed, false);
+
+  // No insider activity at all — nothing to bypass on.
+  assert.equal(resolveInsiderBypass({ clusters: { detected: false }, config: cfg }).allowed, false);
+});
+
+test('an insider with no score never clears the floor — unscored is not zero and not a pass', () => {
+  const unscored = { detected: true, insiderCount: 3, uniqueInsiders: [{ wallet: 'W1' }, { wallet: 'W2' }] };
+  const r = resolveInsiderBypass({ clusters: unscored, config: bypassConfig() });
+  assert.equal(r.allowed, false);
+  assert.equal(r.score, null);
+  assert.match(r.reason, /unscored does not clear the floor/);
+
+  // The HIGHEST scoring insider decides it, not the first or the last.
+  const mixed = {
+    detected: true,
+    insiderCount: 3,
+    uniqueInsiders: [{ wallet: 'W1', insiderScore: 4 }, { wallet: 'W2' }, { wallet: 'W3', insiderScore: 90 }],
+  };
+  const best = resolveInsiderBypass({ clusters: mixed, config: bypassConfig() });
+  assert.equal(best.allowed, true);
+  assert.equal(best.score, 90);
+  assert.equal(best.wallet, 'W3');
+});
+
+test('the bypass clears LP, concentration and holders — and nothing else', () => {
+  const broken = cleanSecurity({ lpLockedPct: 40, top10Pct: 55, totalHolders: 12 });
+
+  const blocked = evaluateSecurityShield({
+    security: broken,
+    demand: healthyDemand,
+    thresholds: shieldThresholds,
+  });
+  assert.equal(blocked.passed, false, 'three gates fail without the override');
+  assert.equal(blocked.failures.length, 3);
+
+  const bypassed = evaluateSecurityShield({
+    security: broken,
+    demand: healthyDemand,
+    thresholds: shieldThresholds,
+    insiderBypass: allowedBypass(),
+  });
+  assert.equal(bypassed.passed, true);
+  assert.equal(bypassed.insiderBypassApplied, true);
+  assert.deepEqual(bypassed.bypassedGates, [
+    'LP burned / locked',
+    'Top 10 non-LP concentration',
+    'Minimum unique holders',
+  ]);
+
+  // The rows keep their REAL measured values. An alert that reported a clean
+  // shield here would be lying about the token it is recommending.
+  const lp = bypassed.checks.find((c) => c.gate === 'lp');
+  assert.equal(lp.bypassed, true);
+  assert.match(lp.detail, /40\.0% burned \/ locked/);
+  assert.match(lp.detail, /\[BYPASSED\] did not pass, overridden by insider score 105 ≥ floor 85/);
+  // Exactly once — the renderer used to append a second tag of its own.
+  assert.equal(lp.detail.match(/\[BYPASSED\]/g).length, 1);
+
+  // Gates outside the set stay absolute, at any score.
+  for (const [what, secOver, demandOver] of [
+    ['mint authority', { mintAuthority: 'MintAuth1111' }, {}],
+    ['freeze authority', { freezeAuthority: 'FreezeAuth111' }, {}],
+    ['liquidity depth', {}, { liqToMcapPct: 4, liquidityUsd: 20_000 }],
+  ]) {
+    const r = evaluateSecurityShield({
+      security: cleanSecurity(secOver),
+      demand: { ...healthyDemand, ...demandOver },
+      thresholds: shieldThresholds,
+      insiderBypass: allowedBypass(9_999),
+    });
+    assert.equal(r.passed, false, `${what} must not be bypassable`);
+  }
+
+  // A gate that already passed is never marked bypassed.
+  const clean = evaluateSecurityShield({
+    security: cleanSecurity(),
+    demand: healthyDemand,
+    thresholds: shieldThresholds,
+    insiderBypass: allowedBypass(),
+  });
+  assert.equal(clean.insiderBypassApplied, false);
+  assert.deepEqual(clean.bypassedGates, []);
+});
+
+test('only an audit whose every failure is bypassable can be overridden', () => {
+  assert.equal(auditFailuresAreBypassable(lpFailedAudit()), true, 'LP burn alone');
+  assert.equal(
+    auditFailuresAreBypassable(lpFailedAudit({ top10Pct: 44 })),
+    true,
+    'LP burn + concentration'
+  );
+
+  // One non-bypassable failure poisons the whole audit — a bypassable failure
+  // must never carry a live mint authority through alongside it.
+  assert.equal(
+    auditFailuresAreBypassable(lpFailedAudit({ mintAuthority: 'MintAuth1111' })),
+    false
+  );
+  assert.equal(auditFailuresAreBypassable(lpFailedAudit({ rugged: true })), false);
+
+  // A serial-rugger row is appended by applyDeployerVerdict and is not bypassable.
+  const withRugger = applyDeployerVerdict(lpFailedAudit(), {
+    status: 'SERIAL RUGGER',
+    reasons: ['3 of 4 past deploys dead'],
+  });
+  assert.equal(auditFailuresAreBypassable(withRugger), false);
+
+  // UNVERIFIED has no failing rows at all. Missing provider data is not a gate
+  // an insider score is allowed to vouch for.
+  const unverified = runSecurityAudit(cleanSecurity({ lpLockedPct: null }), {
+    minLpLockedPct: 99,
+    maxTop10Pct: 25,
+  });
+  assert.equal(unverified.status, 'UNVERIFIED');
+  assert.equal(auditFailuresAreBypassable(unverified), false);
+  assert.equal(auditFailuresAreBypassable(PASSED), false, 'nothing to bypass on a pass');
+});
+
+test('a high-point insider carries an unburned-LP token past the safety gate', () => {
+  const base = {
+    audit: lpFailedAudit(),
+    security: cleanSecurity({ lpLockedPct: 40 }),
+    demand: strongDemand,
+    velocity: null,
+    catalysts: { bullish: [], bearish: [] },
+    thresholds,
+    clusters: scoredInsiders(105),
+    signalCategory: { category: SIGNAL_CATEGORY.INSIDER_EARLY },
+  };
+
+  assert.equal(base.audit.status, 'FAILED', 'fixture sanity — the LP gate really failed');
+
+  const bypassed = scoreToken({
+    ...base,
+    insiderBypass: resolveInsiderBypass({ clusters: base.clusters, config: bypassConfig() }),
+  });
+  assert.equal(bypassed.safetyGateFailed, false);
+  assert.equal(bypassed.safetyGateReason, null);
+  assert.notEqual(bypassed.verdict, 'SCAM/AVOID');
+  assert.ok(bypassed.score > 0, 'a bypassed token must be able to score, or the switch is inert');
+  assert.equal(bypassed.insiderBypass.applied, true);
+  assert.equal(bypassed.insiderBypass.score, 105);
+  assert.deepEqual(bypassed.insiderBypass.gates, ['Liquidity Pool']);
+
+  // Same token, same insiders, switch off.
+  const blocked = scoreToken({
+    ...base,
+    insiderBypass: resolveInsiderBypass({
+      clusters: base.clusters,
+      config: bypassConfig({ allowInsiderSafetyBypass: false }),
+    }),
+  });
+  assert.equal(blocked.safetyGateFailed, true, 'blocked when allowInsiderSafetyBypass is false');
+  assert.equal(blocked.verdict, 'SCAM/AVOID');
+  assert.equal(blocked.score, 0);
+  assert.equal(blocked.insiderBypass, null);
+
+  // And below the floor, with the switch on.
+  const underFloor = scoreToken({
+    ...base,
+    clusters: scoredInsiders(60),
+    insiderBypass: resolveInsiderBypass({ clusters: scoredInsiders(60), config: bypassConfig() }),
+  });
+  assert.equal(underFloor.safetyGateFailed, true, 'a 60-point insider is not a 85-point one');
+  assert.equal(underFloor.verdict, 'SCAM/AVOID');
+
+  // Omitting the argument entirely is the pre-existing behaviour, unchanged.
+  assert.equal(scoreToken(base).safetyGateFailed, true);
+});
+
+test('the holder floor is bypassable and the liquidity floor is not', () => {
+  const base = {
+    audit: PASSED,
+    security: cleanSecurity({ totalHolders: 12 }),
+    demand: strongDemand,
+    velocity: null,
+    catalysts: { bullish: [], bearish: [] },
+    thresholds,
+    clusters: scoredInsiders(105),
+  };
+
+  assert.equal(scoreToken(base).verdict, 'UNVERIFIED / LOW HOLDERS');
+
+  const bypassed = scoreToken({ ...base, insiderBypass: allowedBypass() });
+  assert.equal(bypassed.safetyGateFailed, false);
+  assert.notEqual(bypassed.verdict, 'UNVERIFIED / LOW HOLDERS');
+  assert.deepEqual(bypassed.insiderBypass.gates, ['Minimum unique holders']);
+  // The gate report still states the truth: 12 holders, floor not passed.
+  assert.equal(bypassed.holderGate.passed, false);
+  assert.equal(bypassed.holderGate.holders, 12);
+
+  // Depth is outside the override, by specification and on purpose: a pool you
+  // cannot exit is untradeable no matter who else is in it.
+  const thin = scoreToken({
+    ...base,
+    security: cleanSecurity(),
+    demand: { ...strongDemand, liquidityUsd: 8_000, liqToMcapPct: 3.2 },
+    insiderBypass: allowedBypass(9_999),
+  });
+  assert.equal(thin.verdict, 'THIN LIQUIDITY');
+  assert.equal(thin.safetyGateFailed, true);
+  assert.equal(thin.score, 0);
+});
+
+test('a blacklist, a serial rugger and a mixed audit failure all survive the bypass', () => {
+  const base = {
+    security: cleanSecurity({ lpLockedPct: 40 }),
+    demand: strongDemand,
+    velocity: null,
+    catalysts: { bullish: [], bearish: [] },
+    thresholds,
+    clusters: scoredInsiders(9_999),
+    insiderBypass: allowedBypass(9_999),
+  };
+
+  const blacklisted = scoreToken({
+    ...base,
+    audit: lpFailedAudit(),
+    blacklistHit: { listed: true, reason: 'known rug deployer' },
+  });
+  assert.equal(blacklisted.verdict, 'SCAM/AVOID');
+  assert.equal(blacklisted.safetyGateFailed, true);
+
+  const rugger = scoreToken({
+    ...base,
+    audit: lpFailedAudit(),
+    deployer: { status: 'SERIAL RUGGER', reasons: ['3 of 4 past deploys dead'] },
+  });
+  assert.equal(rugger.verdict, 'SCAM/AVOID');
+  assert.equal(rugger.score, 0);
+
+  // LP burn is bypassable, a live mint authority is not, and the pair together
+  // is not bypassable at all.
+  const mixed = scoreToken({
+    ...base,
+    audit: lpFailedAudit({ mintAuthority: 'MintAuth1111' }),
+    security: cleanSecurity({ lpLockedPct: 40, mintAuthority: 'MintAuth1111' }),
+  });
+  assert.equal(mixed.verdict, 'SCAM/AVOID');
+  assert.equal(mixed.safetyGateFailed, true);
+  assert.equal(mixed.insiderBypass, null);
+});
+
+test('the bypass reaches the insider tier gate, or it would unblock nothing', () => {
+  // Without this, a bypassed token clears the shield and is then refused a tier,
+  // and the notifier drops it at `outside-insider-tiers` — a switch that does
+  // nothing at all. Asserted so that stays true.
+  const demand = { marketCap: 60_000, liquidityUsd: 25_000, ageHours: 0.4, ageIsLowerBound: false };
+  const security = cleanSecurity({ lpLockedPct: 40, top10Pct: 55, totalHolders: 20 });
+  const audit = lpFailedAudit({ top10Pct: 55 });
+
+  const blocked = classifySignal({ demand, security, config: insiderConfig, clusters: insiders(), audit });
+  assert.equal(blocked.category, SIGNAL_CATEGORY.NONE);
+  assert.equal(blocked.insiderRequirements.passed, false);
+
+  const promoted = classifySignal({
+    demand,
+    security,
+    config: { ...insiderConfig, ...bypassConfig() },
+    clusters: scoredInsiders(105),
+    audit,
+    insiderBypass: allowedBypass(),
+  });
+  assert.equal(promoted.category, SIGNAL_CATEGORY.INSIDER_EARLY);
+  assert.equal(promoted.insiderRequirements.passed, true);
+  assert.equal(promoted.insiderRequirements.insiderBypassApplied, true);
+  assert.deepEqual(promoted.insiderRequirements.bypassedGates, [
+    'Contract audit',
+    'LP burned / locked',
+    'Top 10 concentration',
+  ]);
+
+  // Insider detection itself is never waived: with no cluster there is no
+  // bypass, so an empty roster cannot promote a token on configuration alone.
+  const noInsiders = classifySignal({
+    demand,
+    security,
+    config: { ...insiderConfig, ...bypassConfig() },
+    clusters: { detected: false },
+    audit,
+    insiderBypass: resolveInsiderBypass({ clusters: { detected: false }, config: bypassConfig() }),
+  });
+  assert.equal(isInsiderCategory(noInsiders.category), false);
+
+  // Mint authority still refuses the tier at any score.
+  const minted = classifySignal({
+    demand,
+    security: cleanSecurity({ lpLockedPct: 40, mintAuthority: 'MintAuth1111' }),
+    config: { ...insiderConfig, ...bypassConfig() },
+    clusters: scoredInsiders(9_999),
+    audit: lpFailedAudit({ mintAuthority: 'MintAuth1111' }),
+    insiderBypass: allowedBypass(9_999),
+  });
+  assert.equal(minted.category, SIGNAL_CATEGORY.NONE);
+});
+
+test('the bypassed alert leads with the high-risk notice', () => {
+  const lines = alertHeaderLines({
+    signalCategory: { alertHeader: 'EARLY INSIDER SCALP ALERT ($30k–$500k MC)' },
+    clusters: insiders(2),
+    insiderBypass: {
+      applied: true,
+      score: 105,
+      floor: 85,
+      wallet: 'InsiderWalletAaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      label: 'Elite Whale #1',
+      gates: ['Liquidity Pool', 'Minimum unique holders'],
+    },
+  });
+
+  assert.match(lines[0], /HIGH-RISK NOTICE: ANTI-RUG SHIELD BYPASSED BY HIGH-CONVICTION INSIDER/);
+  assert.match(lines[1], /Matched Insider Score/);
+  assert.match(lines[1], /105/);
+  assert.match(lines[1], /85\+ required \(High-Alpha Override\)/);
+  assert.ok(
+    lines.some((l) => /Liquidity Pool, Minimum unique holders/.test(l)),
+    'the waived gates are named, not just the fact of a waiver'
+  );
+  assert.ok(
+    lines.some((l) => /Mint authority, freeze authority.*NOT bypassed/.test(l)),
+    'and what was still enforced is stated too'
+  );
+  assert.ok(
+    lines.some((l) => /EARLY INSIDER SCALP ALERT/.test(l)),
+    'the tier header survives below the notice'
+  );
+
+  // No notice on an ordinary alert.
+  const plain = alertHeaderLines({
+    signalCategory: { alertHeader: 'EARLY INSIDER SCALP ALERT ($30k–$500k MC)' },
+    clusters: insiders(2),
+  });
+  assert.equal(plain.some((l) => /HIGH-RISK NOTICE/.test(l)), false);
+});
+
+/**
+ * End to end through the dispatcher, which is where the switch either works or
+ * does not. Built by running the real classify -> score chain rather than by
+ * hand-writing a verdict, so a change that breaks the chain fails here.
+ */
+function bypassPipeline({ allow = true, insiderScore = 105, security, audit } = {}) {
+  const config = {
+    ...insiderConfig,
+    ...bypassConfig({ allowInsiderSafetyBypass: allow }),
+    telegram: {
+      enabled: true,
+      insiderOnly: true,
+      insiderTiersOnly: true,
+      insiderMinScore: 68,
+      cooldownHours: 6,
+    },
+  };
+  const clusters = scoredInsiders(insiderScore);
+  const insiderBypass = resolveInsiderBypass({ clusters, config });
+  const demand = { ...strongDemand, marketCap: 60_000 };
+  const sec = security ?? cleanSecurity({ lpLockedPct: 40 });
+  const aud = audit ?? lpFailedAudit();
+
+  const signalCategory = classifySignal({ demand, security: sec, config, clusters, audit: aud, insiderBypass });
+  const verdictInfo = scoreToken({
+    audit: aud,
+    security: sec,
+    demand,
+    velocity: null,
+    catalysts: { bullish: [], bearish: [] },
+    thresholds,
+    clusters,
+    signalCategory,
+    config,
+    insiderBypass,
+  });
+
+  return {
+    config,
+    result: { verdictInfo, demand, security: sec, audit: aud, clusters, signalCategory, smartMoney: null, deployer: null },
+    pair: { chainId: 'solana', baseToken: { symbol: 'BYPASS', address: MINT } },
+  };
+}
+
+test('the notifier sends a bypassed token and blocks it when the switch is off', async () => {
+  const on = bypassPipeline({ allow: true });
+  assert.equal(on.result.verdictInfo.insiderBypass.applied, true);
+  assert.ok(on.result.verdictInfo.score >= 68, 'must clear the alert floor or the switch is inert');
+
+  // Stops at 'no-credentials', which is AFTER the safety and audit blocks — so
+  // reaching it proves the failed audit did not stop the dispatch.
+  const sent = await maybeAlert({
+    result: on.result,
+    pair: on.pair,
+    credentials: {},
+    config: on.config,
+    alertLog: {},
+    now: Date.now(),
+  });
+  assert.equal(sent.status, 'no-credentials');
+
+  const off = bypassPipeline({ allow: false });
+  const blocked = await maybeAlert({
+    result: off.result,
+    pair: off.pair,
+    credentials: {},
+    config: off.config,
+    alertLog: {},
+    now: Date.now(),
+  });
+  assert.equal(blocked.status, 'blocked-safety');
+
+  // The dispatcher re-derives the bypass from config rather than trusting the
+  // verdict. A verdict claiming a bypass while config forbids one is blocked.
+  const forged = {
+    ...on.result,
+    verdictInfo: { ...on.result.verdictInfo, safetyGateFailed: false },
+  };
+  const refused = await maybeAlert({
+    result: forged,
+    pair: on.pair,
+    credentials: {},
+    config: { ...on.config, smartMoney: { allowInsiderSafetyBypass: false } },
+    alertLog: {},
+    now: Date.now(),
+  });
+  assert.equal(refused.status, 'blocked-audit-not-passed');
+});
+
+test('the bypassed alert body states what was waived instead of showing a clean shield', () => {
+  const { result, pair, config } = bypassPipeline({ allow: true });
+  const text = buildMessage({
+    pair,
+    demand: result.demand,
+    verdictInfo: { ...result.verdictInfo, securityStatus: result.audit.status },
+    smartMoney: null,
+    deployer: null,
+    security: result.security,
+    tradeLink: { template: 'https://example.test/{chain}/{address}', label: 'Trade' },
+    reaudit: { ran: false },
+    signalCategory: result.signalCategory,
+    clusters: result.clusters,
+    thresholds: config.thresholds,
+    sizerConfig: config,
+  });
+
+  assert.match(text, /HIGH-RISK NOTICE: ANTI-RUG SHIELD BYPASSED BY HIGH-CONVICTION INSIDER/);
+  assert.match(text, /Matched Insider Score/);
+  assert.match(text, /\[BYPASSED\]/);
+  // The real LP figure is still printed beside the waived row.
+  assert.match(text, /40\.0% burned \/ locked/);
 });
 
 /* ------------------------------------------------------------------ *
