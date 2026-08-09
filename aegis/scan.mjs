@@ -62,6 +62,7 @@ import { detectInsiderClusters, clusterScoreBonus } from './insider_cluster.mjs'
 import { discoverNetwork, loadDiscovered, saveDiscovered, walletLinks } from './network_discovery.mjs';
 import { fetchBreakingNews, matchTokenToNews } from './news_sentinel.mjs';
 import { fetchTrending, scoreSocialHype } from './social_tracer.mjs';
+import { loadSurfaced, surfacedFreshness } from './discovery_daemon.mjs';
 import {
   loadObservations,
   saveObservations,
@@ -722,11 +723,39 @@ export async function runScan(args = {}) {
     }
     pairs = [pair];
   } else {
-    console.log(`🔎 Discovering launches on: ${chains.join(', ')}`);
-    const { candidates, stats } = await discoverCandidates(chains, config.discovery);
-    console.log(
-      `   ${stats.total} candidates surfaced (${stats.fromFeeds} from launch feeds, ${stats.fromSearch} from search).`
-    );
+    // Prefer the daemon's pre-surfaced pool. Discovery is a FIXED cost that
+    // does not shrink with the audit limit, so on the loop it sat in front of
+    // every tick and `scanLimit` could not touch it. Reading a fresh file is
+    // effectively free.
+    //
+    // Falls back to discovering inline when the pool is stale or absent, and
+    // SAYS which path it took. A stale pool is worse than a slow scan here:
+    // these tokens are minutes old, so a five-minute-old list of "fresh
+    // launches" is mostly the previous window's.
+    const maxAgeSec = config.discovery?.maxCandidateAgeSeconds ?? 180;
+    const surfaced = await loadSurfaced(join(HERE, '.state', 'surfaced_candidates.json'));
+    const fresh = surfacedFreshness(surfaced, maxAgeSec, now.getTime());
+
+    let candidates;
+    let stats;
+    if (fresh.fresh) {
+      candidates = surfaced.candidates;
+      stats = surfaced.stats ?? { total: candidates.length, fromFeeds: '?', fromSearch: '?' };
+      console.log(
+        `🔎 Candidates from discovery daemon: ${candidates.length} (${fresh.ageSec.toFixed(0)}s old, 0s discovery latency)`
+      );
+    } else {
+      console.log(
+        `🔎 Discovering launches on: ${chains.join(', ')}` +
+          (surfaced.generatedAt
+            ? ` — daemon pool ${fresh.ageSec.toFixed(0)}s old, past the ${maxAgeSec}s limit`
+            : ' — no daemon pool on file')
+      );
+      ({ candidates, stats } = await discoverCandidates(chains, config.discovery));
+      console.log(
+        `   ${stats.total} candidates surfaced (${stats.fromFeeds} from launch feeds, ${stats.fromSearch} from search).`
+      );
+    }
 
     const byChain = new Map();
     for (const c of candidates) {

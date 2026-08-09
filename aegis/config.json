@@ -499,7 +499,9 @@
       "dog",
       "pump"
     ],
-    "searchMinMarketCapUsd": 300000
+    "searchMinMarketCapUsd": 300000,
+    "daemonIntervalSeconds": 60,
+    "maxCandidateAgeSeconds": 180
   },
   "postMortem": {
     "enabled": true,
