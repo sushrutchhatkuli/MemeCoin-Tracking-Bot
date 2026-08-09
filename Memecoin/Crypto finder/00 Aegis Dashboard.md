@@ -2,7 +2,7 @@
 tags:
   - dashboard
 ---
-
+Aegis night command on terminal: cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; Stop-Process -Name node -Force; node aegis/loop.mjs
 # 🛰️ Aegis-Crypto Command Dashboard
 
 > [!info] How this vault is fed

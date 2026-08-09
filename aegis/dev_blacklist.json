@@ -2638,6 +2638,18 @@
       "reason": "Post-mortem: $MONKE fell -85.5% within 3.12h",
       "added": "2026-08-09",
       "source": "post-mortem"
+    },
+    {
+      "address": "7HB4Wx2hQVsT3uRfLhcqQHti6iMca28qynTA4PAY812c",
+      "reason": "Post-mortem: $CLIP fell -88.6% within 4.32h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "2GKYFhkWpaJVJchPPQfKMbijtE8D9m7pQpfd7AFqJPjY",
+      "reason": "Post-mortem: $toad64 fell -100% within 1.78h (pair delisted)",
+      "added": "2026-08-09",
+      "source": "post-mortem"
     }
   ],
   "mints": [
