@@ -2698,6 +2698,18 @@
       "reason": "Post-mortem: $Callturt fell -100% within 1.04h (pair delisted)",
       "added": "2026-08-09",
       "source": "post-mortem"
+    },
+    {
+      "address": "HDns85w46vh4qpaxNvKfFX25T2gbi4nMBKB6SR4Zoi8g",
+      "reason": "Post-mortem: $BLOOM fell -98.8% within 1.14h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "9ezo6feKhXuqXRg2UHJyu21BnxbcLH5rYENe3qgNLRwU",
+      "reason": "Post-mortem: $PORF fell -100% within 1.07h (pair delisted)",
+      "added": "2026-08-09",
+      "source": "post-mortem"
     }
   ],
   "mints": [
