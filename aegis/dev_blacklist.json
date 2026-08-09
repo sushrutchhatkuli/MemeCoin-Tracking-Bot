@@ -2650,6 +2650,48 @@
       "reason": "Post-mortem: $toad64 fell -100% within 1.78h (pair delisted)",
       "added": "2026-08-09",
       "source": "post-mortem"
+    },
+    {
+      "address": "ECU66AaYXuhA5MiWMy4Q4j8mLdTjxutV39PhTzrn28q",
+      "reason": "Post-mortem: $FOMOGUY fell -76.3% within 1.39h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "SpaZAWuVYoXH5qn3p5Tr8jJLqostHqc48py3EHvCXHq",
+      "reason": "Post-mortem: $SPAZ fell -100% within 1.23h (pair delisted)",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "DDia6excQHrdSc1BqniNeYX46XBT7SQDe9Sj8GXnBQaJ",
+      "reason": "Post-mortem: $MIDASTOAD fell -99.1% within 1.07h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "DGXiWLpjDKB5G62ffmtVRKfidDySRniuQ8r6YnNR4zkH",
+      "reason": "Post-mortem: $KEK fell -98.3% within 1.31h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "7y5tNJ2VhmMigLgUr9CMhB9okC9vNu9zE1ZQDcZtyUXf",
+      "reason": "Post-mortem: $MONKEYWIF fell -100% within 1.23h (pair delisted)",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "3ep9ycgU8LEDFvUYqM3CvJ6C2e7BMvvLACyxmemCfyEN",
+      "reason": "Post-mortem: $Atlas fell -82.5% within 5.35h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "3MGGxpGBQDRtjtNpZhk3NQGrmrJRnGTgVzfrNyZuhgxN",
+      "reason": "Post-mortem: $SADDYMIAW fell -98.2% within 1.07h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
     }
   ],
   "mints": [
