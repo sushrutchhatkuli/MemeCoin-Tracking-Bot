@@ -1153,6 +1153,7 @@ export function scoreToken({
   signalCategory,
   clusters,
   megaRunner,
+  socialHype,
 }) {
   // Demand — 30 pts
   const demandScore =
@@ -1265,6 +1266,15 @@ export function scoreToken({
   // on a token whose contract was never verified.
   const megaRunnerBonus = gatesFullyPassed ? (megaRunner?.scoreBoost ?? 0) : 0;
 
+  // Social hype. Same bar again: viral attention is the easiest thing in this
+  // engine to buy, and a trending ticker on an unaudited contract is the exact
+  // shape of a pump. Requires an affirmatively PASSED audit.
+  //
+  // Named socialHypeBonus, NOT socialBonus — `socialBonus` above is the
+  // declared-links bonus from social_scanner.mjs and reusing the name is a
+  // redeclaration, not a shadow.
+  const socialHypeBonus = gatesFullyPassed ? (socialHype?.scoreBoost ?? 0) : 0;
+
   let score = Math.round(
     demandScore +
       depthScore +
@@ -1275,7 +1285,8 @@ export function scoreToken({
       socialBonus +
       categoryBonus +
       clusterBonus +
-      megaRunnerBonus
+      megaRunnerBonus +
+      socialHypeBonus
   );
   score -= catalysts.bearish.length * 4;
   score = clamp(score, 0, 100);
@@ -1422,6 +1433,7 @@ export function scoreToken({
       category: categoryBonus,
       insiderCluster: clusterBonus,
       megaRunner: megaRunnerBonus,
+      socialHype: socialHypeBonus,
       bearishPenalty: catalysts.bearish.length * 4,
     },
   };

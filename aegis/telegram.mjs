@@ -62,6 +62,12 @@ export async function loadEnv(path) {
     tgApiId: pick('TELEGRAM_API_ID'),
     tgApiHash: pick('TELEGRAM_API_HASH'),
     tgSession: pick('TELEGRAM_SESSION'),
+    // Both optional. CryptoPanic is 403 without a token and X search is 401
+    // without a bearer, so the modules that use them stay inert rather than
+    // failing, and report which sources were actually live.
+    cryptoPanicToken: pick('CRYPTOPANIC_TOKEN'),
+    coingeckoKey: pick('COINGECKO_API_KEY'),
+    twitterBearer: pick('TWITTER_BEARER_TOKEN'),
   };
 }
 
@@ -426,7 +432,7 @@ function renderWhales(smartMoney) {
  * the tier header does not carry. At a single wallet it would just restate the
  * header, and the full roster appears in the cluster block below regardless.
  */
-export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader }) {
+export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social }) {
   const count = clusters?.insiderCount ?? 0;
   const tierHeader = signalCategory?.alertHeader ?? null;
 
@@ -446,8 +452,18 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
       ]
     : [];
 
+  // News leads when it fires: a token named after a live headline needs that
+  // context before anything else, in both directions — it explains the move,
+  // and it is the signature of an opportunistic launch.
+  const newsBanner = news?.matched
+    ? [`<b>📰 ${esc(`BREAKING NEWS CATALYST ALERT (News Matched: ${news.keywords.join(' / ')}!)`)} 📰</b>`]
+    : [];
+  const socialBanner = social?.detected
+    ? [`<b>📈 ${esc(`SOCIAL HYPE SPIKE (${social.matchType === 'contract' ? 'trending, contract verified' : social.matchType === 'symbol' ? 'ticker match only — unverified' : 'mention velocity'})`)} 📈</b>`]
+    : [];
+
   if (tierHeader) {
-    const lines = [...bundle, ...viral, `<b>${esc(tierHeader)}</b>`];
+    const lines = [...newsBanner, ...bundle, ...viral, ...socialBanner, `<b>${esc(tierHeader)}</b>`];
     if (count >= 4) lines.push(`🔥 <b>CABAL SWARM — ${count} unique insider wallets</b>`);
     else if (count >= 2) lines.push(`🔥 <b>MULTI-INSIDER — ${count} unique wallets</b>`);
     return lines;
@@ -456,8 +472,10 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
   // Fallback chain, unchanged. Reached when telegram.insiderTiersOnly is off
   // and a token alerts from outside both bands, or on a non-insider signal.
   return [
+    ...newsBanner,
     ...bundle,
     ...viral,
+    ...socialBanner,
     count >= 4
       ? '🚀 <b>CABAL SWARM BUY ALERT</b> 🚀'
       : count >= 2
@@ -506,6 +524,45 @@ function renderShield(shield) {
   return lines;
 }
 
+/**
+ * News-catalyst and social-hype detail.
+ *
+ * The caveat under a news match is not boilerplate. A token named after a live
+ * headline is the signature of an opportunistic launch at least as often as a
+ * genuine one, and the alert is the moment that needs saying.
+ */
+function renderNewsAndSocial(news, social) {
+  const lines = [];
+
+  if (news?.matched) {
+    lines.push('', `📰 <b>NEWS CATALYST:</b> ${esc(news.keywords.join(', '))}`);
+    for (const h of news.headlines ?? []) {
+      const age = h.ageMinutes === null ? '' : ` (${h.ageMinutes.toFixed(0)}m ago)`;
+      lines.push(
+        `• ${h.link ? `<a href="${esc(h.link)}">${esc(h.title.slice(0, 96))}</a>` : esc(h.title.slice(0, 96))} — <i>${esc(h.source)}${age}</i>`
+      );
+    }
+    lines.push(
+      '<i>⚠️ A token named after a breaking story is the signature of an opportunistic launch as often as a real one. This adds no score; every safety gate still applied.</i>'
+    );
+  }
+
+  if (social?.detected) {
+    lines.push('', '📈 <b>SOCIAL HYPE:</b>');
+    for (const r of social.reasons ?? []) lines.push(`• ${esc(r)} ✅`);
+    if (social.matchType === 'symbol') {
+      lines.push(
+        '<i>⚠️ Matched on TICKER only — the contract was not verified against the trending coin. Solana tickers are unrestricted, so this may be an impersonator.</i>'
+      );
+    }
+    if (!social.mentionsAvailable) {
+      lines.push('<i>Search trend only — X mention velocity needs a paid API key and is not part of this signal.</i>');
+    }
+  }
+
+  return lines;
+}
+
 /** Viral-volume detail. Shows the two measured figures, not just the banner. */
 function renderMegaRunner(megaRunner) {
   if (!megaRunner?.detected) return [];
@@ -517,7 +574,7 @@ function renderMegaRunner(megaRunner) {
   ];
 }
 
-export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader }) {
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader, news, social }) {
   const symbol = pair.baseToken?.symbol ?? 'UNKNOWN';
   const address = pair.baseToken.address;
   const usd = (n) =>
@@ -542,7 +599,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     demand.m5.sells > 0 ? (demand.m5.buys / demand.m5.sells).toFixed(1) : '∞';
 
   return [
-    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader }),
+    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social }),
     `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
     `<i>Score ${verdictInfo.score}/100</i>${clusters?.label ? ` | <b>${esc(clusters.label)}</b>` : ''}`,
     // Placed above the advice: if the buy button is locked, the trading advice
@@ -551,6 +608,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
       ? ['', `<b>${esc(migration.label)}</b>`, `<i>${esc(migration.detail)}</i>`]
       : []),
     ...(signalCategory?.advice ? ['', `<b>${esc(signalCategory.advice)}</b>`] : []),
+    ...renderNewsAndSocial(news, social),
     ...renderMegaRunner(megaRunner),
     ...renderCto(cto),
     ...renderClusters(clusters),
@@ -1134,6 +1192,8 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     thresholds: config.thresholds,
     megaRunner: result.megaRunner,
     megaRunnerHeader: config.megaRunner?.alertHeader ?? null,
+    news: result.news,
+    social: result.social,
   });
 
   const sent = await sendTelegram({ ...credentials, text });

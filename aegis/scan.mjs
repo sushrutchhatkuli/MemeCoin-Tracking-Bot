@@ -60,6 +60,8 @@ import { analyzeSocials, socialBadge } from './social_scanner.mjs';
 import { migrationStatus, MIGRATION } from './migration.mjs';
 import { detectInsiderClusters, clusterScoreBonus } from './insider_cluster.mjs';
 import { discoverNetwork, loadDiscovered, saveDiscovered, walletLinks } from './network_discovery.mjs';
+import { fetchBreakingNews, matchTokenToNews } from './news_sentinel.mjs';
+import { fetchTrending, scoreSocialHype } from './social_tracer.mjs';
 import {
   loadObservations,
   saveObservations,
@@ -202,6 +204,8 @@ async function analyzeToken({
   funderCache,
   discoveredStore,
   screenCache,
+  newsWindow,
+  trending,
   now,
 }) {
   const address = pair.baseToken.address;
@@ -411,6 +415,16 @@ async function analyzeToken({
     }
   }
 
+  // News and trending are fetched ONCE per scan by the caller and passed in —
+  // they are market-wide facts, not per-token ones, and re-fetching them for
+  // every audited token would hammer two rate-limited free APIs.
+  const news = newsWindow
+    ? matchTokenToNews({ pair, news: newsWindow, config, now: now.getTime() })
+    : { matched: false, keywords: [], headlines: [] };
+  const socialHype = trending
+    ? scoreSocialHype({ pair, trending, mentions: null, config })
+    : { detected: false, scoreBoost: 0, reasons: [] };
+
   const rawCatalysts = detectCatalysts(pair, security, demand, velocity, config.thresholds, {
     smartMoney,
     deployer,
@@ -437,6 +451,7 @@ async function analyzeToken({
     signalCategory,
     clusters,
     megaRunner,
+    socialHype,
   });
 
   return {
@@ -455,6 +470,8 @@ async function analyzeToken({
     clusters,
     cto,
     megaRunner,
+    news,
+    social: socialHype,
   };
 }
 
@@ -550,9 +567,47 @@ export async function runScan(args = {}) {
   console.log(
     `⛔ Blacklist: ${blacklist.wallets.size} deployer(s), ${blacklist.mints.size} mint(s)`
   );
+
   const credentials = await loadEnv(join(HERE, '.env'));
   if (credentials.rpcOverride) config.rpcUrl = credentials.rpcOverride;
   const now = new Date();
+
+  // Market-wide context, fetched ONCE per scan. Both are free-tier APIs with
+  // real rate limits, and neither varies per token — pulling them inside the
+  // audit loop would multiply the cost by the scan limit for identical data.
+  // Failures are non-fatal: the scan is about on-chain facts, and a news feed
+  // being down is not a reason to stop auditing.
+  let newsWindow = null;
+  let trending = null;
+  if (config.newsSentinel?.enabled !== false) {
+    try {
+      newsWindow = await fetchBreakingNews({
+        config,
+        cryptoPanicToken: credentials.cryptoPanicToken,
+        now: now.getTime(),
+      });
+      const live = newsWindow.sources.filter((s) => s.ok);
+      const dead = newsWindow.sources.filter((s) => !s.ok);
+      console.log(
+        `📰 News: ${newsWindow.items.length} headline(s) from ${live.length}/${newsWindow.sources.length} source(s)` +
+          (dead.length ? ` — unavailable: ${dead.map((d) => d.source).join(', ')}` : '')
+      );
+    } catch (err) {
+      console.error(`⚠️  News sentinel failed (scan continues): ${err.message}`);
+    }
+  }
+  if (config.socialTracer?.enabled !== false) {
+    try {
+      trending = await fetchTrending({ config, now: now.getTime(), apiKey: credentials.coingeckoKey });
+      if (trending.ok) {
+        console.log(
+          `📈 Trending: ${trending.solanaMints.size} Solana contract(s) among ${trending.coins.length} trending search(es)${trending.cached ? ' [cached]' : ''}`
+        );
+      }
+    } catch (err) {
+      console.error(`⚠️  Social tracer failed (scan continues): ${err.message}`);
+    }
+  }
 
   console.log(
     credentials.botToken && credentials.chatId
@@ -655,6 +710,8 @@ export async function runScan(args = {}) {
       funderCache,
       discoveredStore,
       screenCache,
+      newsWindow,
+      trending,
       now,
     });
     const { verdictInfo, audit, demand, deployer, smartMoney, social } = result;
