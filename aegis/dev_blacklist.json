@@ -2722,6 +2722,18 @@
       "reason": "Post-mortem: $FIW fell -100% within 1h (pair delisted)",
       "added": "2026-08-09",
       "source": "post-mortem"
+    },
+    {
+      "address": "tCFCHL64f1afRR1BCXzbv51seLgupCWKDijLDt62J1K",
+      "reason": "Post-mortem: $eˣ fell -100% within 1.15h (pair delisted)",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "0x0385a69662faf423d579d1fb118f838c9af9f569",
+      "reason": "Post-mortem: $Friar Elon fell -100% within 1.2h (pair delisted)",
+      "added": "2026-08-09",
+      "source": "post-mortem"
     }
   ],
   "mints": [
