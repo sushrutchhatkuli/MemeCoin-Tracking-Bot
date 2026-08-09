@@ -136,7 +136,7 @@
     "scoreBoost": 20,
     "allowSymbolMatch": false,
     "minMentionVelocity": 3,
-    "cacheMinutes": 30,
+    "cacheMinutes": 60,
     "resolveLimit": 15,
     "resolveDelayMs": 6000,
     "timeoutMs": 12000
@@ -497,10 +497,7 @@
       "solana",
       "SOL",
       "dog",
-      "trump",
-      "pump",
-      "cat",
-      "AI"
+      "pump"
     ],
     "searchMinMarketCapUsd": 300000
   },

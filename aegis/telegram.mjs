@@ -126,12 +126,33 @@ export function tradeUrl(address, tradeLink, chain = 'solana') {
  * Jupiter is Solana-only, so EVM alerts carry the FOMO link alone rather than a
  * link that would 404.
  */
-export function executionLinks(address, chain, tradeLink) {
+/**
+ * Execution links, optionally pre-filled with the recommended size.
+ *
+ * ── UNVERIFIED, AND WORTH KNOWING ───────────────────────────────────────────
+ * `?amount=` is appended as specified, but neither destination's handling of it
+ * could be confirmed from here: both are client-side apps, so an HTTP fetch
+ * returns the same shell whether the parameter is honoured or ignored. The
+ * downside is mild — an unrecognised query parameter is dropped and the field
+ * simply opens empty — but do check the first alert that arrives, because a
+ * button that silently ignores the amount looks identical to one that fills it,
+ * and the failure mode is trading a size you did not intend.
+ *
+ * The label states the amount too, so the size is legible even if the
+ * pre-fill does not take.
+ */
+export function executionLinks(address, chain, tradeLink, size = null) {
+  const sol = size?.sol ?? null;
+  const q = sol ? `?amount=${sol.toFixed(2)}` : '';
+  const suffix = sol ? ` ${sol.toFixed(2)} SOL` : '';
+
   const links = [
-    `📲 <a href="${esc(tradeUrl(address, tradeLink, chain))}">[ Open in FOMO App ]</a>`,
+    `📲 <a href="${esc(tradeUrl(address, tradeLink, chain))}${esc(q)}">[ Open in FOMO App${esc(suffix)} ]</a>`,
   ];
   if (chain === 'solana') {
-    links.push(`⚡ <a href="https://jup.ag/swap/SOL-${esc(address)}">[ Swap on Jupiter ]</a>`);
+    links.push(
+      `⚡ <a href="https://jup.ag/swap/SOL-${esc(address)}${esc(q)}">[ Swap on Jupiter${esc(suffix)} ]</a>`
+    );
   }
   return links;
 }
@@ -656,7 +677,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     '',
     `<code>${esc(address)}</code>`,
     '',
-    ...executionLinks(address, pair.chainId, tradeLink),
+    ...executionLinks(address, pair.chainId, tradeLink, size),
     `📈 <a href="https://dexscreener.com/${esc(pair.chainId)}/${esc(address)}">DexScreener</a>`,
     // Token contract on Solscan — distinct from the wallet links above, which
     // point at /account/. This is /token/ and resolves the mint itself.

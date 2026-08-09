@@ -270,25 +270,54 @@ async function solanaRpc(url, method, params, timeoutMs = 15000) {
  * below) is correct for those 20, but a whale split across more accounts than
  * that is still understated. This buys freshness, not unlimited depth.
  */
-export async function fetchLiveHolderDistribution({ mint, rpcUrl, excludedAddresses, topN = 10 }) {
+/**
+ * Raw holder data for a mint, with no exclusion logic applied.
+ *
+ * Split out of fetchLiveHolderDistribution so the FETCH can start before the
+ * exclusion set exists. The exclusions come from RugCheck (pool and AMM
+ * accounts), which used to mean the whole holder read waited on an HTTP call it
+ * does not actually depend on — only the final computation does.
+ *
+ * getTokenSupply and getTokenLargestAccounts are independent of each other and
+ * now run together; getMultipleAccounts genuinely depends on the account list,
+ * so it stays sequential. Three round-trips become two.
+ */
+export async function fetchHolderSnapshot({ mint, rpcUrl }) {
   if (!rpcUrl) return { ok: false, error: 'no rpcUrl configured' };
 
-  const supply = await solanaRpc(rpcUrl, 'getTokenSupply', [mint]);
+  const [supply, largest] = await Promise.all([
+    solanaRpc(rpcUrl, 'getTokenSupply', [mint]),
+    solanaRpc(rpcUrl, 'getTokenLargestAccounts', [mint]),
+  ]);
+
   if (supply.error) return { ok: false, error: `getTokenSupply: ${supply.error}` };
   const totalSupply = supply.result?.value?.uiAmount;
   if (!totalSupply) return { ok: false, error: 'supply unavailable' };
 
-  const largest = await solanaRpc(rpcUrl, 'getTokenLargestAccounts', [mint]);
   if (largest.error) return { ok: false, error: `getTokenLargestAccounts: ${largest.error}` };
   const accounts = largest.result?.value ?? [];
   if (!accounts.length) return { ok: false, error: 'no token accounts returned' };
 
-  // Token accounts carry no owner, so resolve them in one batched call.
   const owners = await solanaRpc(rpcUrl, 'getMultipleAccounts', [
     accounts.map((a) => a.address),
     { encoding: 'jsonParsed' },
   ]);
   if (owners.error) return { ok: false, error: `getMultipleAccounts: ${owners.error}` };
+
+  return { ok: true, totalSupply, accounts, owners };
+}
+
+export async function fetchLiveHolderDistribution({ mint, rpcUrl, excludedAddresses, topN = 10, snapshot = null }) {
+  if (!rpcUrl && !snapshot) return { ok: false, error: 'no rpcUrl configured' };
+
+  // A caller that already started the snapshot in parallel passes it in; the
+  // pre-dispatch re-audit still calls this cold and fetches its own.
+  const snap = snapshot ?? (await fetchHolderSnapshot({ mint, rpcUrl }));
+  if (!snap.ok) return { ok: false, error: snap.error };
+
+  const totalSupply = snap.totalSupply;
+  const accounts = snap.accounts;
+  const owners = snap.owners;
 
   const holders = accounts.map((a, i) => ({
     address: a.address,
@@ -317,9 +346,15 @@ export async function fetchLiveHolderDistribution({ mint, rpcUrl, excludedAddres
  * ------------------------------------------------------------------ */
 
 export async function fetchSolanaSecurity(mint, { rpcUrl = null } = {}) {
-  const res = await getJson(`https://api.rugcheck.xyz/v1/tokens/${mint}/report`, {
-    timeoutMs: 25000,
-  });
+  // RugCheck (mint/freeze authority, LP lock, risk flags) and the on-chain
+  // holder snapshot are INDEPENDENT fetches and now run together. Only the
+  // final distribution computation needs both — it applies RugCheck's pool and
+  // AMM exclusions to the RPC holder list — so waiting for one before starting
+  // the other was pure serialised latency on the hot path of every audit.
+  const [res, snapshot] = await Promise.all([
+    getJson(`https://api.rugcheck.xyz/v1/tokens/${mint}/report`, { timeoutMs: 25000 }),
+    rpcUrl ? fetchHolderSnapshot({ mint, rpcUrl }) : Promise.resolve(null),
+  ]);
   if (!res.ok) return { ok: false, error: res.error };
 
   const d = res.data ?? {};
@@ -360,11 +395,13 @@ export async function fetchSolanaSecurity(mint, { rpcUrl = null } = {}) {
   let finalDistribution = distribution;
 
   if (rpcUrl) {
+    // Reuses the snapshot already fetched in parallel above; no second trip.
     const live = await fetchLiveHolderDistribution({
       mint,
       rpcUrl,
       excludedAddresses: excluded,
       topN: 10,
+      snapshot,
     });
     if (live.ok) {
       finalDistribution = live;
