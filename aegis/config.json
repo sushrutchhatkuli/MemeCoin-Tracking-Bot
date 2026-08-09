@@ -594,7 +594,7 @@
       "the SECOND screening pass, which runs over the ranked finalists and is",
       "bounded by topN rather than by this cap."
     ],
-    "profitRule": "skip",
+    "profitRule": "filter",
     "minGradedBuys": 3,
     "minRepresentativeness": 0.5,
     "_option2Note": [

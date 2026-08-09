@@ -295,6 +295,140 @@ export function capEnrichmentShortlist(eligible, cap = 50) {
   return ranked.slice(0, cap);
 }
 
+/* ------------------------------------------------------------------ *
+ * On-chain realized PnL
+ * ------------------------------------------------------------------ */
+
+/**
+ * Net SOL realized through SWAPS, derived from Helius Enhanced Transactions.
+ *
+ * ── WHY SWAPS ONLY, AND NOT EVERY TRANSACTION ───────────────────────────────
+ * Summing the native balance delta across ALL transactions does not measure
+ * trading at all — it measures deposits minus withdrawals. A wallet that moves
+ * 1,000 SOL in from an exchange reads as +$75k "profit" and would sail past a
+ * $50k filter having never made a trade; a winner who cashes out reads as a
+ * loss. Measured on three current elite wallets, the all-transaction figure
+ * was +$302, $0 and -$174 — noise around zero, because deposits and
+ * withdrawals dominate and roughly cancel.
+ *
+ * Restricting to `type === 'SWAP'` removes transfers, so what remains is SOL
+ * out to buy and SOL in from selling. That is the standard construction of
+ * realized PnL.
+ *
+ * ── WHAT IT STILL CANNOT SEE ────────────────────────────────────────────────
+ * OPEN POSITIONS READ AS LOSSES. A wallet that spent 40 SOL on tokens it still
+ * holds shows -40 SOL, and no amount of RPC fixes that: the SOL genuinely left
+ * and the token's value is not a SOL balance. The same three wallets measured
+ * -$2,236, -$229 and +$141 on swaps — all are active buyers still holding, so
+ * the figure is biased negative by construction, and by an unknown amount.
+ *
+ * Read it as "SOL cycled back out through swaps", not "how much this wallet is
+ * up". It is honest about closed positions and pessimistic about open ones.
+ *
+ * Helius pages 100 transactions per call, so a 600-transaction wallet costs six
+ * calls and ~3.6s — affordable only because the shortlist is capped at 50.
+ * Returns netUsd null (never 0) when it cannot be derived: unknown and
+ * break-even are different claims, and Rule 2 must not confuse them.
+ */
+export async function deriveRealizedPnl(wallet, { heliusKey, solUsd, cfg = {} }) {
+  if (!heliusKey) return { ok: false, reason: 'no Helius API key in rpcUrl', netUsd: null };
+
+  const maxPages = cfg.pnlMaxPages ?? 6;
+  const swapsOnly = cfg.pnlSwapsOnly !== false;
+  let before = null;
+  let swapLamports = 0;
+  let allLamports = 0;
+  let swaps = 0;
+  let txs = 0;
+  let pages = 0;
+  let truncated = false;
+
+  while (pages < maxPages) {
+    const url =
+      `https://api.helius.xyz/v0/addresses/${wallet}/transactions` +
+      `?api-key=${encodeURIComponent(heliusKey)}&limit=100${before ? `&before=${before}` : ''}`;
+    let batch;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(cfg.pnlTimeoutMs ?? 25000) });
+      if (!res.ok) {
+        // A partial history is still usable, but it must be FLAGGED — a
+        // truncated sum silently understates a wallet that traded earlier.
+        truncated = true;
+        break;
+      }
+      batch = await res.json();
+    } catch {
+      truncated = true;
+      break;
+    }
+    if (!Array.isArray(batch) || !batch.length) break;
+
+    for (const tx of batch) {
+      txs++;
+      const delta = (tx.accountData ?? []).find((a) => a.account === wallet)?.nativeBalanceChange ?? 0;
+      allLamports += delta;
+      if (tx.type === 'SWAP') {
+        swaps++;
+        swapLamports += delta;
+      }
+    }
+    before = batch[batch.length - 1].signature;
+    pages++;
+    if (batch.length < 100) break;
+    await new Promise((r) => setTimeout(r, cfg.pnlDelayMs ?? 250));
+  }
+
+  if (pages >= maxPages) truncated = true;
+  const lamports = swapsOnly ? swapLamports : allLamports;
+  const netSol = lamports / 1e9;
+
+  return {
+    ok: txs > 0,
+    netSol,
+    netUsd: txs > 0 && solUsd ? netSol * solUsd : null,
+    // Both retained so the divergence is inspectable rather than asserted.
+    swapNetSol: swapLamports / 1e9,
+    allTxNetSol: allLamports / 1e9,
+    swaps,
+    txs,
+    truncated,
+    basis: swapsOnly ? 'net SOL through SWAP transactions' : 'net SOL across all transactions',
+  };
+}
+
+/** Attach derived PnL to each candidate. Mutates in place, like enrichment. */
+async function enrichRealizedPnl(candidates, { heliusKey, solUsd, cfg }) {
+  if (!heliusKey) {
+    console.log('   ⚠️  No Helius API key in rpcUrl — on-chain PnL cannot be derived, netProfitUsd stays null');
+    return { derived: 0, failed: candidates.length };
+  }
+  let derived = 0;
+  let failed = 0;
+  let truncatedCount = 0;
+
+  for (const c of candidates) {
+    const pnl = await deriveRealizedPnl(c.address, { heliusKey, solUsd, cfg });
+    if (pnl.ok && pnl.netUsd !== null) {
+      c.netProfitUsd = pnl.netUsd;
+      c.realizedPnl = pnl;
+      c.basis += `; realized ${pnl.netSol >= 0 ? '+' : ''}${pnl.netSol.toFixed(2)} SOL over ${pnl.swaps} swap(s)${pnl.truncated ? ' (history truncated)' : ''}`;
+      derived++;
+      if (pnl.truncated) truncatedCount++;
+    } else {
+      // Left null, NOT zero. Rule 2 treats null as a failure, which is the
+      // correct reading of "we could not measure this wallet".
+      c.netProfitUsd = null;
+      failed++;
+    }
+  }
+  console.log(
+    `   ↳ realized PnL derived for ${derived}/${candidates.length} wallet(s)` +
+      (truncatedCount ? `, ${truncatedCount} with truncated history` : '') +
+      (failed ? `, ${failed} unavailable` : '')
+  );
+  return { derived, failed };
+}
+
 /** Count on-chain signatures as a lifetime-activity proxy for finalists. */
 async function enrichLifetimeTrades(candidates, rpcUrl) {
   if (!rpcUrl) return;
@@ -429,6 +563,10 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
   let source;
   let totalSeen = 0;
   let maturity = null;
+  // SOL price, needed to convert derived lamport flow to USD. Bound at this
+  // scope because the import path never sets it and PnL derivation is skipped
+  // there anyway (imported leaderboards carry real P&L).
+  let solUsd = 0;
 
   if (importPath) {
     candidates = await candidatesFromImport(resolve(importPath));
@@ -440,6 +578,7 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     candidates = obs.candidates;
     totalSeen = obs.totalSeen;
     maturity = obs.maturity;
+    solUsd = obs.solUsd ?? 0;
     source = 'aegis-observed';
     console.log(
       `🔍 Observed ledger: ${totalSeen} wallet(s) seen buying scanned tokens` +
@@ -553,6 +692,19 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
   if (!importPath && shortlist.length) {
     console.log(`   ↳ enriching ${shortlist.length} shortlisted wallet(s) with on-chain activity…`);
     await enrichLifetimeTrades(shortlist, config.rpcUrl);
+
+    // Only worth paying for when Rule 2 is actually going to read it. Under
+    // profitRule 'skip' the figure is never consulted, and deriving it would
+    // add ~4s per wallet for nothing.
+    if (rules.profitRule !== 'skip') {
+      const heliusKey = (String(config.rpcUrl ?? '').match(/api-key=([\w-]+)/) ?? [])[1] ?? null;
+      console.log(`   ↳ deriving on-chain realized PnL for ${shortlist.length} wallet(s)…`);
+      await enrichRealizedPnl(shortlist, {
+        heliusKey,
+        solUsd,
+        cfg: config.eliteWhales ?? {},
+      });
+    }
   }
 
   // Anything flagged during screening cannot qualify, regardless of its stats.
@@ -613,6 +765,37 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
       ? `   Rule 2  net profit          → SKIPPED (lifetime P&L is not observable; see config)`
       : `   Rule 2  net profit ≥ $${rules.minNetProfitUsd.toLocaleString('en-US')} → ${evaluated.length - failing.netProfit} pass`
   );
+  // The observed PnL spread, so a floor that admits nobody is visibly a floor
+  // problem rather than a mystery. Without this, "0 pass" gives no indication
+  // of whether the bar is slightly high or three orders of magnitude out.
+  if (rules.profitRule !== 'skip') {
+    // ONLY wallets with a real on-chain derivation. Every candidate carries a
+    // netProfitUsd from walletStats (an estimate from observed spend), and
+    // mixing the two would report a spread across 10,000 wallets when 48 were
+    // actually measured.
+    const derived = evaluated
+      .filter((c) => c.realizedPnl?.ok)
+      .map((c) => c.netProfitUsd)
+      .filter((n) => typeof n === 'number')
+      .sort((a, b) => b - a);
+    if (derived.length) {
+      const median = derived[Math.floor(derived.length / 2)];
+      const positive = derived.filter((n) => n > 0).length;
+      console.log(
+        `           derived PnL across ${derived.length} wallet(s): ` +
+          `best ${money(derived[0])} · median ${money(median)} · worst ${money(derived[derived.length - 1])} · ` +
+          `${positive} positive`
+      );
+      if (derived[0] < rules.minNetProfitUsd) {
+        console.log(
+          `           ⚠️  the best wallet is ${money(derived[0])} against a ${money(rules.minNetProfitUsd)} floor — ` +
+            `no floor above ${money(derived[0])} can ever admit anyone`
+        );
+      }
+    } else {
+      console.log('           derived PnL: none available (no Helius key, or every lookup failed)');
+    }
+  }
   console.log(`   Rule 3  trades ≥ ${rules.minLifetimeTrades}         → ${evaluated.length - failing.trades} pass`);
   console.log(`   ✅ passing all three: ${qualified.length} (writing top ${Math.min(qualified.length, rules.topN)})`);
 
