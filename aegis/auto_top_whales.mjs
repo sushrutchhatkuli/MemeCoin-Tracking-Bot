@@ -453,8 +453,8 @@ async function enrichLifetimeTrades(candidates, rpcUrl) {
   let failed = 0;
   for (const c of candidates) {
     let got = null;
-    for (let attempt = 0; attempt < 2 && got === null; attempt++) {
-      if (attempt) await new Promise((r) => setTimeout(r, 600));
+    for (let attempt = 0; attempt < 3 && got === null; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 1200 * attempt));
       try {
         const r = await fetch(rpcUrl, {
           method: 'POST',
@@ -468,9 +468,13 @@ async function enrichLifetimeTrades(candidates, rpcUrl) {
           signal: AbortSignal.timeout(20000),
         });
         const j = await r.json();
-        if (Array.isArray(j.result)) got = j.result.length;
+        if (Array.isArray(j.result)) {
+          got = j.result.length;
+        } else if (r.status === 429 || j?.error?.code === -32429) {
+          await new Promise((res) => setTimeout(res, 1500));
+        }
       } catch {
-        /* retry once, then give up and leave the observed count in place */
+        /* retry on network timeout */
       }
     }
 
@@ -480,7 +484,7 @@ async function enrichLifetimeTrades(candidates, rpcUrl) {
       c.lifetimeTrades = got;
       c.basis += `; lifetime activity = ${got} signatures${got === 1000 ? ' (capped)' : ''}`;
     }
-    await new Promise((r) => setTimeout(r, 220));
+    await new Promise((r) => setTimeout(r, 150));
   }
 
   if (failed) {
