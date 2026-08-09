@@ -31,7 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 
 import { fetchSinglePair } from './sources.mjs';
-import { fetchEarliestBuyers } from './smart_money.mjs';
+import { fetchEarliestBuyers, fetchBondingCurveBuyers } from './smart_money.mjs';
 import { loadEnv } from './telegram.mjs';
 import {
   loadObservations,
@@ -96,14 +96,50 @@ export async function harvestLaunchBuyers({ address, recap, config = null, obsPa
       ? Number(pair.priceUsd) / Number(pair.priceNative)
       : null;
 
-  const replay = await fetchEarliestBuyers({
-    rpcUrl,
-    poolAddress: pair.pairAddress,
-    mint: address,
-    cfg: { ...(cfg.smartMoney ?? {}), ...me },
-    solUsd,
-  });
-  if (!replay.ok) return { ok: false, summary: `pool walk failed: ${replay.error}` };
+  // ---- Bonding curve first ----------------------------------------
+  //
+  // For a graduated pump.fun token the AMM pool is created AT MIGRATION, so a
+  // pool walk finds migration-era buyers and never sees the people who bought
+  // on the curve beforehand — the ones the $5k-$30k window is actually about.
+  // The curve account holds exactly that phase and nothing else, which is why
+  // it is tried first and why it is cheap: measured at 196 signatures in one
+  // page for $RAVECAT, against 40+ pages on the mint without reaching genesis.
+  let replay = null;
+  let via = null;
+
+  if (me.useBondingCurve !== false) {
+    const curve = await fetchBondingCurveBuyers({
+      mint: address,
+      rpcUrl,
+      cfg: { ...(cfg.smartMoney ?? {}), ...me },
+      solUsd,
+    });
+    if (curve.ok && curve.buyers.length) {
+      replay = curve;
+      via = 'bonding-curve';
+    } else if (me.requireBondingCurve === true) {
+      return {
+        ok: false,
+        summary: `bonding-curve traversal unavailable (${curve.error ?? 'no curve buys found'}) and requireBondingCurve is set`,
+      };
+    }
+  }
+
+  // Falls back to the AMM pool for tokens that never used a bonding curve —
+  // a direct Raydium launch has no curve to replay, and the pool genesis IS
+  // its launch there.
+  if (!replay) {
+    const pool = await fetchEarliestBuyers({
+      rpcUrl,
+      poolAddress: pair.pairAddress,
+      mint: address,
+      cfg: { ...(cfg.smartMoney ?? {}), ...me },
+      solUsd,
+    });
+    if (!pool.ok) return { ok: false, summary: `pool walk failed: ${pool.error}` };
+    replay = pool;
+    via = 'amm-pool';
+  }
 
   // A truncated walk never reached the launch, so its buyers are early-ish, not
   // early. Crediting them as launch buyers would be the single easiest way to
@@ -116,10 +152,15 @@ export async function harvestLaunchBuyers({ address, recap, config = null, obsPa
     };
   }
 
-  const { inWindow, noEntryPrice, outside } = filterLaunchWindow(replay.buyers, {
-    minMcapUsd: me.launchMinMcapUsd ?? 30_000,
-    maxMcapUsd: me.launchMaxMcapUsd ?? 100_000,
-  });
+  // The curve window is lower than the AMM window on purpose: on the curve a
+  // token starts near zero and migrates around $60-70k, so $5k-$30k is the
+  // genuinely early band there. Post-migration the same token opens at the
+  // migration cap, where $30k-$100k is the equivalent.
+  const window =
+    via === "bonding-curve"
+      ? { minMcapUsd: me.curveMinMcapUsd ?? 5_000, maxMcapUsd: me.curveMaxMcapUsd ?? 30_000 }
+      : { minMcapUsd: me.launchMinMcapUsd ?? 30_000, maxMcapUsd: me.launchMaxMcapUsd ?? 100_000 };
+  const { inWindow, noEntryPrice, outside } = filterLaunchWindow(replay.buyers, window);
 
   if (!inWindow.length) {
     return {
@@ -127,7 +168,7 @@ export async function harvestLaunchBuyers({ address, recap, config = null, obsPa
       credited: 0,
       summary:
         `walked ${replay.pages} page(s), ${replay.buyers.length} launch buyer(s), ` +
-        `none inside the $${(me.launchMinMcapUsd ?? 30_000) / 1000}k-$${(me.launchMaxMcapUsd ?? 100_000) / 1000}k window ` +
+        `none inside the $${window.minMcapUsd / 1000}k-$${window.maxMcapUsd / 1000}k window (via ${via}) ` +
         `(${outside} outside, ${noEntryPrice} without an attributable entry)`,
       replay,
     };
@@ -147,6 +188,7 @@ export async function harvestLaunchBuyers({ address, recap, config = null, obsPa
   return {
     ok: true,
     credited: res.credited,
+    via,
     summary:
       `${res.credited} launch buyer(s) credited ${(recap.multiplier * (me.pointsPerMultiplier ?? 2.5)).toFixed(1)} pts each` +
       (recap.multiplier >= protectAt ? ', marked mega_win_protected' : '') +

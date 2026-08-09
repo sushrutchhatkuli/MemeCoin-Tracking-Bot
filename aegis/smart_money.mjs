@@ -397,6 +397,196 @@ export function extractBuys(txResult, { mint, poolAddress }) {
  * This is the most RPC-expensive call in the pipeline (one getTransaction per
  * signature), so callers should only invoke it when a watchlist actually exists.
  */
+/* ------------------------------------------------------------------ *
+ * Pump.fun bonding-curve traversal
+ * ------------------------------------------------------------------ */
+
+export const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+const PUMP_API = 'https://frontend-api-v3.pump.fun/coins';
+// pump.fun mints a fixed 1,000,000,000 supply at 6 decimals. Used to turn a
+// per-token price into a market cap; the constant is the protocol's, not a
+// guess, and a token that does not match it is not a pump.fun launch.
+const PUMP_TOTAL_SUPPLY = 1_000_000_000;
+
+/**
+ * Resolve a mint's bonding-curve account.
+ *
+ * The curve is a PDA of the pump.fun program, but deriving it locally needs an
+ * ed25519 on-curve check, and pulling in @solana/web3.js for one function would
+ * break a pipeline that is otherwise dependency-free. pump.fun's own API
+ * returns the address directly, so that is the path taken.
+ *
+ * MEASURED: the v1 host (frontend-api.pump.fun) answers 530, v3 answers 200.
+ * Both are undocumented third-party endpoints outside this pipeline's control,
+ * so a failure here is REPORTED, never guessed around — there is no safe
+ * fallback that invents a curve address.
+ */
+export async function resolveBondingCurve(mint, { timeoutMs = 15000 } = {}) {
+  try {
+    const res = await fetch(`${PUMP_API}/${mint}`, {
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { accept: 'application/json', 'user-agent': 'aegis/1.0' },
+    });
+    if (!res.ok) return { ok: false, error: `pump.fun API HTTP ${res.status}` };
+    const body = await res.json().catch(() => null);
+    const curve = body?.bonding_curve ?? body?.bondingCurve ?? null;
+    if (!curve) return { ok: false, error: 'no bonding_curve in pump.fun response (not a pump.fun mint?)' };
+    return {
+      ok: true,
+      curve,
+      associatedCurve: body.associated_bonding_curve ?? null,
+      creator: body.creator ?? null,
+      createdAt: body.created_timestamp ?? null,
+      complete: body.complete === true,
+    };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Extract a single bonding-curve buy from a parsed transaction.
+ *
+ * Curve buys have a simple, fixed shape — one signer, SOL out, tokens in —
+ * which is why this does not reuse extractBuys: that function reasons about
+ * AMM pool token accounts, and the curve has no pool side to exclude.
+ *
+ * SOL spent is the signer's own balance delta with the fee added back, so the
+ * figure is what was paid for tokens rather than what left the wallet.
+ */
+export function extractCurveBuy(tx, { mint, solUsd = null }) {
+  const msg = tx?.transaction?.message;
+  const meta = tx?.meta;
+  if (!msg || !meta || meta.err) return null;
+
+  const keys = (msg.accountKeys ?? []).map((k) => (typeof k === 'string' ? k : k.pubkey));
+  const signerKey = (msg.accountKeys ?? []).find((k) => k?.signer);
+  const signer = typeof signerKey === 'string' ? signerKey : signerKey?.pubkey;
+  if (!signer) return null;
+
+  // Only genuine Buy instructions. Create, Sell and the migration CreatePool
+  // all touch the curve and none of them is someone buying in.
+  const logs = meta.logMessages ?? [];
+  if (!logs.some((l) => /Instruction:\s*Buy\b/i.test(l))) return null;
+
+  const idx = keys.indexOf(signer);
+  if (idx < 0) return null;
+  const lamports = (meta.postBalances[idx] ?? 0) - (meta.preBalances[idx] ?? 0);
+  const solSpent = Math.abs(lamports) / 1e9 - (meta.fee ?? 0) / 1e9;
+  if (!(solSpent > 0)) return null;
+
+  // Tokens received: the signer's balance change for THIS mint.
+  const before = (meta.preTokenBalances ?? []).filter((b) => b.mint === mint && b.owner === signer);
+  const after = (meta.postTokenBalances ?? []).filter((b) => b.mint === mint && b.owner === signer);
+  const sum = (rows) => rows.reduce((s, r) => s + (r.uiTokenAmount?.uiAmount ?? 0), 0);
+  const amount = sum(after) - sum(before);
+  if (!(amount > 0)) return null;
+
+  // Entry market cap from the price actually paid, against pump.fun's fixed
+  // supply. This is the buyer's own entry, not the token's price later.
+  const pricePerToken = solSpent / amount;
+  const entryMarketCapUsd = solUsd ? pricePerToken * PUMP_TOTAL_SUPPLY * solUsd : null;
+
+  return {
+    wallet: signer,
+    amount,
+    solSpent,
+    usdSpent: solUsd ? solSpent * solUsd : null,
+    entryMarketCapUsd,
+    via: 'bonding-curve',
+  };
+}
+
+/**
+ * Replay a pump.fun bonding curve from its first transaction.
+ *
+ * ── WHY THIS IS CHEAP WHERE THE POOL WALK WAS NOT ───────────────────────────
+ * The curve account only exists between creation and migration, so its history
+ * is the launch phase and nothing else. MEASURED on $RAVECAT: 196 signatures in
+ * ONE page, genesis immediately — against 40+ pages walking the mint without
+ * even reaching it, because the mint accumulates every post-migration AMM trade
+ * forever. Targeting the curve is what makes pre-migration buyers reachable at
+ * all.
+ *
+ * The first transactions are CreateV2 (the dev), then the opening buys.
+ */
+export async function fetchBondingCurveBuyers({ mint, rpcUrl, cfg = {}, solUsd = null }) {
+  const resolved = await resolveBondingCurve(mint, { timeoutMs: cfg.pumpApiTimeoutMs ?? 15000 });
+  if (!resolved.ok) return { ok: false, error: resolved.error, buyers: [] };
+
+  const perPage = cfg.curvePageSize ?? 1000;
+  const maxPages = cfg.curveMaxPages ?? 10;
+  const replayCount = cfg.curveReplayTxs ?? 40;
+  const delayMs = cfg.rpcDelayMs ?? 220;
+
+  let before = null;
+  let oldest = [];
+  let pages = 0;
+  let reachedGenesis = false;
+
+  while (pages < maxPages) {
+    const page = await rpc(rpcUrl, 'getSignaturesForAddress', [
+      resolved.curve,
+      before ? { limit: perPage, before } : { limit: perPage },
+    ]);
+    if (page.error) break;
+    const list = page.result ?? [];
+    if (!list.length) {
+      reachedGenesis = true;
+      break;
+    }
+    oldest = list;
+    before = list[list.length - 1].signature;
+    pages++;
+    if (list.length < perPage) {
+      reachedGenesis = true;
+      break;
+    }
+    await sleep(delayMs);
+  }
+
+  if (!oldest.length) return { ok: false, error: 'no curve history', buyers: [], pages };
+
+  const launchSigs = [...oldest].reverse().slice(0, replayCount);
+  const buyers = new Map();
+  let inspected = 0;
+
+  for (const sig of launchSigs) {
+    const tx = await rpc(rpcUrl, 'getTransaction', [
+      sig.signature,
+      { maxSupportedTransactionVersion: 0, encoding: 'jsonParsed' },
+    ]);
+    if (tx.error) break;
+    inspected++;
+    const buy = extractCurveBuy(tx.result, { mint, solUsd });
+    // Earliest entry per wallet — a sniper adding to the position later is the
+    // same participant, and its first fill is the interesting one.
+    if (buy && !buyers.has(buy.wallet)) {
+      buyers.set(buy.wallet, {
+        ...buy,
+        blockTime: sig.blockTime ?? 0,
+        slot: sig.slot ?? null,
+        signature: sig.signature,
+      });
+    }
+    await sleep(delayMs);
+  }
+
+  return {
+    ok: true,
+    buyers: [...buyers.values()],
+    curve: resolved.curve,
+    creator: resolved.creator,
+    graduated: resolved.complete,
+    pages,
+    inspected,
+    reachedGenesis,
+    note: reachedGenesis
+      ? `bonding curve replayed from creation (${pages} page(s))`
+      : `stopped at the ${maxPages}-page curve cap — not the first buyers`,
+  };
+}
+
 /**
  * Page backwards to the OLDEST signatures on a pool, then replay them.
  *

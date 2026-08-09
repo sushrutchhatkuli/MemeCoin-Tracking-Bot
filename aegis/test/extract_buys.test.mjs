@@ -43,6 +43,7 @@ import { pollOnce, pollerIsLive, pruneWatchState } from '../liquidity_watch.mjs'
 import { parseMultiplierRecap } from '../telegram_listener.mjs';
 import { awardAlphaPoints, scoreForwardTrade, applyOutcomes, pruneObservations } from '../wallet_observations.mjs';
 import { filterLaunchWindow } from '../multiplier_engine.mjs';
+import { extractCurveBuy, PUMP_FUN_PROGRAM } from '../smart_money.mjs';
 import { pruneCooldown, isOnCooldown, cooldownKey } from '../scan.mjs';
 import { capEnrichmentShortlist } from '../auto_top_whales.mjs';
 import { extractMints, channelMatches, SeenCache } from '../telegram_listener.mjs';
@@ -1022,6 +1023,66 @@ test('a missing or malformed baseline never fires', () => {
     detectLiquidityDrain(pos(100, 45), 50, { liquidityDrain: { enabled: false } }, NOW2),
     null
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * Pump.fun bonding-curve extraction
+ * ------------------------------------------------------------------ */
+
+const CURVE_MINT = 'mNzssXQ9hU1ASJ1CVuu4JjrFBrfeVdR2JzirKS3pump';
+const CURVE_BUYER = 'GkjJYRAryyz7xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';
+
+/** Shape mirrors a real pump.fun Buy as returned by getTransaction. */
+const curveTx = ({ instr = 'Buy', lamports = -8_614_000_000, tokens = 30_000_000, err = null } = {}) => ({
+  meta: {
+    err,
+    fee: 5000,
+    preBalances: [20_000_000_000],
+    postBalances: [20_000_000_000 + lamports],
+    preTokenBalances: [],
+    postTokenBalances: tokens
+      ? [{ mint: CURVE_MINT, owner: CURVE_BUYER, uiTokenAmount: { uiAmount: tokens } }]
+      : [],
+    logMessages: [`Program log: Instruction: ${instr}`],
+  },
+  transaction: { message: { accountKeys: [{ pubkey: CURVE_BUYER, signer: true }] } },
+});
+
+test('a bonding-curve Buy yields wallet, SOL spent and entry market cap', () => {
+  // 8.614 SOL for 30M of a 1e9 supply -> price x supply x solUsd.
+  const b = extractCurveBuy(curveTx(), { mint: CURVE_MINT, solUsd: 76 });
+  assert.equal(b.wallet, CURVE_BUYER);
+  assert.equal(Number(b.solSpent.toFixed(3)), 8.614);
+  assert.equal(b.via, 'bonding-curve');
+  // 8.614/30e6 * 1e9 * 76 ≈ $21,822 — inside the $5k-$30k curve window.
+  assert.ok(b.entryMarketCapUsd > 20_000 && b.entryMarketCapUsd < 24_000, String(b.entryMarketCapUsd));
+});
+
+test('only Buy instructions count — not Create, Sell or the migration', () => {
+  for (const instr of ['CreateV2', 'Sell', 'CreatePool', 'Withdraw']) {
+    assert.equal(extractCurveBuy(curveTx({ instr }), { mint: CURVE_MINT, solUsd: 76 }), null, instr);
+  }
+});
+
+test('failed transactions and non-buys are skipped', () => {
+  assert.equal(extractCurveBuy(curveTx({ err: { InstructionError: [0, 'x'] } }), { mint: CURVE_MINT }), null);
+  assert.equal(extractCurveBuy(curveTx({ tokens: 0 }), { mint: CURVE_MINT }), null, 'no tokens received');
+  assert.equal(extractCurveBuy(curveTx({ lamports: 0 }), { mint: CURVE_MINT }), null, 'no SOL spent');
+  assert.equal(extractCurveBuy(null, { mint: CURVE_MINT }), null);
+});
+
+test('entry market cap is null rather than zero when SOL price is unknown', () => {
+  const b = extractCurveBuy(curveTx(), { mint: CURVE_MINT, solUsd: null });
+  assert.equal(b.entryMarketCapUsd, null, 'unknown must not read as a $0 entry');
+  assert.ok(b.solSpent > 0, 'the SOL figure is still usable');
+});
+
+test('a different mint in the same transaction is not credited', () => {
+  const tx = curveTx();
+  tx.meta.postTokenBalances = [
+    { mint: 'SomeOtherMint1111111111111111111111111111111', owner: CURVE_BUYER, uiTokenAmount: { uiAmount: 999 } },
+  ];
+  assert.equal(extractCurveBuy(tx, { mint: CURVE_MINT, solUsd: 76 }), null);
 });
 
 /* ------------------------------------------------------------------ *
