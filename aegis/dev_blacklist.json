@@ -2734,6 +2734,30 @@
       "reason": "Post-mortem: $Friar Elon fell -100% within 1.2h (pair delisted)",
       "added": "2026-08-09",
       "source": "post-mortem"
+    },
+    {
+      "address": "45Xv6nZRnrTAEjESmhPtJaLt1qBrMLQ85X9uKSzSv35B",
+      "reason": "Post-mortem: $TOAD fell -97.6% within 1.09h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "4ExxGDSkAeVYXBtRnU3vM7FQrpywrNnrguNXPdyo46wD",
+      "reason": "Post-mortem: $SCREM fell -98.6% within 1.05h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "Ew2v3cw2fapxEKHxW1MVbQMTpVxqSpxyb8QQf84nJGyG",
+      "reason": "Post-mortem: $888 fell -74.3% within 1.14h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
+    },
+    {
+      "address": "3fKF8cbyWKU56fpFkrQ1E6zJoAh4mqArdsPoUE6ycTKL",
+      "reason": "Post-mortem: $ZOMBUCKS fell -85.9% within 1.11h",
+      "added": "2026-08-09",
+      "source": "post-mortem"
     }
   ],
   "mints": [

@@ -4,7 +4,7 @@
     "the next sync. Add hand-picked wallets to a separate file instead.",
     "",
     "Source: aegis-observed",
-    "Generated: 2026-08-09T08:30:03.738Z",
+    "Generated: 2026-08-09T08:59:33.010Z",
     "Rules applied: win rate >= 75% over >= 3 graded buys,",
     "net profit >= $5,000,",
     "on-chain activity >= 100 signatures.",
@@ -15,7 +15,7 @@
     "and it should grow over time; the win rate will fall as it does."
   ],
   "generated": {
-    "at": "2026-08-09T08:30:03.739Z",
+    "at": "2026-08-09T08:59:33.010Z",
     "source": "aegis-observed",
     "profitRuleSkipped": false,
     "count": 1
