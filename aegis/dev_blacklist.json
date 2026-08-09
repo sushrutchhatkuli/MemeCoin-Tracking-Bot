@@ -2692,6 +2692,12 @@
       "reason": "Post-mortem: $SADDYMIAW fell -98.2% within 1.07h",
       "added": "2026-08-09",
       "source": "post-mortem"
+    },
+    {
+      "address": "7A6jomai2YmGQL1J9R2tiCmVrYPZG5Hz25pGmmmRoJmf",
+      "reason": "Post-mortem: $Callturt fell -100% within 1.04h (pair delisted)",
+      "added": "2026-08-09",
+      "source": "post-mortem"
     }
   ],
   "mints": [
