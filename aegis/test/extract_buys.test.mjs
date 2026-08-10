@@ -77,6 +77,12 @@ import { awardAlphaPoints, scoreForwardTrade, applyOutcomes, pruneObservations }
 import { filterLaunchWindow } from '../multiplier_engine.mjs';
 import { extractCurveBuy, PUMP_FUN_PROGRAM } from '../smart_money.mjs';
 import { pruneCooldown, isOnCooldown, cooldownKey } from '../scan.mjs';
+import {
+  isMintCreation,
+  extractMintFromTransaction,
+  mergeCandidates,
+  websocketUrlFor,
+} from '../discovery_daemon.mjs';
 import { capEnrichmentShortlist } from '../auto_top_whales.mjs';
 import { extractMints, channelMatches, SeenCache } from '../telegram_listener.mjs';
 
@@ -2267,6 +2273,123 @@ test('end to end: a single-buy token cannot reach EARLY-STAGE INSIDER SCALP', ()
     clusters: clusterOf({ count: 2, clusterSize: 2 }), audit: PASSED,
   });
   assert.equal(allowed.category, SIGNAL_CATEGORY.INSIDER_EARLY);
+});
+
+/* ------------------------------------------------------------------ *
+ * WebSocket mint stream
+ *
+ * Two things here are load-bearing and neither is obvious: the creation
+ * instruction is CreateV2 rather than Create, and a polled refresh must not
+ * clobber streamed mints before DexScreener has caught up with them.
+ * ------------------------------------------------------------------ */
+
+test('CreateV2 is a creation and the ATA program’s own Create is not', () => {
+  // Measured: filtering on /Instruction: Create\b/ matched 0 of 17,384
+  // notifications over 20s, because the program moved to CreateV2.
+  assert.equal(isMintCreation(['Program 6EF8 invoke [1]', 'Program log: Instruction: CreateV2']), true);
+  assert.equal(isMintCreation(['Program log: Instruction: Create']), true, 'legacy fallback');
+
+  // The associated-token-account program logs a bare "Create" inside nearly
+  // every pump.fun transaction. Matching it would tag every buy as a launch.
+  assert.equal(isMintCreation(['Program log: Create']), false);
+  assert.equal(isMintCreation(['Program log: CreateIdempotent']), false);
+  assert.equal(isMintCreation(['Program log: Instruction: Buy', 'Program log: Create']), false);
+
+  // Real captured shapes.
+  assert.equal(isMintCreation(['Program log: Instruction: Sell', 'Program log: GetFees']), false);
+  for (const bad of [null, undefined, 'a string', 42, {}]) {
+    assert.equal(isMintCreation(bad), false, String(bad));
+  }
+});
+
+test('the mint is read by vanity suffix, then by initializeMint2', () => {
+  const REAL = 'APnWA41c6AjbMY6f6BdyXsj3jGzxiRWZBUN97fxRpump';
+  assert.equal(
+    extractMintFromTransaction({ transaction: { message: { accountKeys: [{ pubkey: 'Other111' }, { pubkey: REAL }] } } }),
+    REAL
+  );
+  // String-form account keys, which is what a non-jsonParsed encoding returns.
+  assert.equal(extractMintFromTransaction({ transaction: { message: { accountKeys: ['A', REAL] } } }), REAL);
+
+  // Fallback when the vanity convention does not hold — read from the parsed
+  // instruction rather than guessed from position.
+  assert.equal(
+    extractMintFromTransaction({
+      transaction: { message: { accountKeys: ['A', 'B'], instructions: [] } },
+      meta: { innerInstructions: [{ instructions: [{ parsed: { type: 'initializeMint2', info: { mint: 'MintXyz' } } }] }] },
+    }),
+    'MintXyz'
+  );
+
+  assert.equal(extractMintFromTransaction({}), null);
+  assert.equal(extractMintFromTransaction({ transaction: { message: { accountKeys: [] } } }), null);
+});
+
+test('a polled refresh must not clobber streamed mints', () => {
+  // THE bug this function exists to prevent. refreshOnce rewrites the whole
+  // file every 60s; a mint written by the socket at t+0.6s would be erased long
+  // before DexScreener had a pair for it (~30s), so the feature would appear to
+  // work and deliver nothing.
+  const now = 1_000_000_000_000;
+  const streamed = { chainId: 'solana', tokenAddress: 'Mint1pump', via: 'ws-mint', streamed: true, firstSeenAt: now - 5_000 };
+  const polled = { chainId: 'solana', tokenAddress: 'Polled1', via: 'boost/profile', socialHints: [{ type: 'twitter' }] };
+
+  const merged = mergeCandidates({ existing: [streamed], incoming: [polled], now, ttlSeconds: 900 });
+  assert.equal(merged.length, 2, 'the streamed mint survives the refresh');
+  assert.ok(merged.some((c) => c.tokenAddress === 'Mint1pump'));
+  assert.ok(merged.some((c) => c.tokenAddress === 'Polled1'));
+  assert.equal(merged[0].tokenAddress, 'Mint1pump', 'streamed sorts to the front');
+});
+
+test('a streamed mint ages out, and a polled entry for it keeps its provenance', () => {
+  const now = 1_000_000_000_000;
+  const stale = { tokenAddress: 'Old1pump', via: 'ws-mint', firstSeenAt: now - 901_000 };
+  assert.equal(
+    mergeCandidates({ existing: [stale], incoming: [], now, ttlSeconds: 900 }).length,
+    0,
+    'past the TTL it is dropped'
+  );
+
+  // When the feeds finally catch up, the polled entry wins (it carries social
+  // hints the socket cannot know) but keeps the earliest known sighting.
+  const streamed = { tokenAddress: 'M1pump', via: 'ws-mint', streamed: true, firstSeenAt: now - 30_000 };
+  const polled = { tokenAddress: 'M1pump', via: 'boost/profile', socialHints: [{ type: 'twitter' }] };
+  const merged = mergeCandidates({ existing: [streamed], incoming: [polled], now, ttlSeconds: 900 });
+  assert.equal(merged.length, 1, 'deduplicated by address');
+  assert.deepEqual(merged[0].socialHints, [{ type: 'twitter' }], 'the richer polled entry wins');
+  assert.equal(merged[0].firstSeenAt, now - 30_000, 'but the earliest sighting is preserved');
+  assert.equal(merged[0].streamed, true);
+});
+
+test('the merged pool is capped and drops the tail, not the newest', () => {
+  const now = 1_000_000_000_000;
+  const streamed = Array.from({ length: 5 }, (_, i) => ({
+    tokenAddress: `S${i}pump`, via: 'ws-mint', firstSeenAt: now - i * 1000,
+  }));
+  const polled = Array.from({ length: 50 }, (_, i) => ({ tokenAddress: `P${i}`, via: 'search' }));
+  const merged = mergeCandidates({ existing: streamed, incoming: polled, now, ttlSeconds: 900, maxTracked: 10 });
+
+  assert.equal(merged.length, 10);
+  assert.equal(merged.filter((c) => c.via === 'ws-mint').length, 5, 'every streamed mint is kept');
+  assert.equal(merged[0].tokenAddress, 'S0pump', 'newest streamed first');
+});
+
+test('the websocket url is derived from the configured RPC', () => {
+  assert.equal(websocketUrlFor('https://mainnet.helius-rpc.com/?api-key=x'), 'wss://mainnet.helius-rpc.com/?api-key=x');
+  assert.equal(websocketUrlFor('http://localhost:8899'), 'ws://localhost:8899');
+  assert.equal(websocketUrlFor('wss://already.ws'), 'wss://already.ws', 'idempotent');
+  assert.equal(websocketUrlFor(null), null);
+  assert.equal(websocketUrlFor(''), null);
+});
+
+test('the creation program is the one constant, not a second copy of it', async () => {
+  // Verified on-chain: exists, executable, owned by the BPF upgradeable loader.
+  // Asserted as IDENTITY rather than by value, so a future edit to either file
+  // cannot leave two program ids that disagree while both look authoritative.
+  const daemon = await import('../discovery_daemon.mjs');
+  assert.equal(daemon.PUMP_FUN_PROGRAM, PUMP_FUN_PROGRAM);
+  assert.equal(PUMP_FUN_PROGRAM, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+  assert.match(PUMP_FUN_PROGRAM, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
 });
 
 /* ------------------------------------------------------------------ *

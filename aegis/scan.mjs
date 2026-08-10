@@ -905,8 +905,11 @@ export async function runScan(args = {}) {
     if (fresh.fresh) {
       candidates = surfaced.candidates;
       stats = surfaced.stats ?? { total: candidates.length, fromFeeds: '?', fromSearch: '?' };
+      const streamedCount = candidates.filter((c) => c.via === 'ws-mint' || c.streamed).length;
       console.log(
-        `Candidates from discovery daemon: ${candidates.length} (${fresh.ageSec.toFixed(0)}s old, 0s discovery latency)`
+        `Candidates from discovery daemon: ${candidates.length} (pool ${fresh.ageSec.toFixed(0)}s old` +
+          (streamedCount ? `, ${streamedCount} from the live mint stream` : '') +
+          ')'
       );
     } else {
       console.log(
@@ -930,7 +933,38 @@ export async function runScan(args = {}) {
       const map = await fetchPairsBatch(addresses);
       pairs.push(...map.values());
     }
+
+    // --- Streamed-mint priority ---------------------------------------
+    //
+    // The volume sort below is right for the polled pool and WRONG for a
+    // streamed one, and the failure is silent: a mint the socket caught seconds
+    // after creation has no volume by construction, so it sorts dead last and
+    // is cut by the scanLimit slice every single tick. The 0ms discovery would
+    // deliver a candidate the scanner then never looks at.
+    //
+    // So streamed mints are floated to the front, capped so a burst of launches
+    // cannot displace the entire established pool — 24 creations/minute against
+    // a 15-token budget would otherwise crowd out everything else.
+    const streamedAddresses = new Set(
+      candidates.filter((c) => c.via === 'ws-mint' || c.streamed).map((c) => c.tokenAddress)
+    );
+    const priorityCap = config.discovery?.mintStream?.priorityAuditSlots ?? 3;
+
     pairs.sort((a, b) => (b.volume?.h1 ?? 0) - (a.volume?.h1 ?? 0));
+
+    if (streamedAddresses.size && config.discovery?.mintStream?.priorityAudit !== false) {
+      const streamed = pairs.filter((p) => streamedAddresses.has(p.baseToken?.address)).slice(0, priorityCap);
+      if (streamed.length) {
+        const rest = pairs.filter((p) => !streamed.includes(p));
+        pairs = [...streamed, ...rest];
+        console.log(
+          `   ${streamed.length} streamed mint(s) promoted to the front of the audit queue` +
+            (streamedAddresses.size > streamed.length
+              ? ` (${streamedAddresses.size - streamed.length} more streamed, over the ${priorityCap}-slot cap)`
+              : '')
+        );
+      }
+    }
 
     // Cooldown BEFORE the cap, which is the whole point. Filtering after the
     // slice would let recently-audited tokens occupy the audit budget and then
