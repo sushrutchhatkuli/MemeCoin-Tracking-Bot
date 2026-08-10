@@ -33,6 +33,7 @@ import {
   resolveInsiderBypass,
   tractionFrom,
 } from './audit.mjs';
+import { traceBundleTips } from './bundle_tracer.mjs';
 import { renderNote, noteFilename } from './note.mjs';
 import { loadState, saveState, computeVelocity, recordSnapshot } from './state.mjs';
 import {
@@ -408,6 +409,35 @@ async function analyzeToken({
 
   if (clusters?.detected) clusters.scoreBonus = clusterScoreBonus(clusters, config);
 
+  // --- Jito tip analysis --------------------------------------------
+  //
+  // Runs on the replayed buyers, whose transactions already carried their tip
+  // out of smart_money.mjs, so the normal path costs no extra RPC. rpcUrl is
+  // passed for the fallback: a buyer row from a cached or partial replay has no
+  // tip attached, and one lookup is better than reporting a launch as untipped
+  // because the data was simply not collected.
+  const jitoTip =
+    pair.chainId === 'solana' && buyers.length
+      ? await traceBundleTips({
+          buyers: buyers.map((b) => ({
+            ...b,
+            secondsAfterLaunch:
+              pair.pairCreatedAt && b.blockTime
+                ? (b.blockTime * 1000 - pair.pairCreatedAt) / 1000
+                : null,
+          })),
+          rpcUrl: config.rpcUrl,
+          solUsd,
+          config,
+        })
+      : null;
+
+  if (jitoTip?.detected) {
+    console.log(
+      `   ${jitoTip.label}${jitoTip.qualifies ? ` — +${jitoTip.scoreBoost} cabal conviction` : ' (under the bonus floor)'}`
+    );
+  }
+
   // Attach each insider's rolling scorecard from Aegis's own ledger. Free —
   // the observations are already in memory — and it is the only performance
   // data that exists: GMGN and Birdeye, which sell the real thing, are gated.
@@ -531,6 +561,7 @@ async function analyzeToken({
     socialHype,
     config,
     insiderBypass,
+    jitoTip,
   });
 
   if (verdictInfo.insiderBypass?.applied) {
@@ -557,6 +588,7 @@ async function analyzeToken({
     clusters,
     cto,
     megaRunner,
+    jitoTip,
     news,
     social: socialHype,
   };

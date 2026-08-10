@@ -457,7 +457,7 @@ function renderWhales(smartMoney) {
  * the tier header does not carry. At a single wallet it would just restate the
  * header, and the full roster appears in the cluster block below regardless.
  */
-export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass }) {
+export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip }) {
   const count = clusters?.insiderCount ?? 0;
   const tierHeader = signalCategory?.alertHeader ?? null;
 
@@ -477,11 +477,20 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
   // A slot-level bundle leads everything: it is the most specific structural
   // claim available about HOW the buys happened, and it is the one an operator
   // most wants to see before deciding whether this is a cabal entry.
-  const bundle = clusters?.jito?.detected
-    ? [
-        `<b>${esc(clusters.jito.confirmed ? 'JITO BLOCK #0 CABAL BUNDLE DETECTED' : 'SAME-SLOT CABAL BUNDLE DETECTED')} </b>`,
-      ]
-    : [];
+  //
+  // The tip line sits directly under it because the two answer one question
+  // together: the bundle says the buys were co-executed, the tip says what that
+  // ordering was worth to whoever bought it. A tip with no bundle still renders
+  // — someone paid for priority either way — but it is the pair that means
+  // something.
+  const bundle = [
+    ...(clusters?.jito?.detected
+      ? [
+          `<b>${esc(clusters.jito.confirmed ? 'JITO BLOCK #0 CABAL BUNDLE DETECTED' : 'SAME-SLOT CABAL BUNDLE DETECTED')} </b>`,
+        ]
+      : []),
+    ...(jitoTip?.detected ? [`<b>${esc(jitoTip.label)}</b>`] : []),
+  ];
 
   // News leads when it fires: a token named after a live headline needs that
   // context before anything else, in both directions — it explains the move,
@@ -624,6 +633,40 @@ function renderNewsAndSocial(news, social) {
   return lines;
 }
 
+/**
+ * Jito tip detail — what was paid, over how many transactions, and what it does
+ * and does not mean.
+ *
+ * The caveat is not boilerplate and is not optional. This is the only signal in
+ * the alert that was BOUGHT rather than done: a tip is a payment to a public
+ * address, so a well-funded rug pays exactly the same figure a real cabal does,
+ * and has the same reason to. Printing "5.2 SOL" beside a conviction bonus with
+ * nothing else said would invite the reading that money spent equals quality.
+ */
+function renderJitoTip(jitoTip) {
+  if (!jitoTip?.detected) return [];
+
+  const lines = [
+    '',
+    `<b>${esc(jitoTip.label)}</b>`,
+    `• Paid across ${jitoTip.tippingTxs} of ${jitoTip.inspectedTxs} launch-window transaction(s)`,
+  ];
+  if (jitoTip.unknownTxs) {
+    lines.push(
+      `• <i>${jitoTip.unknownTxs} transaction(s) could not be read — the real total is at least this, never less.</i>`
+    );
+  }
+  lines.push(
+    jitoTip.qualifies
+      ? `• Cabal Conviction: <b>+${jitoTip.scoreBoost}</b> (over the ${jitoTip.minTipSol} SOL floor)`
+      : `• Under the ${jitoTip.minTipSol} SOL floor — no conviction points awarded`
+  );
+  lines.push(
+    '<i>A tip buys ORDERING, not quality. It is the one signal here that is purchased outright rather than earned, and a developer rugging their own launch has the same reason to pay it — they want their buys sequenced ahead of yours. Read it as capital and intent, never as endorsement.</i>'
+  );
+  return lines;
+}
+
 /** Viral-volume detail. Shows the two measured figures, not just the banner. */
 function renderMegaRunner(megaRunner) {
   if (!megaRunner?.detected) return [];
@@ -635,7 +678,7 @@ function renderMegaRunner(megaRunner) {
   ];
 }
 
-export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader, news, social, sizerConfig }) {
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader, news, social, sizerConfig, jitoTip }) {
   // Read off the verdict rather than re-derived: this is a rendering decision,
   // and the scorer is the only thing entitled to decide a gate was overridden.
   const insiderBypass = verdictInfo?.insiderBypass?.applied === true ? verdictInfo.insiderBypass : null;
@@ -678,7 +721,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     : [];
 
   return [
-    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass }),
+    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip }),
     `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
     `<i>Score ${verdictInfo.score}/100</i>${clusters?.label ? ` | <b>${esc(clusters.label)}</b>` : ''}`,
     // Placed above the advice: if the buy button is locked, the trading advice
@@ -689,6 +732,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     ...(signalCategory?.advice ? ['', `<b>${esc(signalCategory.advice)}</b>`] : []),
     ...sizeLines,
     ...renderNewsAndSocial(news, social),
+    ...renderJitoTip(jitoTip),
     ...renderMegaRunner(megaRunner),
     ...renderCto(cto),
     ...renderClusters(clusters),
@@ -1507,6 +1551,7 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     news: result.news,
     social: result.social,
     sizerConfig: config,
+    jitoTip: result.jitoTip,
   });
 
   const sent = await sendTelegram({ ...credentials, text });

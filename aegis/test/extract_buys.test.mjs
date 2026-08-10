@@ -39,6 +39,14 @@ import {
 } from '../audit.mjs';
 import { alertHeaderLines, buildMessage, maybeAlert, parseCommand, handleCommand } from '../telegram.mjs';
 import { buildDeps, toPlainText } from '../bot.mjs';
+import {
+  JITO_TIP_ACCOUNTS,
+  accountKeysInBalanceOrder,
+  extractJitoTip,
+  formatTipLine,
+  summariseTips,
+  traceBundleTips,
+} from '../bundle_tracer.mjs';
 import { stopLossPctFor, armedTrailingLock, evaluateTriggers, detectLiquidityDrain, TRIGGER } from '../sell_notifier.mjs';
 import { walletScorecard } from '../wallet_observations.mjs';
 import { detectJitoBundles } from '../insider_cluster.mjs';
@@ -2156,6 +2164,318 @@ test('end to end: a single-buy token cannot reach EARLY-STAGE INSIDER SCALP', ()
     clusters: clusterOf({ count: 2, clusterSize: 2 }), audit: PASSED,
   });
   assert.equal(allowed.category, SIGNAL_CATEGORY.INSIDER_EARLY);
+});
+
+/* ------------------------------------------------------------------ *
+ * Jito tip & bundle analyser
+ *
+ * The tip account list is the whole mechanism: one wrong character and the
+ * tracer reports "no tip" on every token forever, which reads as a measurement
+ * rather than as a broken lookup. So the shape of the extraction is tested
+ * against a transaction built to the real getTransaction layout, and the
+ * unreadable cases are tested to make sure none of them collapses into a zero.
+ * ------------------------------------------------------------------ */
+
+const TIP_A = 'DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL';
+const TIP_B = 'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY';
+
+/**
+ * A getTransaction result in the shape Helius returns: accountKeys aligned with
+ * pre/postBalances, entry i of one describing entry i of the others.
+ */
+function tipTx({ keys, deltas, err = null, loaded = null, dropKeys = 0 }) {
+  const pre = keys.map(() => 1_000_000_000);
+  const post = pre.map((p, i) => p + (deltas[i] ?? 0));
+  const staticKeys = keys.slice(0, keys.length - dropKeys);
+  return {
+    meta: {
+      err,
+      fee: 5000,
+      preBalances: pre,
+      postBalances: post,
+      ...(loaded ? { loadedAddresses: loaded } : {}),
+    },
+    transaction: { message: { accountKeys: staticKeys.map((k) => ({ pubkey: k, signer: false })) } },
+  };
+}
+
+test('a tip is read from the tip account’s balance delta', () => {
+  const tx = tipTx({
+    keys: [BUYER, TIP_A, POOL],
+    deltas: [-5_200_000_000, 5_200_000_000, 0],
+  });
+  const r = extractJitoTip(tx);
+  assert.equal(r.ok, true);
+  assert.equal(r.lamports, 5_200_000_000);
+  assert.equal(r.sol, 5.2);
+  assert.equal(r.accounts.length, 1);
+  assert.equal(r.accounts[0].account, TIP_A);
+});
+
+test('tips to several tip accounts in one transaction are summed', () => {
+  const r = extractJitoTip(
+    tipTx({ keys: [BUYER, TIP_A, TIP_B], deltas: [-3_000_000_000, 1_000_000_000, 2_000_000_000] })
+  );
+  assert.equal(r.sol, 3);
+  assert.equal(r.accounts.length, 2);
+});
+
+test('a transaction with no tip account reads as a real zero', () => {
+  const r = extractJitoTip(tipTx({ keys: [BUYER, POOL, RELAYER], deltas: [-1e9, 1e9, 0] }));
+  assert.equal(r.ok, true);
+  assert.equal(r.lamports, 0);
+});
+
+test('only CREDITS to a tip account count', () => {
+  // A negative delta on a tip account is not a refund of somebody's tip, and
+  // netting it off would erase real tips from the same launch window.
+  const r = extractJitoTip(tipTx({ keys: [TIP_A, TIP_B], deltas: [-500_000_000, 2_000_000_000] }));
+  assert.equal(r.sol, 2);
+});
+
+test('a FAILED transaction paid no tip that counts — the bundle did not land', () => {
+  const r = extractJitoTip(
+    tipTx({ keys: [BUYER, TIP_A], deltas: [-1e9, 1e9], err: { InstructionError: [0, 'X'] } })
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.lamports, 0);
+});
+
+test('an unreadable transaction is ok:false, never a zero tip', () => {
+  // The distinction the whole module rests on: "we could not read this" must
+  // never render as "this paid nothing", because zero is the answer that looks
+  // normal and would silently understate every total.
+  assert.equal(extractJitoTip({}).ok, false);
+  assert.equal(extractJitoTip({ meta: {} }).ok, false);
+  assert.equal(extractJitoTip(null).ok, false);
+
+  // Account list shorter than the balance arrays, with no loadedAddresses to
+  // close the gap — reading an index here would attribute one account's balance
+  // change to a different account entirely.
+  const misaligned = tipTx({ keys: [BUYER, TIP_A, POOL], deltas: [0, 1e9, 0], dropKeys: 1 });
+  const r = extractJitoTip(misaligned);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /does not match balances/);
+});
+
+test('lookup-table accounts are appended in writable-then-readonly order', () => {
+  // A versioned transaction can resolve the tip account through an address
+  // lookup table, in which case accountKeys holds only the static prefix.
+  const tx = tipTx({
+    keys: [BUYER, POOL, TIP_A],
+    deltas: [-2e9, 0, 2e9],
+    dropKeys: 1,
+    loaded: { writable: [TIP_A], readonly: [] },
+  });
+  const { keys, aligned } = accountKeysInBalanceOrder(tx);
+  assert.equal(aligned, true);
+  assert.deepEqual(keys, [BUYER, POOL, TIP_A]);
+  assert.equal(extractJitoTip(tx).sol, 2);
+});
+
+test('the pinned tip account list is the eight Jito publishes', () => {
+  assert.equal(JITO_TIP_ACCOUNTS.length, 8);
+  for (const a of JITO_TIP_ACCOUNTS) {
+    assert.match(a, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/, `${a} is not valid base58`);
+  }
+  assert.equal(new Set(JITO_TIP_ACCOUNTS).size, 8, 'no duplicates');
+  // The three named in the spec. 3AVr… was a typo for 3AVi… — asserted so the
+  // wrong one cannot be reintroduced from the prompt later.
+  assert.ok(JITO_TIP_ACCOUNTS.includes('Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY'));
+  assert.ok(JITO_TIP_ACCOUNTS.includes('DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL'));
+  assert.ok(JITO_TIP_ACCOUNTS.includes('3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT'));
+  assert.equal(JITO_TIP_ACCOUNTS.some((a) => a.startsWith('3AVr')), false);
+});
+
+const tipCfg = { jitoTips: { enabled: true, minTipSolForBonus: 1.0, scoreBoost: 15 } };
+
+test('tips are summed once per TRANSACTION, not once per buyer in it', () => {
+  // The bug this exists to prevent: one bundle transaction fills four wallets,
+  // and summing per buyer turns a single 0.5 SOL tip into 2.0 SOL — inflating
+  // exactly the tokens that already look most like a cabal.
+  const entries = [
+    { signature: 'sigA', jitoTipLamports: 500_000_000 },
+    { signature: 'sigA', jitoTipLamports: 500_000_000 },
+    { signature: 'sigA', jitoTipLamports: 500_000_000 },
+    { signature: 'sigA', jitoTipLamports: 500_000_000 },
+  ];
+  const r = summariseTips({ entries, config: tipCfg });
+  assert.equal(r.totalSol, 0.5);
+  assert.equal(r.inspectedTxs, 1);
+  assert.equal(r.qualifies, false, '0.5 SOL is under the 1.0 floor');
+  assert.equal(r.scoreBoost, 0);
+});
+
+test('over 1.0 SOL awards the conviction bonus; exactly 1.0 does not', () => {
+  const sum = (sol) =>
+    summariseTips({
+      entries: [{ signature: 's', jitoTipLamports: sol * 1e9 }],
+      solUsd: 77.12,
+      config: tipCfg,
+    });
+
+  const over = sum(5.2);
+  assert.equal(over.qualifies, true);
+  assert.equal(over.scoreBoost, 15);
+  assert.equal(Math.round(over.totalUsd), 401);
+  assert.equal(over.label, 'JITO BUNDLE TIP: 5.20 SOL ($401)');
+
+  // ">1.0 SOL" as specified — the floor itself is not over it.
+  assert.equal(sum(1.0).qualifies, false);
+  assert.equal(sum(1.000000001).qualifies, true);
+});
+
+test('unreadable transactions are counted, not folded in as zeroes', () => {
+  const r = summariseTips({
+    entries: [
+      { signature: 'a', jitoTipLamports: 2_000_000_000 },
+      { signature: 'b', jitoTipLamports: null },
+      { signature: 'c', jitoTipLamports: undefined },
+    ],
+    config: tipCfg,
+  });
+  assert.equal(r.totalSol, 2);
+  assert.equal(r.unknownTxs, 2);
+  assert.equal(r.inspectedTxs, 1, 'unknown transactions are not inspected transactions');
+});
+
+test('a tip with no SOL price renders without inventing a dollar figure', () => {
+  const r = summariseTips({ entries: [{ signature: 's', jitoTipLamports: 3.5e9 }], config: tipCfg });
+  assert.equal(r.totalUsd, null);
+  assert.equal(r.label, 'JITO BUNDLE TIP: 3.50 SOL');
+  assert.equal(formatTipLine({ totalSol: 3.5, totalUsd: null }), 'JITO BUNDLE TIP: 3.50 SOL');
+});
+
+test('the tip sum is scoped to the launch window, and unknown timing is excluded', async () => {
+  const buyers = [
+    { signature: 'in1', secondsAfterLaunch: 4, jitoTipLamports: 2_000_000_000 },
+    { signature: 'in2', secondsAfterLaunch: 280, jitoTipLamports: 1_000_000_000 },
+    { signature: 'late', secondsAfterLaunch: 4000, jitoTipLamports: 9_000_000_000 },
+    { signature: 'unknown', secondsAfterLaunch: null, jitoTipLamports: 9_000_000_000 },
+  ];
+  const r = await traceBundleTips({ buyers, config: { jitoTips: { ...tipCfg.jitoTips, launchWindowSeconds: 300 } } });
+
+  assert.equal(r.totalSol, 3, 'only the two inside the 300s window');
+  assert.equal(r.windowSec, 300);
+  assert.equal(r.qualifies, true);
+});
+
+test('the tracer makes no RPC call when every buyer already carries its tip', async () => {
+  // The cost claim in the config note, asserted: buyer replay already fetched
+  // these transactions, so re-fetching them would double the most expensive
+  // call in the pipeline to learn something already in memory.
+  let fetched = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (...args) => { fetched++; return originalFetch(...args); };
+  try {
+    const r = await traceBundleTips({
+      buyers: [{ signature: 's1', secondsAfterLaunch: 10, jitoTipLamports: 2e9 }],
+      rpcUrl: 'https://rpc.invalid/',
+      config: tipCfg,
+    });
+    assert.equal(fetched, 0, 'no network call for tips already in hand');
+    assert.equal(r.totalSol, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a disabled tracer reports nothing rather than a zero tip', async () => {
+  const r = await traceBundleTips({
+    buyers: [{ signature: 's', secondsAfterLaunch: 5, jitoTipLamports: 9e9 }],
+    config: { jitoTips: { enabled: false } },
+  });
+  assert.equal(r.detected, false);
+  assert.equal(r.scoreBoost, 0);
+  assert.match(r.skipped, /disabled/);
+});
+
+test('the conviction bonus is forfeited unless the audit affirmatively PASSED', () => {
+  // Same rule as the mega-runner boost, and this signal needs it most: a tip is
+  // a PAYMENT, so a well-funded rug buys the identical figure a real cabal does.
+  const base = {
+    security: { ok: true, totalHolders: 5000, top10Pct: 10 },
+    demand: strongDemand,
+    velocity: null,
+    catalysts: { bullish: [], bearish: [] },
+    thresholds,
+    jitoTip: { scoreBoost: 15, detected: true, totalSol: 5.2 },
+  };
+
+  const passed = scoreToken({ ...base, audit: PASSED });
+  const unverified = scoreToken({ ...base, audit: { status: 'UNVERIFIED', checks: [], failures: [], unknowns: ['x'] } });
+  const failed = scoreToken({ ...base, audit: { status: 'FAILED', checks: [], failures: ['Mint Authority: ACTIVE'], unknowns: [] } });
+
+  assert.equal(passed.breakdown.jitoTip, 15);
+  assert.equal(unverified.breakdown.jitoTip, 0, 'UNVERIFIED is not "passed"');
+  assert.equal(failed.breakdown.jitoTip, 0);
+  assert.equal(failed.score, 0);
+
+  // And it genuinely moves the score rather than only appearing in the breakdown.
+  const without = scoreToken({ ...base, audit: PASSED, jitoTip: null });
+  assert.equal(passed.score - without.score, 15);
+});
+
+test('the tip line leads the alert and states what it does not mean', () => {
+  const jitoTip = {
+    detected: true, totalSol: 5.2, totalUsd: 401, tippingTxs: 3, inspectedTxs: 4,
+    unknownTxs: 1, qualifies: true, scoreBoost: 15, minTipSol: 1,
+    label: 'JITO BUNDLE TIP: 5.20 SOL ($401)',
+  };
+
+  const header = alertHeaderLines({
+    signalCategory: { alertHeader: 'EARLY INSIDER SCALP ALERT ($30k–$500k MC)' },
+    clusters: insiders(3),
+    jitoTip,
+  });
+  assert.ok(header.some((l) => /JITO BUNDLE TIP: 5\.20 SOL \(\$401\)/.test(l)));
+  assert.ok(
+    header.findIndex((l) => /JITO BUNDLE TIP/.test(l)) <
+      header.findIndex((l) => /EARLY INSIDER SCALP ALERT/.test(l)),
+    'the tip sits above the tier header'
+  );
+
+  const body = buildMessage({
+    pair: { chainId: 'solana', baseToken: { symbol: 'TIP', address: MINT } },
+    demand: { ...strongDemand, liqToMcapPct: 40 },
+    verdictInfo: { score: 88, securityStatus: 'PASSED', holderGate: { floor: 150 } },
+    smartMoney: null, deployer: null,
+    security: cleanSecurity(),
+    tradeLink: { template: 'https://x.test/{chain}/{address}', label: 'Trade' },
+    reaudit: { ran: false },
+    signalCategory: { alertHeader: 'EARLY INSIDER SCALP ALERT ($30k–$500k MC)' },
+    clusters: scoredInsiders(10),
+    thresholds,
+    sizerConfig: {},
+    jitoTip,
+  });
+
+  assert.match(body, /JITO BUNDLE TIP: 5\.20 SOL \(\$401\)/);
+  assert.match(body, /Paid across 3 of 4 launch-window transaction\(s\)/);
+  assert.match(body, /1 transaction\(s\) could not be read — the real total is at least this, never less/);
+  assert.match(body, /Cabal Conviction: <b>\+15<\/b>/);
+  assert.match(body, /A tip buys ORDERING, not quality/);
+  assert.match(body, /developer rugging their own launch has the same reason to pay it/);
+});
+
+test('a tip under the floor is shown but awards nothing', () => {
+  const body = buildMessage({
+    pair: { chainId: 'solana', baseToken: { symbol: 'TIP', address: MINT } },
+    demand: { ...strongDemand, liqToMcapPct: 40 },
+    verdictInfo: { score: 70, securityStatus: 'PASSED', holderGate: { floor: 150 } },
+    smartMoney: null, deployer: null, security: cleanSecurity(),
+    tradeLink: { template: 'https://x.test/{chain}/{address}', label: 'Trade' },
+    reaudit: { ran: false }, signalCategory: {}, clusters: scoredInsiders(10),
+    thresholds, sizerConfig: {},
+    jitoTip: {
+      detected: true, totalSol: 0.4, totalUsd: 31, tippingTxs: 1, inspectedTxs: 6,
+      unknownTxs: 0, qualifies: false, scoreBoost: 0, minTipSol: 1,
+      label: 'JITO BUNDLE TIP: 0.40 SOL ($31)',
+    },
+  });
+  assert.match(body, /JITO BUNDLE TIP: 0\.40 SOL/);
+  assert.match(body, /Under the 1 SOL floor — no conviction points awarded/);
+  assert.doesNotMatch(body, /Cabal Conviction/);
 });
 
 /* ------------------------------------------------------------------ *

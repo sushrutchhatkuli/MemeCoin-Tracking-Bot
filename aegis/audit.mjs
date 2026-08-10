@@ -1445,6 +1445,7 @@ export function scoreToken({
   socialHype,
   config,
   insiderBypass = null,
+  jitoTip = null,
 }) {
   // Demand — 30 pts
   const demandScore =
@@ -1603,6 +1604,19 @@ export function scoreToken({
   // redeclaration, not a shadow.
   const socialHypeBonus = gatesFullyPassed ? (socialHype?.scoreBoost ?? 0) : 0;
 
+  // Jito Cabal Conviction. Awarded when the launch-window bundles paid more than
+  // jitoTips.minTipSolForBonus in validator tips.
+  //
+  // Held to the SAME affirmative-PASS bar as the cluster, mega-runner and hype
+  // bonuses, and it is the one that needs the bar most: a tip is not merely
+  // manufacturable, it is a PAYMENT. Anyone with the SOL can buy this signal
+  // outright, to a public address, in one transaction. A developer rugging
+  // their own launch has the same reason to tip as a cabal does — they want
+  // their buys sequenced first, and the tip is a rounding error against what
+  // they plan to extract. Without this gate, "well-funded operation" would read
+  // as "good token", which is precisely backwards on an unaudited contract.
+  const jitoTipBonus = gatesFullyPassed ? (jitoTip?.scoreBoost ?? 0) : 0;
+
   let score = Math.round(
     demandScore +
       depthScore +
@@ -1614,7 +1628,8 @@ export function scoreToken({
       categoryBonus +
       clusterBonus +
       megaRunnerBonus +
-      socialHypeBonus
+      socialHypeBonus +
+      jitoTipBonus
   );
   score -= catalysts.bearish.length * 4;
   score = clamp(score, 0, 100);
@@ -1774,6 +1789,7 @@ export function scoreToken({
       insiderCluster: clusterBonus,
       megaRunner: megaRunnerBonus,
       socialHype: socialHypeBonus,
+      jitoTip: jitoTipBonus,
       bearishPenalty: catalysts.bearish.length * 4,
     },
   };

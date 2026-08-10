@@ -18,6 +18,8 @@
 
 import { readFile } from 'node:fs/promises';
 
+import { extractJitoTip } from './bundle_tracer.mjs';
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -725,6 +727,14 @@ export async function fetchRecentBuyers({ rpcUrl, poolAddress, mint, cfg, screen
       continue;
     }
 
+    // The Jito tip is read HERE, from a transaction that is already in memory,
+    // rather than by re-fetching it in bundle_tracer. Doing it there would
+    // double the getTransaction count for the whole launch window — the single
+    // most expensive call in the pipeline — to learn something this response
+    // already contains. Unreadable stays null, never 0: see summariseTips.
+    const tip = extractJitoTip(tx.result);
+    const tipLamports = tip.ok ? tip.lamports : null;
+
     for (const b of extractBuys(tx.result, { mint, poolAddress })) {
       const existing = buyers.get(b.wallet);
       // `slot` rides along for the bundle tracer: transactions in one Jito
@@ -736,6 +746,10 @@ export async function fetchRecentBuyers({ rpcUrl, poolAddress, mint, cfg, screen
         blockTime: sig.blockTime ?? 0,
         slot: sig.slot ?? null,
         signature: sig.signature,
+        // A property of the TRANSACTION, copied onto each buyer it produced.
+        // summariseTips deduplicates by signature before summing, so a tip in a
+        // multi-buyer transaction is counted once rather than once per wallet.
+        jitoTipLamports: tipLamports,
       };
       // Keep the EARLIEST buy per wallet — entry timing is the interesting fact.
       if (!existing || entry.blockTime < existing.blockTime) buyers.set(b.wallet, entry);
