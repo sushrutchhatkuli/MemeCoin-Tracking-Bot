@@ -21,8 +21,11 @@
  * This one needs a good name. A rug and a legitimate launch can carry byte-
  * identical metadata, because the metadata is typed into a form.
  *
- * So the +15 is gated on the contract audit having AFFIRMATIVELY passed, like
+ * So the bonus is gated on the contract audit having AFFIRMATIVELY passed, like
  * every other bonus, and the alert says plainly that a name is not a contract.
+ * It is also deliberately small — cut to +5 on 2026-08-10 — because a signal
+ * derived from a name should be able to break a tie at the alert floor and not
+ * to carry a token there by itself.
  *
  * ── PROMPT INJECTION IS A REAL ATTACK HERE, NOT A THEORETICAL ONE ───────────
  * Token names are arbitrary attacker-supplied strings that this module feeds to
@@ -32,8 +35,8 @@
  *
  * costs a few dollars to deploy. MEASURED against gemini-flash-lite-latest on
  * 2026-08-09, with the metadata interpolated naively into the prompt, that
- * exact name returned {"score": 100} — a free +15 for anyone who reads this
- * file. With the hardened frame in buildPrompt() the same name returns
+ * exact name returned {"score": 100} — a free top-tier grade for anyone who
+ * reads this file. With the hardened frame in buildPrompt() the same name returns
  * {"score": 0} while a benign "Doge Killer" still returns 85.
  *
  * Three layers, because one is not enough:
