@@ -27,6 +27,7 @@ import {
   evaluateInsiderRequirements,
   evaluateSecurityShield,
   evaluateCommunityTakeover,
+  evaluateBundleSpendFloor,
   resolveInsiderBypass,
   auditFailuresAreBypassable,
   applyCtoOverride,
@@ -1472,22 +1473,105 @@ test('pool share is computed and flags a thin pool', () => {
   const deep = recommendSize({ score: 95, demand: { liquiditySol: 800 }, config: sizerCfg });
   assert.equal(Number(deep.poolSharePct.toFixed(2)), 0.25);
   assert.equal(deep.thinPool, false);
+  assert.equal(deep.capped, false, 'a deep pool leaves the ladder size alone');
 
-  const thin = recommendSize({ score: 95, demand: { liquiditySol: 12 }, config: sizerCfg });
-  assert.equal(Number(thin.poolSharePct.toFixed(2)), 16.67);
-  assert.equal(thin.thinPool, true);
-  assert.equal(thin.sol, 2.0, 'the warning must not shrink the configured size');
+  // A 1.5% share is over thinPoolWarnPct and under maxPoolSharePct: warned
+  // about, not reduced. This is the band where the old warning still does its
+  // original job.
+  const warned = recommendSize({ score: 95, demand: { liquiditySol: 133 }, config: sizerCfg });
+  assert.equal(warned.capped, false);
+  assert.equal(warned.thinPool, true);
+  assert.equal(warned.sol, 2.0);
 
   const unknown = recommendSize({ score: 95, demand: {}, config: sizerCfg });
   assert.equal(unknown.poolSharePct, null);
   assert.equal(unknown.thinPool, false, 'unknown depth is not a thin pool');
 });
 
+/* ------------------------------------------------------------------ *
+ * Pool impact cap
+ *
+ * BEHAVIOUR CHANGE, 2026-08-09. The sizer previously returned the configured
+ * size no matter how thin the pool, and warned in text. It now reduces the
+ * size. The assertion "the warning must not shrink the configured size" was
+ * deleted from the test above because it is deliberately no longer true.
+ * ------------------------------------------------------------------ */
+
+test('no recommendation may exceed 5% of the pool, whatever the score', () => {
+  // Measured median pool is 20.3 SOL, so this is the common case rather than
+  // an edge one: the 2.0 rung exceeds 5% on 62% of live scanned tokens.
+  const thin = recommendSize({ score: 95, demand: { liquiditySol: 12 }, config: sizerCfg });
+  assert.equal(thin.sol, 0.6, '5% of 12 SOL');
+  assert.equal(thin.uncappedSol, 2.0, 'what the ladder wanted is retained');
+  assert.equal(thin.capped, true);
+  assert.equal(Number(thin.poolSharePct.toFixed(2)), 5, 'share is recomputed on the CAPPED size');
+
+  // The cap is on the pool, not on the rung, so it binds at every level.
+  for (const [score, wanted] of [[95, 2.0], [82, 0.75], [70, 0.25]]) {
+    const r = recommendSize({ score, demand: { liquiditySol: 2 }, config: sizerCfg });
+    assert.equal(r.uncappedSol, wanted);
+    assert.equal(r.sol, 0.1, `5% of a 2 SOL pool, from score ${score}`);
+    assert.equal(r.capped, true);
+  }
+
+  // Exactly at the cap is not capped.
+  const exact = recommendSize({ score: 95, demand: { liquiditySol: 40 }, config: sizerCfg });
+  assert.equal(exact.sol, 2.0);
+  assert.equal(exact.capped, false);
+});
+
+test('a pool too thin to size into recommends nothing rather than a gesture', () => {
+  // 5% of 0.6 SOL is 0.03 SOL. Printing that as a recommendation with a
+  // straight face is worse than saying the token cannot be sized into.
+  const r = recommendSize({ score: 95, demand: { liquiditySol: 0.6 }, config: sizerCfg });
+  assert.equal(r.poolTooThin, true);
+  const line = formatSizeLine(r);
+  assert.match(line, /^RECOMMENDED BUY SIZE: none/);
+  assert.match(line, /the pool holds 0\.60 SOL/);
+  assert.match(line, /HEAVY CONVICTION wanted 2\.00/);
+});
+
+test('unknown pool depth cannot be capped, and the alert says so', () => {
+  const r = recommendSize({ score: 82, demand: {}, config: sizerCfg });
+  assert.equal(r.sol, 0.75, 'the size is not silently suppressed');
+  assert.equal(r.poolDepthUnknown, true);
+  assert.equal(r.capped, false);
+  assert.match(formatSizeLine(r), /pool depth unknown, the 5% impact cap could NOT be applied/);
+
+  // Failing closed is available for anyone who wants the guarantee absolute.
+  const strict = recommendSize({
+    score: 82,
+    demand: {},
+    config: { positionSizer: { requireKnownPoolDepth: true } },
+  });
+  assert.equal(strict, null);
+});
+
+test('the cap is configurable and can be widened or tightened', () => {
+  const tight = recommendSize({
+    score: 95, demand: { liquiditySol: 100 }, config: { positionSizer: { maxPoolSharePct: 1 } },
+  });
+  assert.equal(tight.sol, 1.0);
+  assert.equal(tight.capped, true);
+
+  const loose = recommendSize({
+    score: 95, demand: { liquiditySol: 100 }, config: { positionSizer: { maxPoolSharePct: 50 } },
+  });
+  assert.equal(loose.sol, 2.0, 'a loose cap never INCREASES the ladder size');
+  assert.equal(loose.capped, false);
+});
+
 test('the alert line matches the specified format', () => {
+  // No demand at all is the unknown-depth path, which now carries the notice.
   const line = formatSizeLine(recommendSize({ score: 82, config: sizerCfg }));
-  assert.equal(line, 'RECOMMENDED BUY SIZE: 0.75 SOL (Standard Entry)');
+  assert.match(line, /^RECOMMENDED BUY SIZE: 0\.75 SOL \(Standard Entry\) — pool depth unknown/);
+
   const withPool = formatSizeLine(recommendSize({ score: 82, demand: { liquiditySol: 800 }, config: sizerCfg }));
-  assert.match(withPool, /^RECOMMENDED BUY SIZE: 0\.75 SOL \(Standard Entry\) — 0\.09% of the pool$/);
+  assert.equal(withPool, 'RECOMMENDED BUY SIZE: 0.75 SOL (Standard Entry) — 0.09% of the pool');
+
+  const capped = formatSizeLine(recommendSize({ score: 95, demand: { liquiditySol: 12 }, config: sizerCfg }));
+  assert.match(capped, /CAPPED at 5% of the 12\.0 SOL pool \(ladder wanted 2\.00 SOL\)/);
+
   assert.equal(formatSizeLine(null), null);
 });
 
@@ -2170,6 +2254,169 @@ test('end to end: a single-buy token cannot reach EARLY-STAGE INSIDER SCALP', ()
     clusters: clusterOf({ count: 2, clusterSize: 2 }), audit: PASSED,
   });
   assert.equal(allowed.category, SIGNAL_CATEGORY.INSIDER_EARLY);
+});
+
+/* ------------------------------------------------------------------ *
+ * Micro-bundle blocking — minimum cabal spend floor
+ *
+ * The same-slot argument is about TIMING, and it holds just as well for three
+ * wallets spending 0.01 SOL each. That is not a cabal, and the tag it would
+ * earn is expensive: it leads the alert header, carries +25, decorates the top
+ * sizing rung and satisfies the early tier's multi-wallet requirement.
+ * ------------------------------------------------------------------ */
+
+const spendCfg = (over = {}) => ({
+  insiderCluster: { minBundleWallets: 3, minBundleWalletSol: 0.5, minBundleTotalSol: 1.5, ...over },
+});
+const member = (wallet, solSpent) => ({ wallet, solSpent, slot: 42, signature: `sig-${wallet}` });
+
+test('a real cabal bundle clears both floors', () => {
+  const r = evaluateBundleSpendFloor({
+    members: [member('W1', 0.8), member('W2', 0.6), member('W3', 0.9)],
+    config: spendCfg(),
+    solUsd: 77,
+  });
+  assert.equal(r.passed, true);
+  assert.equal(r.qualifying.length, 3);
+  assert.equal(Number(r.totalSol.toFixed(2)), 2.3);
+  assert.equal(Math.round(r.totalUsd), 177);
+  assert.match(r.detail, /3 wallet\(s\) spending 2\.30 SOL \(\$177\) combined/);
+});
+
+test('micro-buys under 0.50 SOL per wallet do not count', () => {
+  // Three wallets, one slot, 0.03 SOL between them. Timing says cabal; the
+  // money says a script.
+  const r = evaluateBundleSpendFloor({
+    members: [member('W1', 0.01), member('W2', 0.01), member('W3', 0.01)],
+    config: spendCfg(),
+  });
+  assert.equal(r.passed, false);
+  assert.equal(r.qualifying.length, 0);
+  assert.equal(r.rejected.length, 3);
+  assert.match(r.detail, /only 0 of 3 wallet\(s\) cleared the 0\.5 SOL floor/);
+});
+
+test('a dust wallet riding along does not sink a genuine bundle', () => {
+  // Dropping the member and re-checking the count, rather than failing the
+  // whole group, is the difference between filtering noise and discarding
+  // signal.
+  const r = evaluateBundleSpendFloor({
+    members: [member('W1', 0.8), member('W2', 0.6), member('W3', 0.9), member('DUST', 0.004)],
+    config: spendCfg(),
+  });
+  assert.equal(r.passed, true);
+  assert.equal(r.qualifying.length, 3, 'the dust wallet is dropped, not counted');
+  assert.equal(r.rejected[0].wallet, 'DUST');
+  assert.equal(Number(r.totalSol.toFixed(2)), 2.3, 'dust does not inflate the combined total');
+});
+
+test('dropping dust can take the group under the wallet count', () => {
+  const r = evaluateBundleSpendFloor({
+    members: [member('W1', 2.0), member('W2', 2.0), member('DUST', 0.01)],
+    config: spendCfg(),
+  });
+  assert.equal(r.passed, false, 'two real wallets is not a three-wallet bundle');
+  assert.equal(r.qualifying.length, 2);
+  assert.ok(r.totalSol >= 1.5, 'the combined floor was met — it was the count that failed');
+});
+
+test('at the shipped floors the combined total is REDUNDANT, and that is asserted', () => {
+  // 3 wallets x 0.50 SOL = 1.50 SOL exactly, so any group clearing the
+  // per-wallet floor with enough wallets clears the combined floor too. The
+  // 1.50 figure in the specification therefore constrains nothing on its own at
+  // these values — the per-wallet floor is doing all the work.
+  //
+  // Asserted rather than left implicit so that lowering minBundleWallets or
+  // minBundleWalletSol later, which WOULD make the combined floor bite, shows
+  // up as a deliberate change to a failing test.
+  const cfg = spendCfg();
+  assert.equal(
+    cfg.insiderCluster.minBundleWallets * cfg.insiderCluster.minBundleWalletSol,
+    cfg.insiderCluster.minBundleTotalSol,
+    'the combined floor is exactly the minimum the per-wallet floor already forces'
+  );
+
+  const minimal = evaluateBundleSpendFloor({
+    members: [member('W1', 0.5), member('W2', 0.5), member('W3', 0.5)],
+    config: cfg,
+  });
+  assert.equal(minimal.passed, true, 'exactly on both floors passes');
+  assert.equal(minimal.totalSol, 1.5);
+});
+
+test('the combined floor does bind once the config lets it', () => {
+  // Four wallets at 0.5 is 2.0 SOL — clears the per-wallet floor and the count,
+  // and still fails a 2.5 SOL combined requirement.
+  const r = evaluateBundleSpendFloor({
+    members: [member('W1', 0.5), member('W2', 0.5), member('W3', 0.5), member('W4', 0.5)],
+    config: spendCfg({ minBundleTotalSol: 2.5 }),
+    solUsd: 77,
+  });
+  assert.equal(r.qualifying.length, 4, 'every wallet cleared the per-wallet floor');
+  assert.equal(r.passed, false, 'and the group still fails on combined size');
+  assert.match(r.detail, /2\.00 SOL \(\$154\) combined — under the 2\.5 SOL floor/);
+});
+
+test('unattributable spend does not qualify — unknown is not a pass', () => {
+  // solSpent is null when a transaction had several buyers and the SOL cannot
+  // be split between them from balances alone. 9.7% of recorded buys.
+  const r = evaluateBundleSpendFloor({
+    members: [member('W1', null), member('W2', undefined), member('W3', 5.0)],
+    config: spendCfg(),
+  });
+  assert.equal(r.passed, false);
+  assert.equal(r.qualifying.length, 1);
+  assert.equal(r.rejected.filter((x) => x.reason === 'spend not attributable').length, 2);
+});
+
+test('the floors are configurable and default sanely with no config', () => {
+  const generous = evaluateBundleSpendFloor({
+    members: [member('W1', 0.1), member('W2', 0.1), member('W3', 0.1)],
+    config: spendCfg({ minBundleWalletSol: 0.05, minBundleTotalSol: 0.2 }),
+  });
+  assert.equal(generous.passed, true);
+
+  const bare = evaluateBundleSpendFloor({ members: [member('W1', 9), member('W2', 9), member('W3', 9)] });
+  assert.equal(bare.minWalletSol, 0.5, 'defaults to the shipped floors');
+  assert.equal(bare.minTotalSol, 1.5);
+  assert.equal(bare.passed, true);
+});
+
+test('the bundle TAG is blocked on a micro-buy group', async () => {
+  const dust = [
+    { wallet: 'W1', slot: 900, solSpent: 0.01, signature: 's1', secondsAfterLaunch: 3 },
+    { wallet: 'W2', slot: 900, solSpent: 0.02, signature: 's2', secondsAfterLaunch: 3 },
+    { wallet: 'W3', slot: 900, solSpent: 0.01, signature: 's3', secondsAfterLaunch: 3 },
+  ];
+  const blocked = await detectJitoBundles(dust, spendCfg().insiderCluster, { confirm: false });
+  assert.equal(blocked.detected, false, 'same slot, but no real money — no tag');
+  assert.equal(blocked.blockedByCabalSpendFloor, true);
+  assert.equal(blocked.sameSlotGroups, 1, 'the co-execution is reported, not silently dropped');
+  assert.match(blocked.detail, /Same-slot group rejected/);
+
+  // The identical timing with real size behind it is still a bundle.
+  const real = dust.map((d) => ({ ...d, solSpent: 0.9 }));
+  const tagged = await detectJitoBundles(real, spendCfg().insiderCluster, { confirm: false });
+  assert.equal(tagged.detected, true);
+  assert.equal(tagged.size, 3);
+  assert.equal(Number(tagged.spend.totalSol.toFixed(2)), 2.7);
+  assert.match(tagged.detail, /2\.70 SOL combined/);
+});
+
+test('blocking the tag also removes the +25 and the header it would have earned', async () => {
+  const dust = [
+    { wallet: 'W1', slot: 900, solSpent: 0.01, signature: 's1' },
+    { wallet: 'W2', slot: 900, solSpent: 0.01, signature: 's2' },
+    { wallet: 'W3', slot: 900, solSpent: 0.01, signature: 's3' },
+  ];
+  const jito = await detectJitoBundles(dust, spendCfg().insiderCluster, { confirm: false });
+
+  // No scoreBonus is emitted at all, so clusterScoreBonus has nothing to add.
+  assert.equal(jito.scoreBonus, undefined);
+
+  // And the alert header falls back rather than claiming a bundle.
+  const header = alertHeaderLines({ signalCategory: {}, clusters: { detected: true, insiderCount: 3, jito } });
+  assert.equal(header.some((l) => /CABAL BUNDLE DETECTED/.test(l)), false);
 });
 
 /* ------------------------------------------------------------------ *

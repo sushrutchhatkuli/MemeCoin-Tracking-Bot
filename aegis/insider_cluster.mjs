@@ -32,6 +32,11 @@
  *     alone is reported, not scored, unless it coincides with cluster timing.
  */
 
+// The cabal spend floor lives in audit.mjs with the other gates, so the bundle
+// TAG here and the insider tier gate there apply one definition rather than two
+// that can drift. audit.mjs imports nothing, so this cannot cycle.
+import { evaluateBundleSpendFloor } from './audit.mjs';
+
 const SIG_PAGE = 1000;
 
 async function rpc(url, method, params, timeoutMs = 20000) {
@@ -156,7 +161,7 @@ async function fetchBundleId(signature, timeoutMs = 8000) {
   }
 }
 
-export async function detectJitoBundles(annotated, cfg = {}, { confirm = true } = {}) {
+export async function detectJitoBundles(annotated, cfg = {}, { confirm = true, solUsd = null } = {}) {
   const minWallets = cfg.minBundleWallets ?? 3;
   const launchWindowSec = cfg.bundleLaunchWindowSeconds ?? null;
 
@@ -180,7 +185,7 @@ export async function detectJitoBundles(annotated, cfg = {}, { confirm = true } 
   // De-duplicate by wallet inside a slot: one wallet with two legs in the same
   // slot is one participant, not two, and counting legs would manufacture a
   // three-wallet "cabal" out of a single busy trader.
-  const groups = [...bySlot.entries()]
+  const sameSlot = [...bySlot.entries()]
     .map(([slot, members]) => {
       const unique = [...new Map(members.map((m) => [m.wallet, m])).values()];
       return { slot, members: unique, size: unique.length };
@@ -188,7 +193,39 @@ export async function detectJitoBundles(annotated, cfg = {}, { confirm = true } 
     .filter((g) => g.size >= minWallets)
     .sort((a, b) => b.size - a.size || a.slot - b.slot);
 
-  if (!groups.length) return { detected: false, groups: [] };
+  if (!sameSlot.length) return { detected: false, groups: [] };
+
+  // ---- Micro-bundle blocking ---------------------------------------
+  //
+  // Timing alone is not a cabal. Three wallets spending 0.01 SOL each inside
+  // one slot satisfies every structural test above and represents nothing —
+  // and manufacturing exactly that is the cheapest way to buy a bundle tag,
+  // which leads the alert header and carries +25. Groups are re-formed from
+  // only the members that cleared the per-wallet floor, so a genuine bundle
+  // with a dust wallet riding along survives; a bundle that IS dust does not.
+  const graded = sameSlot
+    .map((g) => {
+      const spend = evaluateBundleSpendFloor({ members: g.members, config: { insiderCluster: cfg }, solUsd });
+      return { ...g, spend, members: spend.qualifying, size: spend.qualifying.length };
+    })
+    .sort((a, b) => b.size - a.size || a.slot - b.slot);
+
+  const groups = graded.filter((g) => g.spend.passed);
+
+  if (!groups.length) {
+    // Reported rather than silently dropped: "three wallets co-executed but the
+    // whole bundle was 0.04 SOL" is a fact worth having in the audit output,
+    // and it is not the same as "no same-slot activity at all".
+    const best = graded[0];
+    return {
+      detected: false,
+      groups: [],
+      blockedByCabalSpendFloor: true,
+      sameSlotGroups: sameSlot.length,
+      spend: best?.spend ?? null,
+      detail: best ? `Same-slot group rejected — ${best.spend.detail}` : null,
+    };
+  }
 
   // Best-effort Jito confirmation on the largest group only — one API call per
   // wallet, and the marginal value of confirming a second group is low.
@@ -211,6 +248,7 @@ export async function detectJitoBundles(annotated, cfg = {}, { confirm = true } 
   }
 
   const lead = groups[0];
+  const spendNote = `, ${lead.spend.totalSol.toFixed(2)} SOL${lead.spend.totalUsd ? ` ($${Math.round(lead.spend.totalUsd).toLocaleString('en-US')})` : ''} combined`;
   return {
     detected: true,
     confirmed,
@@ -218,11 +256,12 @@ export async function detectJitoBundles(annotated, cfg = {}, { confirm = true } 
     slot: lead.slot,
     size: lead.size,
     groups,
+    spend: lead.spend,
     scoreBonus: cfg.bundleScoreBonus ?? 25,
     label: confirmed ? 'JITO BUNDLE CONFIRMED' : 'SAME-SLOT CO-EXECUTION',
     detail: confirmed
-      ? `${lead.size} wallets in Jito bundle ${String(bundleId).slice(0, 12)}… (slot ${lead.slot})`
-      : `${lead.size} wallets executed in the same slot (${lead.slot}) — bundle id not confirmed`,
+      ? `${lead.size} wallets in Jito bundle ${String(bundleId).slice(0, 12)}… (slot ${lead.slot})${spendNote}`
+      : `${lead.size} wallets executed in the same slot (${lead.slot}) — bundle id not confirmed${spendNote}`,
   };
 }
 
@@ -289,6 +328,7 @@ export async function detectInsiderClusters({
   // to the cabals it exists to catch.
   const jito = await detectJitoBundles(annotated, cfg, {
     confirm: cfg.confirmViaJitoApi !== false,
+    solUsd,
   });
 
   // ---- PILLAR 2: non-routine sizing --------------------------------
