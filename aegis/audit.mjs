@@ -1446,6 +1446,7 @@ export function scoreToken({
   config,
   insiderBypass = null,
   jitoTip = null,
+  momentum = null,
 }) {
   // Demand — 30 pts
   const demandScore =
@@ -1617,6 +1618,16 @@ export function scoreToken({
   // as "good token", which is precisely backwards on an unaudited contract.
   const jitoTipBonus = gatesFullyPassed ? (jitoTip?.scoreBoost ?? 0) : 0;
 
+  // Viral momentum — 5-minute holder velocity or volume surge.
+  //
+  // Same affirmative-PASS bar, and it needs it: both inputs are the two metrics
+  // config.json's dynamicConcentration note names as "precisely what someone
+  // gaming a scanner would fake, because they are what scanners look at" —
+  // holders by dusting, 5-minute volume by wash trading. Rapid growth on a clean
+  // contract is a crowd arriving; the identical numbers on an unaudited one are
+  // the shape of a token being pumped into an exit.
+  const momentumBonus = gatesFullyPassed ? (momentum?.scoreBoost ?? 0) : 0;
+
   let score = Math.round(
     demandScore +
       depthScore +
@@ -1629,7 +1640,8 @@ export function scoreToken({
       clusterBonus +
       megaRunnerBonus +
       socialHypeBonus +
-      jitoTipBonus
+      jitoTipBonus +
+      momentumBonus
   );
   score -= catalysts.bearish.length * 4;
   score = clamp(score, 0, 100);
@@ -1790,6 +1802,7 @@ export function scoreToken({
       megaRunner: megaRunnerBonus,
       socialHype: socialHypeBonus,
       jitoTip: jitoTipBonus,
+      momentum: momentumBonus,
       bearishPenalty: catalysts.bearish.length * 4,
     },
   };

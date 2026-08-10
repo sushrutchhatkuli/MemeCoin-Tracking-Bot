@@ -34,6 +34,7 @@ import {
   tractionFrom,
 } from './audit.mjs';
 import { traceBundleTips } from './bundle_tracer.mjs';
+import { traceMomentum } from './momentum_tracer.mjs';
 import { renderNote, noteFilename } from './note.mjs';
 import { loadState, saveState, computeVelocity, recordSnapshot } from './state.mjs';
 import {
@@ -297,7 +298,23 @@ async function analyzeToken({
     deployer: security?.ok ? security.creator : null,
   };
   const velocity = computeVelocity(state, key, observation);
+
+  // Momentum reads the PRIOR entry, so it must be computed before
+  // recordSnapshot overwrites it — afterwards the history's newest entry is
+  // this very observation, and the token would report zero growth forever.
+  const momentum = traceMomentum({
+    demand,
+    snapshot: state[key] ?? null,
+    security,
+    config,
+    now: now.getTime(),
+  });
+
   recordSnapshot(state, key, observation);
+
+  if (momentum?.qualifies) {
+    console.log(`   ${momentum.label}`);
+  }
 
   const social = analyzeSocials(pair, config);
 
@@ -562,6 +579,7 @@ async function analyzeToken({
     config,
     insiderBypass,
     jitoTip,
+    momentum,
   });
 
   if (verdictInfo.insiderBypass?.applied) {
@@ -589,6 +607,7 @@ async function analyzeToken({
     cto,
     megaRunner,
     jitoTip,
+    momentum,
     news,
     social: socialHype,
   };

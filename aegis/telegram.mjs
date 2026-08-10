@@ -457,7 +457,7 @@ function renderWhales(smartMoney) {
  * the tier header does not carry. At a single wallet it would just restate the
  * header, and the full roster appears in the cluster block below regardless.
  */
-export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip }) {
+export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip, momentum }) {
   const count = clusters?.insiderCount ?? 0;
   const tierHeader = signalCategory?.alertHeader ?? null;
 
@@ -471,8 +471,13 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
   // token is moving right now. The tier header stays below it rather than being
   // replaced — band and holding style are still what decide how to hold the
   // trade, and losing that would make the alert less actionable, not more.
-  const viral =
-    megaRunner?.detected && megaRunnerHeader ? [`<b>${esc(megaRunnerHeader)}</b>`] : [];
+  const viral = [
+    // Momentum leads the viral banner: it is the more specific of the two and
+    // it is the one with a number in it. The mega-runner header is a fixed
+    // string, this states what actually changed in the last five minutes.
+    ...(momentum?.qualifies && momentum.label ? [`<b>${esc(momentum.label)}</b>`] : []),
+    ...(megaRunner?.detected && megaRunnerHeader ? [`<b>${esc(megaRunnerHeader)}</b>`] : []),
+  ];
 
   // A slot-level bundle leads everything: it is the most specific structural
   // claim available about HOW the buys happened, and it is the one an operator
@@ -634,6 +639,31 @@ function renderNewsAndSocial(news, social) {
 }
 
 /**
+ * Viral momentum detail — the measured figures behind the banner.
+ *
+ * When the holder window was not really five minutes, the block says so in
+ * plain terms rather than leaving the reader to infer it from a decimal. That
+ * is the number someone uses to decide whether to chase a breakout, and the
+ * pipeline samples holders every ~10 minutes, not every five.
+ */
+function renderMomentum(momentum) {
+  if (!momentum?.qualifies) return [];
+
+  const lines = ['', `<b>${esc(momentum.label)}</b>`];
+  for (const r of momentum.reasons ?? []) lines.push(`• ${esc(r)} `);
+
+  if (momentum.holderWindowNormalised) {
+    lines.push(
+      `<i>The holder figure is measured over ${momentum.holders.windowMinutes.toFixed(1)} minutes and expressed as a 5-minute rate. Holder counts come from the audit, which runs at most every ${Math.round((momentum.holders.windowMinutes || 10))}-ish minutes per token, so a literal 5-minute count is not something this pipeline can read.</i>`
+    );
+  }
+  lines.push(
+    '<i>Both inputs are cheap to fake — holders by dusting wallets, 5-minute volume by wash trading between wallets one person controls. They are exactly what a scanner looks at, which is exactly why they get manufactured. This adds score only on an affirmatively PASSED contract audit.</i>'
+  );
+  return lines;
+}
+
+/**
  * Jito tip detail — what was paid, over how many transactions, and what it does
  * and does not mean.
  *
@@ -678,7 +708,7 @@ function renderMegaRunner(megaRunner) {
   ];
 }
 
-export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader, news, social, sizerConfig, jitoTip }) {
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader, news, social, sizerConfig, jitoTip, momentum }) {
   // Read off the verdict rather than re-derived: this is a rendering decision,
   // and the scorer is the only thing entitled to decide a gate was overridden.
   const insiderBypass = verdictInfo?.insiderBypass?.applied === true ? verdictInfo.insiderBypass : null;
@@ -721,7 +751,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     : [];
 
   return [
-    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip }),
+    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip, momentum }),
     `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
     `<i>Score ${verdictInfo.score}/100</i>${clusters?.label ? ` | <b>${esc(clusters.label)}</b>` : ''}`,
     // Placed above the advice: if the buy button is locked, the trading advice
@@ -732,6 +762,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     ...(signalCategory?.advice ? ['', `<b>${esc(signalCategory.advice)}</b>`] : []),
     ...sizeLines,
     ...renderNewsAndSocial(news, social),
+    ...renderMomentum(momentum),
     ...renderJitoTip(jitoTip),
     ...renderMegaRunner(megaRunner),
     ...renderCto(cto),
@@ -1552,6 +1583,7 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     social: result.social,
     sizerConfig: config,
     jitoTip: result.jitoTip,
+    momentum: result.momentum,
   });
 
   const sent = await sendTelegram({ ...credentials, text });

@@ -40,6 +40,12 @@ import {
 import { alertHeaderLines, buildMessage, maybeAlert, parseCommand, handleCommand } from '../telegram.mjs';
 import { buildDeps, toPlainText } from '../bot.mjs';
 import {
+  volumeVelocity,
+  holderVelocity,
+  formatMomentumLine,
+  traceMomentum,
+} from '../momentum_tracer.mjs';
+import {
   JITO_TIP_ACCOUNTS,
   accountKeysInBalanceOrder,
   extractJitoTip,
@@ -2164,6 +2170,291 @@ test('end to end: a single-buy token cannot reach EARLY-STAGE INSIDER SCALP', ()
     clusters: clusterOf({ count: 2, clusterSize: 2 }), audit: PASSED,
   });
   assert.equal(allowed.category, SIGNAL_CATEGORY.INSIDER_EARLY);
+});
+
+/* ------------------------------------------------------------------ *
+ * 5-minute holder velocity & volume surge
+ *
+ * The load-bearing test in this block is the one asserting that a 10-minute
+ * window is LABELLED as ten minutes. The pipeline samples holders every ~10
+ * minutes (auditCooldownMinutes), so "in 5m" is a claim it usually cannot make,
+ * and the number is exactly what a reader uses to decide whether to chase.
+ * ------------------------------------------------------------------ */
+
+const momCfg = (over = {}) => ({
+  momentum: {
+    enabled: true,
+    minHolderDelta5m: 30,
+    minVolumeSurgePct: 200,
+    minVolume5mUsd: 2000,
+    scoreBoost: 10,
+    holderWindowSeconds: 300,
+    minBaselineAgeSeconds: 60,
+    maxBaselineAgeSeconds: 900,
+    exactWindowToleranceSeconds: 60,
+    ...over,
+  },
+});
+
+const minsAgo = (n, now = Date.now()) => now - n * 60_000;
+
+test('the volume baseline excludes the current block from its own average', () => {
+  // h1 = 60k of which the last 5m is 50k. Against the eleven PRECEDING blocks
+  // ((60k-50k)/11 = 909) that is a 55x spike. Against h1/12 = 5k it would read
+  // as 10x — the naive baseline damps the exact spike this exists to catch.
+  const r = volumeVelocity({
+    demand: { volume: { m5: 50_000, h1: 60_000 } },
+    config: momCfg(),
+  });
+  assert.equal(r.ok, true);
+  assert.equal(Math.round(r.baseline5m), 909);
+  assert.ok(r.surgePct > 5000, `expected a large surge, got ${r.surgePct}`);
+  assert.equal(r.qualifies, true);
+});
+
+test('a steady token does not read as a surge', () => {
+  // Same volume every block: m5 is exactly the prior pace.
+  const r = volumeVelocity({ demand: { volume: { m5: 5_000, h1: 60_000 } }, config: momCfg() });
+  assert.equal(Math.round(r.surgePct), 0);
+  assert.equal(r.qualifies, false);
+});
+
+test('200% means 3x the prior pace, and just under it does not qualify', () => {
+  const at = (m5, h1) => volumeVelocity({ demand: { volume: { m5, h1 } }, config: momCfg() });
+  // baseline 1000/block; 3000 in the current block is exactly +200%.
+  assert.equal(Math.round(at(3_000, 14_000).surgePct), 200);
+  assert.equal(at(3_000, 14_000).qualifies, true);
+  assert.equal(at(2_900, 13_900).qualifies, false);
+});
+
+test('a dead pool cannot produce a surge, however large the ratio', () => {
+  // $12 in the prior hour and $200 now is a 1,733% increase and still nothing.
+  const r = volumeVelocity({ demand: { volume: { m5: 200, h1: 332 } }, config: momCfg() });
+  assert.ok(r.surgePct > 1000);
+  assert.equal(r.qualifies, false, 'blocked by the absolute floor');
+  assert.equal(r.belowAbsoluteFloor, true);
+
+  // No volume at all in the preceding hour is undefined, not infinite.
+  const none = volumeVelocity({ demand: { volume: { m5: 9_000, h1: 9_000 } }, config: momCfg() });
+  assert.equal(none.ok, false);
+  assert.equal(none.qualifies, false);
+  assert.match(none.reason, /undefined, not infinite/);
+});
+
+test('missing volume data is not a zero surge', () => {
+  assert.equal(volumeVelocity({ demand: {}, config: momCfg() }).ok, false);
+  assert.equal(volumeVelocity({ demand: { volume: { m5: 100 } }, config: momCfg() }).ok, false);
+});
+
+test('a real 5-minute holder window is labelled "in 5m"', () => {
+  const now = Date.now();
+  const r = holderVelocity({
+    history: [{ t: minsAgo(5, now), holders: 400 }],
+    currentHolders: 447,
+    now,
+    config: momCfg(),
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.delta, 47);
+  assert.equal(r.exact, true);
+  assert.equal(r.qualifies, true);
+  assert.equal(formatMomentumLine({ holders: r }), 'VIRAL MOMENTUM: +47 new holders in 5m');
+});
+
+test('a 10-minute window is normalised AND labelled as ten minutes', () => {
+  // The pipeline's actual cadence. Claiming "+94 in 5m" here would be false by
+  // a factor of two in the direction that makes a token look hotter.
+  const now = Date.now();
+  const r = holderVelocity({
+    history: [{ t: minsAgo(10, now), holders: 400 }],
+    currentHolders: 494,
+    now,
+    config: momCfg(),
+  });
+  assert.equal(r.delta, 94);
+  assert.equal(r.exact, false);
+  assert.equal(Math.round(r.perFiveMin), 47);
+  assert.equal(r.qualifies, true);
+
+  const line = formatMomentumLine({ holders: r });
+  assert.equal(line, 'VIRAL MOMENTUM: +94 new holders in 10.0m (~47/5m)');
+  assert.doesNotMatch(line, /\bin 5m\b/, 'must never claim a window it did not measure');
+});
+
+test('the baseline closest to five minutes wins, not the newest', () => {
+  // A 40-second-old sample multiplied up to a 5-minute rate turns 4 arrivals
+  // into "+30/5m" — noise created by the normalisation itself.
+  const now = Date.now();
+  const r = holderVelocity({
+    history: [
+      { t: minsAgo(22, now), holders: 100 },
+      { t: minsAgo(6, now), holders: 300 },
+      { t: minsAgo(0.7, now), holders: 396 },
+    ],
+    currentHolders: 400,
+    now,
+    config: momCfg(),
+  });
+  assert.equal(r.baselineHolders, 300, 'the 6-minute sample, not the 40-second one');
+  assert.equal(r.delta, 100);
+});
+
+test('an out-of-range baseline is unusable rather than stretched', () => {
+  const now = Date.now();
+  const tooOld = holderVelocity({
+    history: [{ t: minsAgo(40, now), holders: 100 }],
+    currentHolders: 900,
+    now,
+    config: momCfg(),
+  });
+  assert.equal(tooOld.ok, false, 'a 40-minute window is not momentum right now');
+  assert.equal(tooOld.qualifies, false);
+
+  const tooNew = holderVelocity({
+    history: [{ t: minsAgo(0.5, now), holders: 100 }],
+    currentHolders: 140,
+    now,
+    config: momCfg(),
+  });
+  assert.equal(tooNew.ok, false, 'a 30-second delta is noise, not a 5-minute rate');
+});
+
+test('unknown holders and an empty history do not read as zero growth', () => {
+  const now = Date.now();
+  assert.equal(holderVelocity({ history: [], currentHolders: 500, now, config: momCfg() }).ok, false);
+  assert.equal(
+    holderVelocity({ history: [{ t: minsAgo(5, now), holders: 100 }], currentHolders: null, now, config: momCfg() }).ok,
+    false
+  );
+  // A history entry with no holder count is skipped, not counted as 0.
+  const r = holderVelocity({
+    history: [{ t: minsAgo(5, now), holders: null }],
+    currentHolders: 500,
+    now,
+    config: momCfg(),
+  });
+  assert.equal(r.ok, false);
+});
+
+test('holders falling is reported as a negative rate, never as momentum', () => {
+  const now = Date.now();
+  const r = holderVelocity({
+    history: [{ t: minsAgo(5, now), holders: 900 }],
+    currentHolders: 700,
+    now,
+    config: momCfg(),
+  });
+  assert.equal(r.delta, -200);
+  assert.equal(r.qualifies, false);
+});
+
+test('either trigger alone is enough, and neither means no bonus', () => {
+  const now = Date.now();
+  const base = {
+    security: { ok: true, totalHolders: 500 },
+    config: momCfg(),
+    now,
+  };
+  const quietVolume = { volume: { m5: 5_000, h1: 60_000 } };
+  const hotVolume = { volume: { m5: 50_000, h1: 60_000 } };
+  const flatHistory = { history: [{ t: minsAgo(5, now), holders: 499 }] };
+  const growingHistory = { history: [{ t: minsAgo(5, now), holders: 400 }] };
+
+  const holdersOnly = traceMomentum({ ...base, demand: quietVolume, snapshot: growingHistory });
+  assert.equal(holdersOnly.qualifies, true);
+  assert.equal(holdersOnly.scoreBoost, 10);
+  assert.match(holdersOnly.label, /\+100 new holders in 5m/);
+
+  const volumeOnly = traceMomentum({ ...base, demand: hotVolume, snapshot: flatHistory });
+  assert.equal(volumeOnly.qualifies, true);
+  assert.match(volumeOnly.label, /volume \+\d+% vs the prior hour's pace/);
+
+  const both = traceMomentum({ ...base, demand: hotVolume, snapshot: growingHistory });
+  assert.match(both.label, /new holders.*\|.*volume/);
+  assert.equal(both.scoreBoost, 10, 'both triggers is still one bonus, not two');
+
+  const neither = traceMomentum({ ...base, demand: quietVolume, snapshot: flatHistory });
+  assert.equal(neither.qualifies, false);
+  assert.equal(neither.scoreBoost, 0);
+  assert.equal(neither.label, null);
+});
+
+test('a disabled tracker reports nothing rather than a quiet token', () => {
+  const r = traceMomentum({
+    demand: { volume: { m5: 50_000, h1: 60_000 } },
+    snapshot: { history: [{ t: minsAgo(5), holders: 1 }] },
+    security: { ok: true, totalHolders: 9999 },
+    config: { momentum: { enabled: false } },
+  });
+  assert.equal(r.qualifies, false);
+  assert.equal(r.scoreBoost, 0);
+  assert.match(r.skipped, /disabled/);
+});
+
+test('viral momentum is forfeited unless the audit affirmatively PASSED', () => {
+  // Holder counts are inflated by dusting and 5m volume by wash trading. Both
+  // are what a scanner looks at, which is why both get manufactured.
+  const base = {
+    security: { ok: true, totalHolders: 5000, top10Pct: 10 },
+    demand: strongDemand,
+    velocity: null,
+    catalysts: { bullish: [], bearish: [] },
+    thresholds,
+    momentum: { scoreBoost: 10, qualifies: true },
+  };
+
+  assert.equal(scoreToken({ ...base, audit: PASSED }).breakdown.momentum, 10);
+  assert.equal(
+    scoreToken({ ...base, audit: { status: 'UNVERIFIED', checks: [], failures: [], unknowns: ['x'] } }).breakdown.momentum,
+    0
+  );
+  assert.equal(
+    scoreToken({ ...base, audit: { status: 'FAILED', checks: [], failures: ['Mint Authority: ACTIVE'], unknowns: [] } })
+      .breakdown.momentum,
+    0
+  );
+
+  const without = scoreToken({ ...base, audit: PASSED, momentum: null });
+  assert.equal(scoreToken({ ...base, audit: PASSED }).score - without.score, 10);
+});
+
+test('the momentum banner leads the alert and the body states the real window', () => {
+  const now = Date.now();
+  const momentum = traceMomentum({
+    demand: { volume: { m5: 400, h1: 60_000 } },
+    snapshot: { history: [{ t: minsAgo(10, now), holders: 400 }] },
+    security: { ok: true, totalHolders: 494 },
+    config: momCfg(),
+    now,
+  });
+  assert.equal(momentum.holderWindowNormalised, true);
+
+  const header = alertHeaderLines({
+    signalCategory: { alertHeader: 'EARLY INSIDER SCALP ALERT ($30k–$500k MC)' },
+    clusters: insiders(2),
+    momentum,
+  });
+  assert.ok(header.some((l) => /VIRAL MOMENTUM: \+94 new holders in 10\.0m/.test(l)));
+  assert.ok(
+    header.findIndex((l) => /VIRAL MOMENTUM/.test(l)) <
+      header.findIndex((l) => /EARLY INSIDER SCALP ALERT/.test(l)),
+    'the momentum banner sits above the tier header'
+  );
+
+  const body = buildMessage({
+    pair: { chainId: 'solana', baseToken: { symbol: 'MOM', address: MINT } },
+    demand: { ...strongDemand, liqToMcapPct: 40 },
+    verdictInfo: { score: 84, securityStatus: 'PASSED', holderGate: { floor: 150 } },
+    smartMoney: null, deployer: null, security: cleanSecurity(),
+    tradeLink: { template: 'https://x.test/{chain}/{address}', label: 'Trade' },
+    reaudit: { ran: false }, signalCategory: {}, clusters: scoredInsiders(10),
+    thresholds, sizerConfig: {}, momentum,
+  });
+
+  assert.match(body, /VIRAL MOMENTUM: \+94 new holders in 10\.0m \(~47\/5m\)/);
+  assert.match(body, /400 -&gt; 494 holders over 10\.0m/);
+  assert.match(body, /a literal 5-minute count is not something this pipeline can read/);
+  assert.match(body, /holders by dusting wallets, 5-minute volume by wash trading/);
 });
 
 /* ------------------------------------------------------------------ *
