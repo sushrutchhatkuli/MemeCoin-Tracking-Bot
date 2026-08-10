@@ -1535,6 +1535,7 @@ export function scoreToken({
   insiderBypass = null,
   jitoTip = null,
   momentum = null,
+  narrative = null,
 }) {
   // Demand — 30 pts
   const demandScore =
@@ -1716,6 +1717,15 @@ export function scoreToken({
   // the shape of a token being pumped into an exit.
   const momentumBonus = gatesFullyPassed ? (momentum?.scoreBoost ?? 0) : 0;
 
+  // AI narrative. Same affirmative-PASS bar, and of every bonus here this is the
+  // one least entitled to bypass it: the input is a NAME, chosen by the token's
+  // creator, and a rug and a legitimate launch can carry byte-identical
+  // metadata because the metadata is typed into a form. Every other signal costs
+  // something to fake — wash trades, dusted wallets, real SOL in tips. This one
+  // costs a good idea for a name. It measures how well a token would spread,
+  // which is orthogonal to whether it will take your money.
+  const narrativeBonus = gatesFullyPassed ? (narrative?.scoreBoost ?? 0) : 0;
+
   let score = Math.round(
     demandScore +
       depthScore +
@@ -1729,7 +1739,8 @@ export function scoreToken({
       megaRunnerBonus +
       socialHypeBonus +
       jitoTipBonus +
-      momentumBonus
+      momentumBonus +
+      narrativeBonus
   );
   score -= catalysts.bearish.length * 4;
   score = clamp(score, 0, 100);
@@ -1891,6 +1902,7 @@ export function scoreToken({
       socialHype: socialHypeBonus,
       jitoTip: jitoTipBonus,
       momentum: momentumBonus,
+      narrative: narrativeBonus,
       bearishPenalty: catalysts.bearish.length * 4,
     },
   };

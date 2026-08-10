@@ -35,6 +35,11 @@ import {
 } from './audit.mjs';
 import { traceBundleTips } from './bundle_tracer.mjs';
 import { traceMomentum } from './momentum_tracer.mjs';
+import {
+  loadNarrativeCache,
+  saveNarrativeCache,
+  scoreNarrative,
+} from './ai_narrative_scorer.mjs';
 import { renderNote, noteFilename } from './note.mjs';
 import { loadState, saveState, computeVelocity, recordSnapshot } from './state.mjs';
 import {
@@ -273,6 +278,8 @@ async function analyzeToken({
   screenCache,
   newsWindow,
   trending,
+  narrativeCache,
+  geminiKey,
   now,
 }) {
   const address = pair.baseToken.address;
@@ -511,6 +518,33 @@ async function analyzeToken({
   // this used to sit further up.
   const signalCategory = classifySignal({ demand, security, config, clusters, audit, cto, insiderBypass });
 
+  // --- AI narrative -------------------------------------------------
+  //
+  // Gated on the audit having PASSED, and that is a COST decision as much as a
+  // correctness one. scoreToken forfeits the bonus on any gate failure, so a
+  // call for a token that already failed buys a number nothing can use — and
+  // most scanned tokens fail. Skipping them is the difference between paying
+  // for the few tokens that could be alerted and paying for every candidate.
+  //
+  // A cached mint costs nothing and is served regardless of audit status, since
+  // there is no call to save.
+  const narrative =
+    audit.status === 'PASSED' || narrativeCache?.[address]
+      ? await scoreNarrative({
+          pair,
+          config,
+          apiKey: geminiKey,
+          cache: narrativeCache ?? {},
+          now: now.getTime(),
+        })
+      : null;
+
+  if (narrative?.scored && narrative.qualifies) {
+    console.log(`   ${narrative.label}${narrative.cached ? ' [cached]' : ''}`);
+  } else if (narrative?.retired) {
+    console.error(`   [WARN] ${narrative.reason}`);
+  }
+
   // Network discovery reuses the funder cache the cluster pass just warmed, so
   // it costs little extra. Gated on a cluster having fired: expanding the net
   // from tokens with no signal is how a watchlist fills with noise.
@@ -580,6 +614,7 @@ async function analyzeToken({
     insiderBypass,
     jitoTip,
     momentum,
+    narrative,
   });
 
   if (verdictInfo.insiderBypass?.applied) {
@@ -608,6 +643,7 @@ async function analyzeToken({
     megaRunner,
     jitoTip,
     momentum,
+    narrative,
     news,
     social: socialHype,
   };
@@ -716,6 +752,12 @@ export async function runScan(args = {}) {
   const cooldownPath = join(HERE, ...COOLDOWN_PATH);
   const cooldownMs = (config.auditCooldownMinutes ?? 10) * 60_000;
   const seenAuditTokens = await loadCooldown(cooldownPath, cooldownMs, now.getTime());
+
+  // Narrative cache. Loaded once per scan and written once at the end, so a
+  // token graded on any previous pass costs nothing forever after — a name does
+  // not change, which is what makes the repeated cost genuinely zero.
+  const narrativeCache = await loadNarrativeCache();
+  const narrativeCachedBefore = Object.keys(narrativeCache).length;
 
   // Market-wide context, fetched ONCE per scan. Both are free-tier APIs with
   // real rate limits, and neither varies per token — pulling them inside the
@@ -934,6 +976,8 @@ export async function runScan(args = {}) {
         screenCache,
         newsWindow,
         trending,
+        narrativeCache,
+        geminiKey: credentials.geminiKey,
         now,
       });
       return { pair, result, error: null };
@@ -1086,6 +1130,9 @@ export async function runScan(args = {}) {
   // Pruned on write as well as on read, so the file cannot grow without bound
   // if the process is killed before its next load.
   await saveCooldown(cooldownPath, pruneCooldown(seenAuditTokens, cooldownMs, now.getTime()));
+  if (Object.keys(narrativeCache).length !== narrativeCachedBefore) {
+    await saveNarrativeCache(narrativeCache);
+  }
   pruneObservations(observations, now.getTime());
   await saveObservations(observationsPath, observations);
   await savePositions(positions);

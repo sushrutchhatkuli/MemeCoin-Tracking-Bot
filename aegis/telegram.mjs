@@ -72,6 +72,9 @@ export async function loadEnv(path) {
     cryptoPanicToken: pick('CRYPTOPANIC_TOKEN'),
     coingeckoKey: pick('COINGECKO_API_KEY'),
     twitterBearer: pick('TWITTER_BEARER_TOKEN'),
+    // Optional. Without it ai_narrative_scorer stays inert and the narrative
+    // bonus is simply never awarded — never a penalty.
+    geminiKey: pick('GEMINI_API_KEY'),
   };
 }
 
@@ -457,7 +460,7 @@ function renderWhales(smartMoney) {
  * the tier header does not carry. At a single wallet it would just restate the
  * header, and the full roster appears in the cluster block below regardless.
  */
-export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip, momentum }) {
+export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip, momentum, narrative }) {
   const count = clusters?.insiderCount ?? 0;
   const tierHeader = signalCategory?.alertHeader ?? null;
 
@@ -507,8 +510,12 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
     ? [`<b>${esc(`SOCIAL HYPE SPIKE (${social.matchType === 'contract' ? 'trending, contract verified' : social.matchType === 'symbol' ? 'ticker match only — unverified' : 'mention velocity'})`)} </b>`]
     : [];
 
+  // Only S-Tier reaches the header. A mid narrative score is context for the
+  // body, not a banner — headers are for the facts that change a decision.
+  const narrativeBanner = narrative?.qualifies ? [`<b>${esc(narrative.label)}</b>`] : [];
+
   if (tierHeader) {
-    const lines = [...bypassBanner, ...newsBanner, ...bundle, ...viral, ...socialBanner, `<b>${esc(tierHeader)}</b>`];
+    const lines = [...bypassBanner, ...newsBanner, ...bundle, ...viral, ...socialBanner, ...narrativeBanner, `<b>${esc(tierHeader)}</b>`];
     if (count >= 4) lines.push(`<b>CABAL SWARM — ${count} unique insider wallets</b>`);
     else if (count >= 2) lines.push(`<b>MULTI-INSIDER — ${count} unique wallets</b>`);
     return lines;
@@ -522,6 +529,7 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
     ...bundle,
     ...viral,
     ...socialBanner,
+    ...narrativeBanner,
     count >= 4
       ? '<b>CABAL SWARM BUY ALERT</b> '
       : count >= 2
@@ -639,6 +647,32 @@ function renderNewsAndSocial(news, social) {
 }
 
 /**
+ * AI narrative detail.
+ *
+ * Rendered for ANY score, not only S-Tier, because "the AI looked at this and
+ * called it a 30" is more useful than silence — silence is indistinguishable
+ * from the scorer being switched off or the API being down.
+ *
+ * The caveat is mandatory. This grades a name. It has no view of the contract,
+ * and it is scoring the one input the token's creator controls completely.
+ */
+function renderNarrative(narrative) {
+  if (!narrative?.scored) return [];
+
+  const lines = ['', `<b>${esc(narrative.label)}</b>`];
+  if (narrative.aiReason) lines.push(`• Model's note: <i>${esc(narrative.aiReason)}</i>`);
+  lines.push(
+    narrative.qualifies
+      ? `• Narrative bonus: <b>+${narrative.scoreBoost}</b> (${narrative.minScore}+ scores S-Tier)`
+      : `• Under the ${narrative.minScore} S-Tier floor — no narrative points awarded`
+  );
+  lines.push(
+    '<i>This grades the NAME, not the token. It is the only signal here the creator chooses outright — a rug and a real launch can carry identical branding, because branding is typed into a form. A strong meme on a fraudulent contract still scores high, by design. It adds score only on an affirmatively PASSED audit.</i>'
+  );
+  return lines;
+}
+
+/**
  * Viral momentum detail — the measured figures behind the banner.
  *
  * When the holder window was not really five minutes, the block says so in
@@ -708,7 +742,7 @@ function renderMegaRunner(megaRunner) {
   ];
 }
 
-export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader, news, social, sizerConfig, jitoTip, momentum }) {
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader, news, social, sizerConfig, jitoTip, momentum, narrative }) {
   // Read off the verdict rather than re-derived: this is a rendering decision,
   // and the scorer is the only thing entitled to decide a gate was overridden.
   const insiderBypass = verdictInfo?.insiderBypass?.applied === true ? verdictInfo.insiderBypass : null;
@@ -751,7 +785,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     : [];
 
   return [
-    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip, momentum }),
+    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip, momentum, narrative }),
     `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
     `<i>Score ${verdictInfo.score}/100</i>${clusters?.label ? ` | <b>${esc(clusters.label)}</b>` : ''}`,
     // Placed above the advice: if the buy button is locked, the trading advice
@@ -763,6 +797,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     ...sizeLines,
     ...renderNewsAndSocial(news, social),
     ...renderMomentum(momentum),
+    ...renderNarrative(narrative),
     ...renderJitoTip(jitoTip),
     ...renderMegaRunner(megaRunner),
     ...renderCto(cto),
@@ -1584,6 +1619,7 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     sizerConfig: config,
     jitoTip: result.jitoTip,
     momentum: result.momentum,
+    narrative: result.narrative,
   });
 
   const sent = await sendTelegram({ ...credentials, text });
