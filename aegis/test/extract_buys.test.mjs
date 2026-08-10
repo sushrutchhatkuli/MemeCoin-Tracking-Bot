@@ -17,6 +17,8 @@ import {
   priceEntry,
   validateWatchlistEntry,
   formatSmartMoneyLine,
+  buildCandidatePool,
+  matchCandidateSwarm,
 } from '../smart_money.mjs';
 import {
   scoreToken,
@@ -28,6 +30,7 @@ import {
   evaluateSecurityShield,
   evaluateCommunityTakeover,
   evaluateBundleSpendFloor,
+  evaluateCandidateSwarm,
   resolveInsiderBypass,
   auditFailuresAreBypassable,
   applyCtoOverride,
@@ -2264,6 +2267,202 @@ test('end to end: a single-buy token cannot reach EARLY-STAGE INSIDER SCALP', ()
     clusters: clusterOf({ count: 2, clusterSize: 2 }), audit: PASSED,
   });
   assert.equal(allowed.category, SIGNAL_CATEGORY.INSIDER_EARLY);
+});
+
+/* ------------------------------------------------------------------ *
+ * Gate 0 candidate swarm
+ *
+ * A notification filter, so the tests that matter are the ones asserting what
+ * it does NOT do: it must not touch the score, must not touch safety, and must
+ * not stop a below-threshold token being observed and recorded.
+ * ------------------------------------------------------------------ */
+
+const swarmCfg = (over = {}) => ({
+  candidateSwarm: { enabled: true, minGradedBuys: 3, minWallets: 5, requireEarly: false, earlyWindowSeconds: 300, ...over },
+});
+
+/** A ledger where wallet i has `graded` graded buys. */
+const ledger = (spec) => ({
+  wallets: Object.fromEntries(
+    Object.entries(spec).map(([addr, graded]) => [
+      addr,
+      { buys: Array.from({ length: graded }, (_, i) => ({ token: `t${i}`, outcome: i % 4 === 3 ? 'FAIL' : 'WIN', ts: 1 })) },
+    ])
+  ),
+});
+
+test('the candidate pool is every wallet with enough graded history', () => {
+  const pool = buildCandidatePool(
+    ledger({ A: 5, B: 3, C: 2, D: 0, E: 9 }),
+    { minGradedBuys: 3 }
+  );
+  assert.equal(pool.size, 3, 'A, B and E qualify; C and D do not');
+  assert.ok(pool.index.has('A') && pool.index.has('B') && pool.index.has('E'));
+  assert.equal(pool.index.has('C'), false);
+  assert.equal(pool.index.get('A').gradedBuys, 5);
+  assert.equal(pool.index.get('A').wins, 4, 'one in four is a FAIL in the fixture');
+
+  // NEUTRAL and ungraded buys do not count toward the bar.
+  const neutral = buildCandidatePool(
+    { wallets: { X: { buys: [{ outcome: 'NEUTRAL' }, { outcome: null }, { outcome: 'WIN' }] } } },
+    { minGradedBuys: 3 }
+  );
+  assert.equal(neutral.size, 0, 'only one buy is actually graded');
+});
+
+test('five distinct candidates on one token is a swarm; four is not', () => {
+  const pool = buildCandidatePool(ledger({ W1: 3, W2: 3, W3: 3, W4: 3, W5: 3, W6: 3 }), { minGradedBuys: 3 });
+  const buyers = (n) => Array.from({ length: n }, (_, i) => ({ wallet: `W${i + 1}`, solSpent: 1, blockTime: 1000 }));
+
+  const five = matchCandidateSwarm({ buyers: buyers(5), pool, config: swarmCfg() });
+  assert.equal(five.count, 5);
+  assert.equal(five.qualifies, true);
+  assert.match(five.label, /MASSIVE 5\+ CABAL SWARM DETECTED \(5 Candidate Whales Bought Same Token!\)/);
+
+  const four = matchCandidateSwarm({ buyers: buyers(4), pool, config: swarmCfg() });
+  assert.equal(four.qualifies, false);
+  assert.equal(four.detected, true, 'still detected — just under the floor');
+  assert.equal(four.label, null);
+});
+
+test('the same wallet buying repeatedly is one candidate, not five', () => {
+  // The whole claim is DISTINCT wallets converging. Counting legs would let one
+  // busy wallet manufacture a swarm on its own.
+  const pool = buildCandidatePool(ledger({ W1: 4 }), { minGradedBuys: 3 });
+  const r = matchCandidateSwarm({
+    buyers: Array.from({ length: 9 }, () => ({ wallet: 'W1', solSpent: 1, blockTime: 1 })),
+    pool,
+    config: swarmCfg(),
+  });
+  assert.equal(r.count, 1);
+  assert.equal(r.qualifies, false);
+});
+
+test('non-candidate buyers are ignored however many there are', () => {
+  const pool = buildCandidatePool(ledger({ W1: 3, W2: 3 }), { minGradedBuys: 3 });
+  const buyers = [
+    ...Array.from({ length: 40 }, (_, i) => ({ wallet: `RANDOM${i}`, solSpent: 5 })),
+    { wallet: 'W1' },
+    { wallet: 'W2' },
+  ];
+  const r = matchCandidateSwarm({ buyers, pool, config: swarmCfg() });
+  assert.equal(r.count, 2, 'only pool members count');
+  assert.equal(r.qualifies, false);
+});
+
+test('requireEarly counts only wallets provably inside the launch window', () => {
+  const pool = buildCandidatePool(
+    ledger({ W1: 3, W2: 3, W3: 3, W4: 3, W5: 3, W6: 3 }), { minGradedBuys: 3 }
+  );
+  const launch = 1_000_000_000_000;
+  const at = (w, sec) => ({ wallet: w, solSpent: 1, blockTime: (launch + sec * 1000) / 1000 });
+  const buyers = [at('W1', 10), at('W2', 20), at('W3', 30), at('W4', 9000), at('W5', 9000)];
+
+  const loose = matchCandidateSwarm({ buyers, pool, config: swarmCfg(), pairCreatedAt: launch });
+  assert.equal(loose.count, 5);
+  assert.equal(loose.earlyCount, 3);
+  assert.equal(loose.qualifies, true, 'total count clears it when requireEarly is off');
+
+  const strict = matchCandidateSwarm({
+    buyers, pool, config: swarmCfg({ requireEarly: true }), pairCreatedAt: launch,
+  });
+  assert.equal(strict.effectiveCount, 3);
+  assert.equal(strict.qualifies, false, 'only 3 were early');
+
+  // Unknown launch time is never counted as early — pairCreatedAt is available
+  // on 96.7% of pairs, so requiring it costs little and assuming costs a lot.
+  const unknown = matchCandidateSwarm({
+    buyers, pool, config: swarmCfg({ requireEarly: true }), pairCreatedAt: null,
+  });
+  assert.equal(unknown.earlyCount, 0);
+  assert.equal(unknown.qualifies, false);
+});
+
+test('the swarm gate blocks dispatch and is off unless explicitly enabled', () => {
+  const swarm = { detected: true, count: 3, effectiveCount: 3, poolSize: 376 };
+
+  const enforced = evaluateCandidateSwarm({ swarm, config: swarmCfg() });
+  assert.equal(enforced.enforced, true);
+  assert.equal(enforced.passed, false);
+  assert.match(enforced.detail, /only 3 candidate wallet\(s\) — need 5/);
+
+  // A loosening this large must be opted into: absent config leaves it off, so
+  // an older config file keeps exactly its previous alert behaviour.
+  for (const cfg of [{}, { candidateSwarm: {} }, { candidateSwarm: { enabled: false } }]) {
+    const off = evaluateCandidateSwarm({ swarm, config: cfg });
+    assert.equal(off.enforced, false);
+    assert.equal(off.passed, true, JSON.stringify(cfg));
+  }
+
+  assert.equal(evaluateCandidateSwarm({ swarm: null, config: swarmCfg() }).passed, false);
+  assert.equal(
+    evaluateCandidateSwarm({ swarm: { detected: true, count: 7, effectiveCount: 7 }, config: swarmCfg() }).passed,
+    true
+  );
+});
+
+test('the swarm filter never touches the score or the safety verdict', () => {
+  // It is a notification policy. A token blocked from Telegram is still fully
+  // analysed, still scored, and its buys still enter the observation ledger —
+  // which is what makes tomorrow's candidate pool larger than today's.
+  const base = {
+    audit: PASSED,
+    security: { ok: true, totalHolders: 5000, top10Pct: 10 },
+    demand: strongDemand,
+    velocity: null,
+    catalysts: { bullish: [], bearish: [] },
+    thresholds,
+  };
+  const scored = scoreToken(base);
+  assert.ok(scored.score > 0);
+  // scoreToken takes no swarm argument at all — asserted so that adding one
+  // later is a deliberate decision rather than a drift into score inflation.
+  assert.equal('candidateSwarm' in scored.breakdown, false);
+  assert.equal(scoreToken({ ...base, candidateSwarm: { qualifies: false } }).score, scored.score);
+});
+
+test('a swarm leads the alert and prints every wallet with its denominator', () => {
+  const swarm = {
+    detected: true, qualifies: true, count: 6, earlyCount: 4, effectiveCount: 6,
+    minWallets: 5, poolSize: 376, earlyWindowSec: 300, requireEarly: false,
+    label: 'MASSIVE 5+ CABAL SWARM DETECTED (6 Candidate Whales Bought Same Token!)',
+    wallets: Array.from({ length: 6 }, (_, i) => ({
+      address: `Wallet${i}`, short: `Wal${i}…aaaa`, gradedBuys: 4, wins: 3, winRatePct: 75,
+      solSpent: 1.5, secondsAfterLaunch: i < 4 ? 20 : 4000,
+      solscan: `https://solscan.io/account/Wallet${i}`,
+    })),
+  };
+
+  const header = alertHeaderLines({
+    signalCategory: { alertHeader: 'EARLY INSIDER SCALP ALERT ($30k–$500k MC)' },
+    clusters: insiders(2),
+    candidateSwarm: swarm,
+  });
+  assert.match(header[0], /MASSIVE 5\+ CABAL SWARM DETECTED \(6 Candidate Whales Bought Same Token!\)/);
+
+  const body = buildMessage({
+    pair: { chainId: 'solana', baseToken: { symbol: 'SWARM', address: MINT } },
+    demand: { ...strongDemand, liqToMcapPct: 40 },
+    verdictInfo: { score: 84, securityStatus: 'PASSED', holderGate: { floor: 150 } },
+    smartMoney: null, deployer: null, security: cleanSecurity(),
+    tradeLink: { template: 'https://x.test/{chain}/{address}', label: 'Trade' },
+    reaudit: { ran: false }, signalCategory: {}, clusters: scoredInsiders(10),
+    thresholds, sizerConfig: {}, candidateSwarm: swarm,
+  });
+
+  assert.match(body, /CANDIDATE SWARM: 6 of 376 tracked candidate wallets/);
+  assert.match(body, /3\/4 graded \(75%\)/, 'every wallet carries its denominator');
+  assert.match(body, /4 of these bought within 300s of launch/);
+  assert.match(body, /READ THE DENOMINATORS/);
+  assert.match(body, /coordination or a shared signal/i);
+
+  // Below the floor, nothing renders — the token is logged, not announced.
+  const quiet = alertHeaderLines({
+    signalCategory: { alertHeader: 'X' },
+    clusters: insiders(2),
+    candidateSwarm: { ...swarm, qualifies: false, label: null },
+  });
+  assert.equal(quiet.some((l) => /CABAL SWARM DETECTED/.test(l)), false);
 });
 
 /* ------------------------------------------------------------------ *

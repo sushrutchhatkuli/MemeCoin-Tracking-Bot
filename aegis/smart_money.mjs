@@ -303,6 +303,136 @@ function shortUsd(n) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Gate 0 candidate pool & swarm matching
+ * ------------------------------------------------------------------ */
+
+/**
+ * Every wallet with enough graded history to be worth watching at all.
+ *
+ * This is a DIFFERENT and much larger population than the elite watchlist.
+ * smart_wallets.json holds the 9 wallets that survived auto_top_whales' win-rate
+ * ranking; this holds every wallet Aegis has graded `minGradedBuys` times,
+ * measured at 376 wallets against 35,674 in the ledger.
+ *
+ * ── WHY A LOOSE POOL FEEDS A TIGHT GATE ─────────────────────────────────────
+ * A single Gate-0 wallet means almost nothing. The bar is three graded buys,
+ * which at a ~77% base rug rate is a wallet that has been present at a few
+ * tokens, not one with a demonstrated edge — the eliteWhales notes make the
+ * same point about small samples at length.
+ *
+ * The claim is made by the COUNT, not the membership. One of 376 wallets buying
+ * a token is noise. Five of them independently converging on the same token
+ * inside one observation window is a different kind of statement, and it is the
+ * count that has to be rare for that statement to mean anything.
+ *
+ * MEASURED over the ledger's 4.9 days: 2,492 token-windows contained at least
+ * one Gate-0 buyer, 370 contained 3+, and only 65 contained 5+. So the 5-wallet
+ * bar fires on 2.6% of the windows where any candidate appears at all — roughly
+ * 13 times a day before the alert pipeline's other gates are applied.
+ */
+/** Same display form insider_cluster and the whale renderer already use. */
+const shortWallet = (a) => (typeof a === 'string' && a.length > 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : String(a ?? ''));
+
+export function buildCandidatePool(observations, { minGradedBuys = 3 } = {}) {
+  const index = new Map();
+
+  for (const [address, entry] of Object.entries(observations?.wallets ?? {})) {
+    const graded = (entry?.buys ?? []).filter((b) => b.outcome && b.outcome !== 'NEUTRAL');
+    if (graded.length < minGradedBuys) continue;
+
+    const wins = graded.filter((b) => b.outcome === 'WIN').length;
+    index.set(address, {
+      address,
+      gradedBuys: graded.length,
+      wins,
+      winRatePct: (wins / graded.length) * 100,
+      observedBuys: (entry?.buys ?? []).length,
+    });
+  }
+
+  return { index, size: index.size, minGradedBuys };
+}
+
+/**
+ * How many DISTINCT candidate wallets bought this token in what the replay saw.
+ *
+ * Costs no RPC: it is a set lookup against buyers that fetchRecentBuyers already
+ * returned. The pool is rebuilt from the observation ledger once per scan, not
+ * once per token.
+ *
+ * `earlyCount` is the subset provably inside `earlyWindowSeconds` of pair
+ * creation. Unknown launch timing does NOT count as early — pairCreatedAt is
+ * available on 96.7% of measured pairs, so requiring it costs little, and
+ * assuming it would turn "all buyers" into "launch buyers" on exactly the pairs
+ * where the distinction matters.
+ */
+export function matchCandidateSwarm({
+  buyers = [],
+  pool = null,
+  config = {},
+  pairCreatedAt = null,
+} = {}) {
+  const cfg = config.candidateSwarm ?? {};
+  const minWallets = cfg.minWallets ?? 5;
+  const earlyWindowSec = cfg.earlyWindowSeconds ?? 300;
+  const requireEarly = cfg.requireEarly === true;
+
+  const empty = {
+    detected: false,
+    qualifies: false,
+    count: 0,
+    earlyCount: 0,
+    wallets: [],
+    minWallets,
+    poolSize: pool?.size ?? 0,
+    requireEarly,
+  };
+  if (!pool?.index?.size || !buyers.length) return empty;
+
+  const seen = new Map();
+  for (const b of buyers) {
+    const hit = pool.index.get(b?.wallet);
+    if (!hit || seen.has(b.wallet)) continue;
+
+    const secondsAfterLaunch =
+      pairCreatedAt && b.blockTime ? (b.blockTime * 1000 - pairCreatedAt) / 1000 : null;
+
+    seen.set(b.wallet, {
+      ...hit,
+      short: shortWallet(b.wallet),
+      solscan: `https://solscan.io/account/${b.wallet}`,
+      solSpent: b.solSpent ?? null,
+      secondsAfterLaunch,
+      early:
+        secondsAfterLaunch !== null &&
+        secondsAfterLaunch >= 0 &&
+        secondsAfterLaunch <= earlyWindowSec,
+    });
+  }
+
+  const wallets = [...seen.values()].sort((a, b) => b.gradedBuys - a.gradedBuys);
+  const earlyCount = wallets.filter((w) => w.early).length;
+  const effective = requireEarly ? earlyCount : wallets.length;
+
+  return {
+    detected: wallets.length > 0,
+    qualifies: effective >= minWallets,
+    count: wallets.length,
+    earlyCount,
+    effectiveCount: effective,
+    wallets,
+    minWallets,
+    earlyWindowSec,
+    requireEarly,
+    poolSize: pool.size,
+    label:
+      effective >= minWallets
+        ? `MASSIVE ${minWallets}+ CABAL SWARM DETECTED (${effective} Candidate Whales Bought Same Token!)`
+        : null,
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Recent buyer extraction (Solana RPC)
  * ------------------------------------------------------------------ */
 

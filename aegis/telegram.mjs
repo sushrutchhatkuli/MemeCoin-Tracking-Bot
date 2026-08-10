@@ -15,6 +15,7 @@ import { fetchLiveHolderDistribution } from './sources.mjs';
 import {
   auditFailuresAreBypassable,
   concentrationCapFor,
+  evaluateCandidateSwarm,
   isAlertableCategory,
   evaluateSecurityShield,
   resolveInsiderBypass,
@@ -460,7 +461,7 @@ function renderWhales(smartMoney) {
  * the tier header does not carry. At a single wallet it would just restate the
  * header, and the full roster appears in the cluster block below regardless.
  */
-export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip, momentum, narrative }) {
+export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip, momentum, narrative, candidateSwarm }) {
   const count = clusters?.insiderCount ?? 0;
   const tierHeader = signalCategory?.alertHeader ?? null;
 
@@ -514,8 +515,13 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
   // body, not a banner — headers are for the facts that change a decision.
   const narrativeBanner = narrative?.qualifies ? [`<b>${esc(narrative.label)}</b>`] : [];
 
+  // The swarm leads everything when it fires. Once the notification filter is
+  // on it is the REASON this alert exists at all, so it goes above the tier
+  // header and above the bundle banner.
+  const swarmBanner = candidateSwarm?.qualifies ? [`<b>${esc(candidateSwarm.label)}</b>`] : [];
+
   if (tierHeader) {
-    const lines = [...bypassBanner, ...newsBanner, ...bundle, ...viral, ...socialBanner, ...narrativeBanner, `<b>${esc(tierHeader)}</b>`];
+    const lines = [...swarmBanner, ...bypassBanner, ...newsBanner, ...bundle, ...viral, ...socialBanner, ...narrativeBanner, `<b>${esc(tierHeader)}</b>`];
     if (count >= 4) lines.push(`<b>CABAL SWARM — ${count} unique insider wallets</b>`);
     else if (count >= 2) lines.push(`<b>MULTI-INSIDER — ${count} unique wallets</b>`);
     return lines;
@@ -524,6 +530,7 @@ export function alertHeaderLines({ signalCategory, clusters, smartMoney, megaRun
   // Fallback chain, unchanged. Reached when telegram.insiderTiersOnly is off
   // and a token alerts from outside both bands, or on a non-insider signal.
   return [
+    ...swarmBanner,
     ...bypassBanner,
     ...newsBanner,
     ...bundle,
@@ -647,6 +654,49 @@ function renderNewsAndSocial(news, social) {
 }
 
 /**
+ * Candidate swarm detail — who converged, and what that does and does not mean.
+ *
+ * Each wallet is shown WITH ITS GRADED-BUY COUNT, for the same reason /whales
+ * prints denominators: Gate-0 membership is three graded buys, and a reader who
+ * sees "5 candidate whales" without the sample sizes will assume five proven
+ * traders agreed. They did not necessarily agree about anything — they may all
+ * follow the same caller.
+ */
+function renderCandidateSwarm(swarm) {
+  if (!swarm?.qualifies) return [];
+
+  const lines = [
+    '',
+    `<b>CANDIDATE SWARM: ${swarm.effectiveCount} of ${swarm.poolSize} tracked candidate wallets</b>`,
+  ];
+  for (const w of swarm.wallets.slice(0, 8)) {
+    const timing =
+      w.secondsAfterLaunch === null || w.secondsAfterLaunch === undefined
+        ? 'entry time unknown'
+        : w.secondsAfterLaunch < 60
+          ? `${Math.round(w.secondsAfterLaunch)}s after launch`
+          : `${Math.round(w.secondsAfterLaunch / 60)}m after launch`;
+    const spend =
+      w.solSpent !== null && w.solSpent !== undefined ? `${w.solSpent.toFixed(2)} SOL` : 'spend not attributable';
+    lines.push(
+      `• <code>${esc(w.short)}</code> — ${w.wins}/${w.gradedBuys} graded (${w.winRatePct.toFixed(0)}%), ${esc(spend)}, ${esc(timing)} · ` +
+        `<a href="${esc(w.solscan)}">Solscan</a>`
+    );
+  }
+  if (swarm.wallets.length > 8) lines.push(`• <i>… and ${swarm.wallets.length - 8} more</i>`);
+
+  if (!swarm.requireEarly) {
+    lines.push(
+      `<i>${swarm.earlyCount} of these bought within ${swarm.earlyWindowSec}s of launch; the rest are later entries. Set candidateSwarm.requireEarly to count only the early ones.</i>`
+    );
+  }
+  lines.push(
+    '<i>READ THE DENOMINATORS. A candidate wallet is one with 3+ graded buys, not a proven trader — at a ~77% base rug rate that is presence, not edge. The claim here is the COUNT: several wallets converging on one token is coordination or a shared signal, which may simply mean they all follow the same caller. It is a reason to look, not a prediction.</i>'
+  );
+  return lines;
+}
+
+/**
  * AI narrative detail.
  *
  * Rendered for ANY score, not only S-Tier, because "the AI looked at this and
@@ -742,7 +792,7 @@ function renderMegaRunner(megaRunner) {
   ];
 }
 
-export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader, news, social, sizerConfig, jitoTip, momentum, narrative }) {
+export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, security, tradeLink, reaudit, signalCategory, migration, clusters, cto, thresholds, megaRunner, megaRunnerHeader, news, social, sizerConfig, jitoTip, momentum, narrative, candidateSwarm }) {
   // Read off the verdict rather than re-derived: this is a rendering decision,
   // and the scorer is the only thing entitled to decide a gate was overridden.
   const insiderBypass = verdictInfo?.insiderBypass?.applied === true ? verdictInfo.insiderBypass : null;
@@ -785,7 +835,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     : [];
 
   return [
-    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip, momentum, narrative }),
+    ...alertHeaderLines({ signalCategory, clusters, smartMoney, megaRunner, megaRunnerHeader, news, social, insiderBypass, jitoTip, momentum, narrative, candidateSwarm }),
     `Token: <b>$${esc(symbol)}</b> (${esc(pair.chainId === 'solana' ? 'Solana' : pair.chainId)})`,
     `<i>Score ${verdictInfo.score}/100</i>${clusters?.label ? ` | <b>${esc(clusters.label)}</b>` : ''}`,
     // Placed above the advice: if the buy button is locked, the trading advice
@@ -796,6 +846,7 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     ...(signalCategory?.advice ? ['', `<b>${esc(signalCategory.advice)}</b>`] : []),
     ...sizeLines,
     ...renderNewsAndSocial(news, social),
+    ...renderCandidateSwarm(candidateSwarm),
     ...renderMomentum(momentum),
     ...renderNarrative(narrative),
     ...renderJitoTip(jitoTip),
@@ -1509,6 +1560,22 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
   // UNVERIFIED never reaches this path: auditFailuresAreBypassable requires at
   // least one FAILED row, and an audit that only has unknowns has none. Missing
   // provider data is not something an insider score is allowed to vouch for.
+  // ---- Ultra-high-conviction candidate swarm filter ----------------
+  //
+  // Placed with the hard blocks, above every tier and score gate, because it is
+  // a NOTIFICATION policy rather than a safety one: it decides whether a token
+  // is worth interrupting for, not whether it is safe. A token blocked here is
+  // fully analysed and its buys are already in wallet_observations.json — the
+  // ledger keeps growing on single and small-cluster buys, which is what makes
+  // tomorrow's pool bigger. Only the notification is withheld.
+  //
+  // Re-derived here from the swarm object rather than trusted as a boolean, so
+  // the threshold in config is the one thing that decides it.
+  const swarmGate = evaluateCandidateSwarm({ swarm: result.candidateSwarm, config });
+  if (swarmGate.enforced && !swarmGate.passed) {
+    return { status: 'below-candidate-swarm', reason: swarmGate.detail };
+  }
+
   if (audit.status !== 'PASSED') {
     const dispatchBypass = resolveInsiderBypass({
       clusters: result.clusters,
@@ -1620,6 +1687,7 @@ export async function maybeAlert({ result, pair, credentials, config, alertLog, 
     jitoTip: result.jitoTip,
     momentum: result.momentum,
     narrative: result.narrative,
+    candidateSwarm: result.candidateSwarm,
   });
 
   const sent = await sendTelegram({ ...credentials, text });

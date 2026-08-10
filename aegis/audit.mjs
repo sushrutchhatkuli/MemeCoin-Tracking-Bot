@@ -381,6 +381,69 @@ export function resolveHolderFloor({ signalCategory, config = {}, thresholds = n
 }
 
 /* ------------------------------------------------------------------ *
+ * Gate 0 candidate swarm
+ * ------------------------------------------------------------------ */
+
+/**
+ * Does this token carry a genuine multi-candidate swarm?
+ *
+ * The pool is deliberately loose (any wallet with 3+ graded buys, ~376 of
+ * 35,674) and the gate is deliberately tight (5+ of them on one token). The
+ * claim lives entirely in the COUNT: one candidate wallet buying something is
+ * noise, and would be noise even if the pool were curated.
+ *
+ * MEASURED over 4.9 days of ledger: 2,492 token-windows had at least one
+ * candidate, 370 had 3+, 65 had 5+. The bar fires on 2.6% of windows where a
+ * candidate appears at all, and the most ever seen on one token in a single
+ * window was 8 — so 5 sits near the top of the observed range rather than
+ * comfortably inside it.
+ *
+ * ── WHAT THIS IS NOT ────────────────────────────────────────────────────────
+ * It is not evidence that 5 skilled traders agreed. Gate-0 membership is 3
+ * graded buys, which at a ~77% base rug rate is presence, not edge. Five
+ * wallets converging is a statement about COORDINATION OR SHARED SIGNAL — they
+ * may all follow the same caller, the same bot, or each other. That is worth
+ * being told about; it is not a prediction.
+ *
+ * Unlike the insider tiers this makes no safety claim at all, which is why it
+ * gates DISPATCH rather than adding score: it decides whether a token is worth
+ * interrupting you for, and every existing safety gate still has to pass first.
+ */
+export function evaluateCandidateSwarm({ swarm = null, config = {} } = {}) {
+  const cfg = config.candidateSwarm ?? {};
+  const minWallets = cfg.minWallets ?? 5;
+
+  if (cfg.enabled !== true) {
+    return { enforced: false, passed: true, detail: 'candidate swarm filter disabled' };
+  }
+  if (!swarm?.detected) {
+    return {
+      enforced: true,
+      passed: false,
+      count: 0,
+      minWallets,
+      detail: `no Gate-0 candidate wallets among the replayed buyers (need ${minWallets})`,
+    };
+  }
+
+  const effective = swarm.effectiveCount ?? swarm.count ?? 0;
+  const passed = effective >= minWallets;
+
+  return {
+    enforced: true,
+    passed,
+    count: swarm.count,
+    earlyCount: swarm.earlyCount,
+    effectiveCount: effective,
+    minWallets,
+    poolSize: swarm.poolSize,
+    detail: passed
+      ? `${effective} of ${swarm.poolSize} candidate wallet(s) bought this token${swarm.requireEarly ? ` within ${swarm.earlyWindowSec}s of launch` : ''}`
+      : `only ${effective} candidate wallet(s)${swarm.requireEarly ? ` inside the ${swarm.earlyWindowSec}s launch window` : ''} — need ${minWallets}`,
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Micro-bundle blocking — minimum cabal spend floor
  * ------------------------------------------------------------------ */
 

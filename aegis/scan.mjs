@@ -46,6 +46,8 @@ import {
   loadWatchlist,
   matchSmartMoney,
   fetchRecentBuyers,
+  buildCandidatePool,
+  matchCandidateSwarm,
   SYSTEM_ACCOUNTS,
 } from './smart_money.mjs';
 import {
@@ -280,6 +282,7 @@ async function analyzeToken({
   trending,
   narrativeCache,
   geminiKey,
+  candidatePool,
   now,
 }) {
   const address = pair.baseToken.address;
@@ -432,6 +435,28 @@ async function analyzeToken({
       : { detected: false, label: null, clusterBuying: null, oversized: [], networks: [], watchlisted: [] };
 
   if (clusters?.detected) clusters.scoreBonus = clusterScoreBonus(clusters, config);
+
+  // --- Gate 0 candidate swarm ---------------------------------------
+  //
+  // A set lookup against buyers fetchRecentBuyers already returned, so it costs
+  // no RPC. The pool is built once per scan from the observation ledger, not
+  // once per token.
+  const candidateSwarm = matchCandidateSwarm({
+    buyers,
+    pool: candidatePool,
+    config,
+    pairCreatedAt: pair.pairCreatedAt ?? null,
+  });
+
+  if (candidateSwarm.qualifies) {
+    console.log(`   ${candidateSwarm.label}`);
+  } else if (candidateSwarm.detected) {
+    // Logged, not alerted. The buys still enter wallet_observations.json, which
+    // is what makes tomorrow's candidate pool larger than today's.
+    console.log(
+      `   ${candidateSwarm.count} candidate wallet(s) — under the ${candidateSwarm.minWallets} swarm floor, logged only`
+    );
+  }
 
   // --- Jito tip analysis --------------------------------------------
   //
@@ -644,6 +669,7 @@ async function analyzeToken({
     jitoTip,
     momentum,
     narrative,
+    candidateSwarm,
     news,
     social: socialHype,
   };
@@ -758,6 +784,19 @@ export async function runScan(args = {}) {
   // not change, which is what makes the repeated cost genuinely zero.
   const narrativeCache = await loadNarrativeCache();
   const narrativeCachedBefore = Object.keys(narrativeCache).length;
+
+  // Gate-0 candidate pool, built ONCE per scan from the observation ledger.
+  // Rebuilding it per token would walk 35k wallets on every audit to produce an
+  // identical answer.
+  const candidatePool = buildCandidatePool(observations, {
+    minGradedBuys: config.candidateSwarm?.minGradedBuys ?? 3,
+  });
+  console.log(
+    `Candidate pool: ${candidatePool.size} wallet(s) with >= ${candidatePool.minGradedBuys} graded buys` +
+      (config.candidateSwarm?.enabled === true
+        ? ` — alerts require ${config.candidateSwarm?.minWallets ?? 5}+ on one token`
+        : ' (swarm filter off)')
+  );
 
   // Market-wide context, fetched ONCE per scan. Both are free-tier APIs with
   // real rate limits, and neither varies per token — pulling them inside the
@@ -978,6 +1017,7 @@ export async function runScan(args = {}) {
         trending,
         narrativeCache,
         geminiKey: credentials.geminiKey,
+        candidatePool,
         now,
       });
       return { pair, result, error: null };
