@@ -163,6 +163,13 @@ async function runOnce(input) {
   console.log(toPlainText(reply));
 }
 
+const USAGE = [
+  'Usage:',
+  '  node bot.mjs                  start the long-poll command listener',
+  '  node bot.mjs --once "/status" run one command locally and exit',
+  '  node bot.mjs --once "/audit <mint>"',
+].join('\n');
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   const argv = process.argv.slice(2);
   const onceAt = argv.indexOf('--once');
@@ -170,10 +177,32 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
   if (onceAt !== -1) {
     const command = argv.slice(onceAt + 1).join(' ').trim();
     if (!command) {
-      console.error('Usage: node bot.mjs --once "/status"');
+      console.error(USAGE);
       process.exit(1);
     }
     await runOnce(command);
+    process.exit(0);
+  }
+
+  // An UNRECOGNISED FLAG MUST NOT START THE DAEMON.
+  //
+  // This previously fell through: `node bot.mjs --cmd /whales` found no --once,
+  // ignored the arguments entirely and silently started the long-poll listener.
+  // Three of those were observed running at once against one bot token, where
+  // Telegram's getUpdates gives 409s and each update reaches whichever poller
+  // asks first — so commands appear to be answered intermittently for reasons
+  // nothing explains. Someone typing a command flag wants a command, and the
+  // failure mode of guessing wrong is a background daemon they did not ask for.
+  const stray = argv.filter((a) => a.startsWith('-'));
+  if (stray.length) {
+    console.error(`Unknown option: ${stray.join(' ')}\n`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  // A bare command with no flag is what someone means, so run it rather than
+  // making them re-type it: `node bot.mjs /whales`.
+  if (argv.length) {
+    await runOnce(argv.join(' ').trim());
     process.exit(0);
   }
 
