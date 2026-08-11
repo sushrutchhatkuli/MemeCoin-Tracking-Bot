@@ -175,7 +175,21 @@ export function applyEliteRules(candidates, rules = ELITE_RULES) {
           : c.netProfitUsd !== null && c.netProfitUsd >= rules.minNetProfitUsd,
       trades:
         fastTracked || (c.lifetimeTrades !== null && c.lifetimeTrades >= rules.minLifetimeTrades),
-      // Rule 5 — REALIZED SOL. Never waived, including by the fast-track.
+      // Rule 5 — REALIZED SOL. Never waived by the fast-track.
+      //
+      // NOT APPLICABLE TO IMPORTED ROWS, and without this the import path is
+      // dead: Rules 4 and 5 read `onChain`, which only exists after the
+      // enrichment replay, and that replay never runs for imports. Unmeasured
+      // is a failure, so EVERY imported wallet failed both rules however good
+      // its leaderboard record — a $30k import would have qualified nobody and
+      // the reason would have been invisible.
+      //
+      // Waiving them here is not a loosening. An imported row carries the
+      // provider's own LIFETIME realized P&L, computed across the wallet's
+      // whole history; Rules 4 and 5 exist to approximate exactly that from a
+      // 12-page replay because observation could not supply it. Where the real
+      // figure is present it is the better measurement, and it is judged by
+      // Rule 2 at the same $30,000 bar.
       //
       // At a win-rate floor below the coin-flip line this is the rule that
       // actually decides whether a wallet made money: 45% admitted a wallet at
@@ -185,7 +199,9 @@ export function applyEliteRules(candidates, rules = ELITE_RULES) {
       // Unmeasured is a failure, like every other unknown here. A wallet whose
       // history could not be replayed has not shown a profit.
       netSol:
-        rules.minAllTimeNetSol === null || rules.minAllTimeNetSol === undefined
+        c.providerMetrics === true ||
+        rules.minAllTimeNetSol === null ||
+        rules.minAllTimeNetSol === undefined
           ? true
           : typeof c.onChain?.netSol === 'number' &&
             Number.isFinite(c.onChain.netSol) &&
@@ -198,7 +214,9 @@ export function applyEliteRules(candidates, rules = ELITE_RULES) {
       // is not a wallet with a good record, and this rule exists precisely
       // because the observed rate it sits beside is too generous.
       onChainWinRate:
-        fastTracked || !rules.minAllTimeWinRatePct
+        // Same reasoning as netSol above: an imported row's win rate IS the
+        // provider's lifetime figure, already judged by Rule 1.
+        fastTracked || c.providerMetrics === true || !rules.minAllTimeWinRatePct
           ? true
           : c.onChain?.winRatePct !== null &&
             c.onChain?.winRatePct !== undefined &&
@@ -916,15 +934,49 @@ const NUM = (v) => {
   return Number.isFinite(n) ? n : null;
 };
 
-/** Pick a field by any of several plausible header names. */
+/**
+ * Pick a field by any of several plausible header names.
+ *
+ * Normalises to ALPHANUMERICS ONLY. It previously stripped just spaces,
+ * underscores and hyphens, which meant Birdeye's `"PnL (USD)"` normalised to
+ * `pnl(usd)` and matched nothing — the column parsed as null and the wallet
+ * arrived with no profit figure at all, silently failing Rule 2 for want of a
+ * value that was sitting in the file.
+ */
+export const normaliseHeader = (key) => String(key).toLowerCase().replace(/[^a-z0-9]/g, '');
+
 const pick = (row, names) => {
   for (const n of names) {
     for (const key of Object.keys(row)) {
-      if (key.toLowerCase().replace(/[\s_-]/g, '') === n) return row[key];
+      if (normaliseHeader(key) === n) return row[key];
     }
   }
   return null;
 };
+
+/**
+ * A leaderboard win rate, always as a PERCENTAGE.
+ *
+ * Providers disagree: GMGN and Cielo export 0.62, Birdeye exports "64%", Dune
+ * exports 58.3. Read literally, a 0.62 is compared against a 40 floor and the
+ * wallet is rejected for being too good — which is how a whole GMGN import
+ * silently qualifies nobody.
+ *
+ * A bare value at or below 1 is treated as a fraction. That is ambiguous for a
+ * genuine 1% win rate, and the ambiguity is resolved in favour of the fraction
+ * deliberately: leaderboards rank by performance, so a 1% row is vanishingly
+ * unlikely, while 0.x fractions are the house format of two of the four
+ * providers. An explicit `%` in the cell always wins over the heuristic.
+ */
+export function normaliseWinRate(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  const text = String(raw);
+  const n = NUM(text);
+  if (n === null) return null;
+  if (text.includes('%')) return n;
+  if (n > 0 && n <= 1) return n * 100;
+  return n;
+}
 
 function parseCsv(text) {
   const lines = text.split(/\r?\n/).filter((l) => l.trim());
@@ -950,20 +1002,51 @@ async function candidatesFromImport(path) {
           return Array.isArray(j) ? j : (j.wallets ?? j.data ?? j.results ?? []);
         })();
 
-  return rows
+  // Column aliases, widened against real export headers from all four
+  // providers rather than guessed. Each entry below was a column that parsed to
+  // null before: `trader` (Dune) produced ZERO candidates from a valid file,
+  // `realized_profit` (GMGN) and `PnL (USD)` (Birdeye) dropped the profit
+  // figure, and `txs_30d` dropped the trade count.
+  const ADDRESS = ['address', 'wallet', 'walletaddress', 'account', 'owner', 'trader', 'signer', 'user', 'makeraddress'];
+  const WIN_RATE = ['winrate', 'winratepct', 'winratepercent', 'wr', 'winrate%', 'winpct', 'successrate'];
+  const PROFIT = [
+    'netprofit', 'netprofitusd', 'realizedpnl', 'realizedpnlusd', 'realizedprofit',
+    'realizedprofitusd', 'pnl', 'pnlusd', 'profit', 'profitusd', 'totalpnl',
+    'totalpnlusd', 'netpnl', 'netpnlusd', 'totalprofit', 'totalprofitusd',
+  ];
+  const TRADES = [
+    'trades', 'tradecount', 'totaltrades', 'txcount', 'swaps', 'swapcount',
+    'totalswaps', 'txs', 'txs30d', 'trades30d', 'numtrades', 'totaltx',
+  ];
+
+  const parsed = rows
     .map((row) => ({
-      address: String(
-        pick(row, ['address', 'wallet', 'walletaddress', 'account', 'owner']) ?? ''
-      ).trim(),
-      winRatePct: NUM(pick(row, ['winrate', 'winratepct', 'wr', 'winrate%'])),
-      netProfitUsd: NUM(
-        pick(row, ['netprofit', 'netprofitusd', 'realizedpnl', 'pnl', 'profit', 'totalpnl'])
-      ),
-      lifetimeTrades: NUM(pick(row, ['trades', 'tradecount', 'totaltrades', 'txcount', 'swaps'])),
+      address: String(pick(row, ADDRESS) ?? '').trim(),
+      // Percent, always. See normaliseWinRate — two of the four providers
+      // export fractions and reading 0.62 against a 40 floor rejects the
+      // wallet for being too good.
+      winRatePct: normaliseWinRate(pick(row, WIN_RATE)),
+      netProfitUsd: NUM(pick(row, PROFIT)),
+      lifetimeTrades: NUM(pick(row, TRADES)),
+      // The provider's own LIFETIME figures. Flagged so the rules can tell them
+      // apart from Aegis's bounded on-chain replay — see applyEliteRules.
+      providerMetrics: true,
       source: 'imported-leaderboard',
       basis: `imported from ${path.split(/[\\/]/).pop()}`,
     }))
     .filter((c) => c.address);
+
+  // A file that parsed rows but no addresses is a column-name mismatch, not an
+  // empty leaderboard, and the difference matters: one is fixed by editing a
+  // header, the other by exporting different data. Saying "0 candidates" for
+  // both sent me looking in the wrong place.
+  if (rows.length && !parsed.length) {
+    console.error(
+      `   No address column found. Saw headers: ${Object.keys(rows[0] ?? {}).join(', ')}\n` +
+        `   Expected one of: ${ADDRESS.join(', ')} (case and punctuation are ignored).`
+    );
+  }
+  return parsed;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1291,6 +1374,16 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
             `no floor above ${money(derived[0])} can ever admit anyone`
         );
       }
+    } else if (importPath) {
+      // Imports carry the provider's own lifetime P&L; nothing is derived, and
+      // saying "no Helius key" here blames the wrong thing entirely.
+      const withProfit = evaluated.filter((c) => typeof c.netProfitUsd === 'number').length;
+      console.log(
+        `           judged on the leaderboard's own P&L column — ${withProfit}/${evaluated.length} row(s) carried one` +
+          (withProfit < evaluated.length
+            ? '; rows without a recognised profit column cannot pass this rule'
+            : '')
+      );
     } else {
       console.log('           derived PnL: none available (no Helius key, or every lookup failed)');
     }

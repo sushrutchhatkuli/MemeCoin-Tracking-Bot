@@ -98,6 +98,8 @@ import {
   computeOnChainWinRate,
   applyEliteRules,
   countMegaWins,
+  normaliseHeader,
+  normaliseWinRate,
   ELITE_RULES,
 } from '../auto_top_whales.mjs';
 import { extractMints, channelMatches, SeenCache } from '../telegram_listener.mjs';
@@ -2509,6 +2511,107 @@ test('a net-negative wallet is rejected however often it was right', () => {
       { ...RULES5, minAllTimeNetSol: null }).qualified.length,
     1
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * Leaderboard CSV import
+ *
+ * Every case here is a header shape that produced a WRONG answer silently:
+ * Dune's `trader` parsed zero wallets from a valid file, Birdeye's
+ * "PnL (USD)" dropped the profit column, and GMGN's 0.62 win rate was compared
+ * against a 40 floor and rejected for being too good.
+ * ------------------------------------------------------------------ */
+
+test('header matching ignores punctuation, not just spaces and underscores', () => {
+  // "PnL (USD)" normalised to `pnl(usd)` under the old rule and matched nothing.
+  assert.equal(normaliseHeader('PnL (USD)'), 'pnlusd');
+  assert.equal(normaliseHeader('realized_profit'), 'realizedprofit');
+  assert.equal(normaliseHeader('Win Rate %'), 'winrate');
+  assert.equal(normaliseHeader('total_pnl_usd'), 'totalpnlusd');
+  assert.equal(normaliseHeader('txs_30d'), 'txs30d');
+  assert.equal(normaliseHeader('  Address  '), 'address');
+});
+
+test('win rates arrive as fractions, percents and strings — all become percent', () => {
+  // GMGN and Cielo export 0.62; Birdeye exports "64%"; Dune exports 58.3.
+  // Read literally, 0.62 fails a 40 floor and a whole import qualifies nobody.
+  assert.equal(normaliseWinRate(0.62), 62);
+  assert.equal(normaliseWinRate('0.55'), 55.00000000000001); // float, asserted honestly
+  assert.equal(normaliseWinRate('64%'), 64);
+  assert.equal(normaliseWinRate(58.3), 58.3);
+  assert.equal(normaliseWinRate('1'), 100, 'a bare 1 is read as a fraction — documented ambiguity');
+  assert.equal(normaliseWinRate('1%'), 1, 'an explicit percent always wins over the heuristic');
+  assert.equal(normaliseWinRate(0), 0);
+  for (const bad of [null, undefined, '', 'n/a']) assert.equal(normaliseWinRate(bad), null, String(bad));
+});
+
+test('all four provider export shapes parse to the same candidate shape', async () => {
+  const { mkdtemp, writeFile: wf, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join: pjoin } = await import('node:path');
+  const { syncTopWhales } = await import('../auto_top_whales.mjs');
+
+  const dir = await mkdtemp(pjoin(tmpdir(), 'aegis-import-'));
+  const fixtures = {
+    // Real header shapes from each provider's export.
+    'gmgn.csv': 'wallet_address,realized_profit,winrate,txs_30d\nAAA1111111111111111111111111111111111111111,45230.50,0.62,412\n',
+    'birdeye.csv': '"Address","PnL (USD)","Win Rate","Total Trades"\n"BBB1111111111111111111111111111111111111111","$88,400.00","64%","523"\n',
+    'dune.csv': 'trader,total_pnl_usd,win_rate_pct,swaps\nCCC1111111111111111111111111111111111111111,52000,58.3,780\n',
+    'cielo.csv': 'walletAddress,pnl,winrate,tradeCount\nDDD1111111111111111111111111111111111111111,41500,0.51,333\n',
+  };
+  const expected = {
+    'gmgn.csv': { wr: 62, pnl: 45230.5, trades: 412 },
+    'birdeye.csv': { wr: 64, pnl: 88400, trades: 523 },
+    'dune.csv': { wr: 58.3, pnl: 52000, trades: 780 },
+    'cielo.csv': { wr: 51, pnl: 41500, trades: 333 },
+  };
+
+  try {
+    for (const [name, body] of Object.entries(fixtures)) {
+      const p = pjoin(dir, name);
+      await wf(p, body, 'utf8');
+      const r = await syncTopWhales({ importPath: p, dryRun: true, reportOnly: true });
+      assert.equal(r.evaluated.length, 1, `${name} produced no candidate`);
+      const c = r.evaluated[0];
+      assert.equal(Math.round(c.winRatePct * 10) / 10, expected[name].wr, `${name} win rate`);
+      assert.equal(c.netProfitUsd, expected[name].pnl, `${name} profit`);
+      assert.equal(c.lifetimeTrades, expected[name].trades, `${name} trades`);
+      assert.equal(c.providerMetrics, true, `${name} must be flagged as provider data`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('imported rows are judged on provider metrics, not on an absent replay', () => {
+  // Rules 4 and 5 read `onChain`, which only exists after the enrichment
+  // replay — and that replay never runs for imports. Since unmeasured is a
+  // failure, EVERY imported wallet failed both rules however good its record,
+  // and a $30k import would have qualified nobody with no visible reason.
+  const rules = {
+    ...ELITE_RULES, profitRule: 'enforce', minNetProfitUsd: 30_000,
+    minWinRatePct: 40, minGradedBuys: 3, minLifetimeTrades: 100,
+    minAllTimeWinRatePct: 40, minAllTimeTrades: 15, minAllTimeNetSol: 0,
+  };
+  const imported = {
+    address: 'I', winRatePct: 62, netProfitUsd: 45_230, lifetimeTrades: 412,
+    providerMetrics: true,
+  };
+  assert.equal(applyEliteRules([imported], rules).qualified.length, 1);
+  const checks = applyEliteRules([imported], rules).evaluated[0].checks;
+  assert.equal(checks.onChainWinRate, true, 'not applicable to a provider row');
+  assert.equal(checks.netSol, true, 'not applicable to a provider row');
+
+  // The waiver is scoped to imports. An observed wallet with no replay still
+  // fails, which is the behaviour that keeps observe mode honest.
+  assert.equal(
+    applyEliteRules([{ ...imported, providerMetrics: undefined }], rules).qualified.length,
+    0
+  );
+  // And the money rule still bites on imports.
+  assert.equal(applyEliteRules([{ ...imported, netProfitUsd: 12_000 }], rules).qualified.length, 0);
+  assert.equal(applyEliteRules([{ ...imported, winRatePct: 35 }], rules).qualified.length, 0);
+  assert.equal(applyEliteRules([{ ...imported, lifetimeTrades: 90 }], rules).qualified.length, 0);
 });
 
 test('Rule 2 reads REALIZED dollars, not the observation estimate', () => {
