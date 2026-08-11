@@ -1281,7 +1281,16 @@ function whalesReport(whales, config = {}) {
           (w.all_time_complete === false ? ' <i>[recent history]</i>' : '')
         : null;
 
+    // An Alpha Hunter is on the list for a different reason from everyone else
+    // — it was exempted from the win-rate floors — so the row says so instead
+    // of leading with a rate the wallet was never judged on.
+    const hunter = w.alpha_hunter
+      ? `<b>ALPHA HUNTER</b> — ${esc(String(w.mega_wins ?? '?'))} mega-runner(s) caught early` +
+        (w.mega_win_detail?.length ? ` (${esc(w.mega_win_detail.join(', '))})` : '')
+      : null;
+
     const bits = [
+      hunter,
       allTime,
       w.all_time_net_sol !== undefined && w.all_time_net_sol !== null
         ? `${w.all_time_net_sol >= 0 ? '+' : ''}${esc(String(w.all_time_net_sol))} SOL realized`

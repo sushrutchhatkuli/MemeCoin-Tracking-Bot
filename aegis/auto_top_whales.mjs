@@ -63,12 +63,69 @@ export const ELITE_RULES = {
   minAllTimeTrades: 15,
   maxHistoryPages: 12,
   dustTradeSol: 0.05,
+  // Rule 5 and the fast-track, both OFF by default so an un-opted config keeps
+  // its previous behaviour rather than changing what qualifies on upgrade.
+  minAllTimeNetSol: null,
+  alphaHunterMegaWins: null,
+  alphaHunterMinMultiplier: 50,
+  alphaHunterMaxMultiplier: 500,
 };
 
 /**
- * Apply all three rules. A candidate must pass every one — the rules are AND,
+ * Mega-runners a wallet was credited with catching early. PURE.
+ *
+ * Reads multiplier_engine's alpha ledger, where each harvested recap win writes
+ * `alpha.awarded[token] = { multiplier, points, symbol, at }`. Counted inside
+ * the configured band: the floor excludes ordinary winners, and the CEILING
+ * excludes absurd multipliers, which on a memecoin are usually a mispriced
+ * first trade rather than a 900x — the same reason detectCatalysts pairs every
+ * ratio with a count floor.
+ *
+ * ── READ THIS BEFORE TRUSTING A megaWinCount ────────────────────────────────
+ * These credits are awarded BECAUSE a wallet was present at a token that won —
+ * selection on the outcome. multiplierEngine's own note spends a paragraph on
+ * why that establishes nothing on its own: every buyer of a 42x looks brilliant
+ * afterwards, including the ones who bought a hundred rugs the same week, and
+ * recap channels publish winners while omitting losers. Two such credits is a
+ * stronger signal than one, but it is still two draws from a biased urn.
+ */
+export function countMegaWins(entry, { minMultiplier = 50, maxMultiplier = 500 } = {}) {
+  const awarded = Object.values(entry?.alpha?.awarded ?? {});
+  const qualifying = awarded.filter(
+    (a) =>
+      typeof a?.multiplier === 'number' &&
+      Number.isFinite(a.multiplier) &&
+      a.multiplier >= minMultiplier &&
+      a.multiplier <= maxMultiplier
+  );
+  return {
+    megaWinCount: qualifying.length,
+    megaWins: qualifying.map((a) => ({
+      multiplier: a.multiplier,
+      symbol: a.symbol ?? null,
+      at: a.at ?? null,
+    })),
+  };
+}
+
+/**
+ * Apply all four rules. A candidate must pass every one — the rules are AND,
  * not a weighted blend, so a spectacular win rate cannot compensate for a thin
  * trade history (which is how small-sample flukes get mistaken for skill).
+ *
+ * ── THE ALPHA HUNTER FAST-TRACK ─────────────────────────────────────────────
+ * A wallet credited with `alphaHunterMegaWins` mega-runners caught early skips
+ * the rules that ask "has this wallet been right often enough to judge" — the
+ * observed win rate, the on-chain win rate, the graded-sample floor and the
+ * lifetime-trades floor. Catching two 50x+ launches early IS the judgment those
+ * rules are proxies for, and a hunter who takes many small losses between them
+ * would fail a win-rate floor while being exactly the wallet worth following.
+ *
+ * IT DOES NOT WAIVE THE MONEY RULE. minAllTimeNetSol still applies, and that is
+ * deliberate: a wallet that caught two 50x runners and is STILL net negative in
+ * SOL did not convert them, and the fast-track exists to find wallets that
+ * catch runners, not wallets that are near them. Nor does it waive the
+ * system-account screen, which runs before any of this.
  */
 export function applyEliteRules(candidates, rules = ELITE_RULES) {
   // Rule 2 is a LIFETIME metric. Observation cannot produce it: Aegis sees a
@@ -81,17 +138,42 @@ export function applyEliteRules(candidates, rules = ELITE_RULES) {
   // never silently applied to imported data, which does carry real lifetime P&L.
   const skipProfit = rules.profitRule === 'skip';
 
+  const fastTrackAt = rules.alphaHunterMegaWins ?? null;
+
   const evaluated = candidates.map((c) => {
+    // The fast-track is decided BEFORE the checks so each waived rule can be
+    // recorded as passing-by-override rather than silently skipped — the report
+    // shows why a wallet qualified, and "waived" and "passed" are different
+    // facts about a wallet.
+    const fastTracked = Boolean(fastTrackAt) && (c.megaWinCount ?? 0) >= fastTrackAt;
+
     const checks = {
       sample:
+        fastTracked ||
         c.gradedBuys === undefined ||
         c.gradedBuys === null ||
         c.gradedBuys >= (rules.minGradedBuys ?? 0),
-      winRate: c.winRatePct !== null && c.winRatePct >= rules.minWinRatePct,
+      winRate: fastTracked || (c.winRatePct !== null && c.winRatePct >= rules.minWinRatePct),
       netProfit: skipProfit
         ? true
         : c.netProfitUsd !== null && c.netProfitUsd >= rules.minNetProfitUsd,
-      trades: c.lifetimeTrades !== null && c.lifetimeTrades >= rules.minLifetimeTrades,
+      trades:
+        fastTracked || (c.lifetimeTrades !== null && c.lifetimeTrades >= rules.minLifetimeTrades),
+      // Rule 5 — REALIZED SOL. Never waived, including by the fast-track.
+      //
+      // At a win-rate floor below the coin-flip line this is the rule that
+      // actually decides whether a wallet made money: 45% admitted a wallet at
+      // 47% that was 2.227 SOL DOWN, which is one that loses often and loses
+      // big. A win rate says how often; this says whether it worked.
+      //
+      // Unmeasured is a failure, like every other unknown here. A wallet whose
+      // history could not be replayed has not shown a profit.
+      netSol:
+        rules.minAllTimeNetSol === null || rules.minAllTimeNetSol === undefined
+          ? true
+          : typeof c.onChain?.netSol === 'number' &&
+            Number.isFinite(c.onChain.netSol) &&
+            c.onChain.netSol > rules.minAllTimeNetSol,
       // Rule 4 — the true on-chain rate, over its own minimum sample.
       //
       // Enforced only when a floor is configured, so an operator who has not
@@ -100,24 +182,32 @@ export function applyEliteRules(candidates, rules = ELITE_RULES) {
       // is not a wallet with a good record, and this rule exists precisely
       // because the observed rate it sits beside is too generous.
       onChainWinRate:
-        !rules.minAllTimeWinRatePct
+        fastTracked || !rules.minAllTimeWinRatePct
           ? true
           : c.onChain?.winRatePct !== null &&
             c.onChain?.winRatePct !== undefined &&
             c.onChain.winRatePct >= rules.minAllTimeWinRatePct &&
             (c.onChain.trades ?? 0) >= (rules.minAllTimeTrades ?? 0),
     };
-    return { ...c, checks, qualified: Object.values(checks).every(Boolean) };
+    return { ...c, checks, fastTracked, qualified: Object.values(checks).every(Boolean) };
   });
 
   const qualified = evaluated
     .filter((c) => c.qualified)
-    // Rule 1 is the primary sort; profit and trade count break ties.
     .sort(
       (a, b) =>
-        b.winRatePct - a.winRatePct ||
-        (b.netProfitUsd ?? 0) - (a.netProfitUsd ?? 0) ||
-        b.lifetimeTrades - a.lifetimeTrades
+        // Alpha Hunters lead, then most mega-runners caught. They are on the
+        // list for a different reason from everyone else and sorting them by a
+        // win rate they were exempted from would rank them by the number the
+        // fast-track exists to ignore.
+        Number(b.fastTracked ?? false) - Number(a.fastTracked ?? false) ||
+        (b.megaWinCount ?? 0) - (a.megaWinCount ?? 0) ||
+        // Realized SOL is the primary sort for everyone else: it is the only
+        // figure here that says whether the wallet actually made money.
+        (b.onChain?.netSol ?? -Infinity) - (a.onChain?.netSol ?? -Infinity) ||
+        (b.onChain?.winRatePct ?? 0) - (a.onChain?.winRatePct ?? 0) ||
+        (b.winRatePct ?? 0) - (a.winRatePct ?? 0) ||
+        (b.lifetimeTrades ?? 0) - (a.lifetimeTrades ?? 0)
     )
     .slice(0, rules.topN);
 
@@ -182,11 +272,22 @@ export function buildWatchlist(qualified, { source, rules }) {
         // The label leads with the ON-CHAIN rate when there is one, because
         // that is the trustworthy number. The observed rate stays in the entry
         // but stops being the headline.
-        label: w.onChain?.winRatePct !== null && w.onChain?.winRatePct !== undefined
-          ? `Elite Whale #${i + 1} (${w.onChain.winRatePct.toFixed(0)}% all-time WR on ${w.onChain.trades} trades)`
-          : profitSkipped
-            ? `Elite Whale #${i + 1} (${w.winRatePct.toFixed(0)}% WR on ${w.gradedBuys ?? '?'} graded)`
-            : `Elite Whale #${i + 1} (${w.winRatePct.toFixed(0)}% WR | ${money(w.netProfitUsd)})`,
+        label: w.fastTracked
+          ? `Alpha Hunter (Spotted ${w.megaWinCount}+ 50X-500X Gems Early)`
+          : w.onChain?.winRatePct !== null && w.onChain?.winRatePct !== undefined
+            ? `Elite Whale #${i + 1} (${w.onChain.winRatePct.toFixed(0)}% all-time WR on ${w.onChain.trades} trades)`
+            : profitSkipped
+              ? `Elite Whale #${i + 1} (${w.winRatePct.toFixed(0)}% WR on ${w.gradedBuys ?? '?'} graded)`
+              : `Elite Whale #${i + 1} (${w.winRatePct.toFixed(0)}% WR | ${money(w.netProfitUsd)})`,
+        ...(w.fastTracked
+          ? {
+              alpha_hunter: true,
+              mega_wins: w.megaWinCount,
+              mega_win_detail: (w.megaWins ?? []).map(
+                (m) => `${m.multiplier}x${m.symbol ? ` ${m.symbol}` : ''}`
+              ),
+            }
+          : {}),
         win_rate: `${w.winRatePct.toFixed(0)}%`,
         graded_buys: w.gradedBuys ?? null,
         // Rule 4's figures, kept as separate fields so nothing can confuse the
@@ -312,6 +413,10 @@ async function candidatesFromObservations(config) {
       // call each and most candidates never get that far.
       lifetimeTrades: s.gradedBuys,
       observed: s,
+      // Mega-runners this wallet was credited with catching early, counted from
+      // the alpha ledger multiplier_engine writes. Free — the record is already
+      // in memory — and it is the input the Alpha Hunter fast-track reads.
+      ...countMegaWins(entry),
       source: 'aegis-observed',
       basis: 'observed buys graded by post-mortem (not lifetime realized P&L)',
     });
@@ -1011,16 +1116,24 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     // Rules 1 and 3 are evaluated here rather than reused from applyEliteRules
     // because that function needs Rule 4's input to run at all — this is the
     // same pre-filter, applied early, to decide who is worth measuring.
-    if (rules.minAllTimeWinRatePct) {
+    if (rules.minAllTimeWinRatePct || rules.minAllTimeNetSol !== null) {
       const heliusKey = (String(config.rpcUrl ?? '').match(/api-key=([\w-]+)/) ?? [])[1] ?? null;
-      const contenders = shortlist.filter(
-        (c) =>
+      const fastTrackAt = rules.alphaHunterMegaWins ?? null;
+      const contenders = shortlist.filter((c) => {
+        // An Alpha Hunter skips rules 1-3, so it would never appear in this
+        // pre-filter — and it still NEEDS the replay, because the net-SOL rule
+        // is not waived and reads c.onChain. Omitting them here would make the
+        // fast-track unreachable: every hunter would fail Rule 5 for want of a
+        // measurement nobody took.
+        if (fastTrackAt && (c.megaWinCount ?? 0) >= fastTrackAt) return true;
+        return (
           c.winRatePct !== null &&
           c.winRatePct >= rules.minWinRatePct &&
           (c.gradedBuys ?? 0) >= (rules.minGradedBuys ?? 0) &&
           c.lifetimeTrades !== null &&
           c.lifetimeTrades >= rules.minLifetimeTrades
-      );
+        );
+      });
       console.log(
         `   ↳ replaying on-chain history for ${contenders.length} of ${shortlist.length} wallet(s) ` +
           `— only those already passing rules 1-3 can qualify ` +

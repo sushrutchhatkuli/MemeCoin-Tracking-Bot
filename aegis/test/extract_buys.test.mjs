@@ -93,7 +93,13 @@ import {
   mergeCandidates,
   websocketUrlFor,
 } from '../discovery_daemon.mjs';
-import { capEnrichmentShortlist, computeOnChainWinRate, applyEliteRules, ELITE_RULES } from '../auto_top_whales.mjs';
+import {
+  capEnrichmentShortlist,
+  computeOnChainWinRate,
+  applyEliteRules,
+  countMegaWins,
+  ELITE_RULES,
+} from '../auto_top_whales.mjs';
 import { extractMints, channelMatches, SeenCache } from '../telegram_listener.mjs';
 
 const MINT = 'MintAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -2463,6 +2469,135 @@ test('/whales leads with the all-time rate and labels the observed one', async (
   assert.match(out, /-67\.4 SOL realized/);
   assert.match(out, /100% observed on 3/, 'the observed rate is kept but demoted and labelled');
   assert.match(out, /observed rates of 75-100% corresponded to true on-chain rates of 8-63%/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Rule 5 (net SOL) and the Alpha Hunter fast-track
+ * ------------------------------------------------------------------ */
+
+const RULES5 = {
+  ...ELITE_RULES,
+  minWinRatePct: 75, minGradedBuys: 3, minLifetimeTrades: 100, profitRule: 'skip',
+  minAllTimeWinRatePct: 45, minAllTimeTrades: 15,
+  minAllTimeNetSol: 0, alphaHunterMegaWins: 2,
+};
+const solid = { address: 'W', winRatePct: 75, gradedBuys: 5, lifetimeTrades: 500,
+  onChain: { winRatePct: 66, trades: 92, netSol: 6.8 } };
+
+test('a net-negative wallet is rejected however often it was right', () => {
+  // The concrete case: at a 45% floor the sync admitted a wallet at 47% that
+  // was 2.227 SOL DOWN — one that loses often AND loses big. A win rate says
+  // how often; net SOL says whether it worked.
+  const loser = { address: 'L', winRatePct: 100, gradedBuys: 5, lifetimeTrades: 500,
+    onChain: { winRatePct: 47, trades: 124, netSol: -2.227 } };
+  const r = applyEliteRules([loser, solid], RULES5);
+  assert.deepEqual(r.qualified.map((c) => c.address), ['W']);
+  assert.equal(r.evaluated.find((c) => c.address === 'L').checks.netSol, false);
+
+  // Exactly zero is not positive.
+  assert.equal(
+    applyEliteRules([{ ...solid, onChain: { ...solid.onChain, netSol: 0 } }], RULES5).qualified.length,
+    0
+  );
+  // Unmeasured is a failure, like every other unknown here.
+  for (const onChain of [undefined, { netSol: null }, { netSol: NaN }]) {
+    assert.equal(applyEliteRules([{ ...solid, onChain }], RULES5).qualified.length, 0, JSON.stringify(onChain));
+  }
+  // Off unless configured.
+  assert.equal(
+    applyEliteRules([{ ...solid, onChain: { ...solid.onChain, netSol: -9 } }],
+      { ...RULES5, minAllTimeNetSol: null }).qualified.length,
+    1
+  );
+});
+
+test('mega-wins are counted inside the band, with a ceiling as well as a floor', () => {
+  assert.equal(countMegaWins({ alpha: { awarded: { a: { multiplier: 60 }, b: { multiplier: 120 } } } }).megaWinCount, 2);
+  // The only credits actually on file are 42x — below the 50x floor.
+  assert.equal(countMegaWins({ alpha: { awarded: { t: { multiplier: 42, symbol: 'RAVECAT' } } } }).megaWinCount, 0);
+  // An absurd multiplier on a memecoin is usually a mispriced first trade.
+  assert.equal(countMegaWins({ alpha: { awarded: { a: { multiplier: 900 } } } }).megaWinCount, 0);
+  assert.equal(countMegaWins({}).megaWinCount, 0);
+  assert.equal(countMegaWins(null).megaWinCount, 0);
+  assert.deepEqual(
+    countMegaWins({ alpha: { awarded: { a: { multiplier: 60, symbol: 'X' } } } }).megaWins,
+    [{ multiplier: 60, symbol: 'X', at: null }]
+  );
+  // The band is configurable.
+  assert.equal(
+    countMegaWins({ alpha: { awarded: { t: { multiplier: 42 } } } }, { minMultiplier: 40 }).megaWinCount,
+    1
+  );
+});
+
+test('an Alpha Hunter skips the win-rate rules but NOT the money rule', () => {
+  // The point of the override: a hunter who takes many small losses between
+  // runners fails a win-rate floor while being exactly the wallet to follow.
+  const hunter = {
+    address: 'H', winRatePct: 10, gradedBuys: 0, lifetimeTrades: 2,
+    megaWinCount: 2, megaWins: [{ multiplier: 60 }, { multiplier: 80 }],
+    onChain: { winRatePct: 12, trades: 3, netSol: 44 },
+  };
+  const promoted = applyEliteRules([hunter], RULES5);
+  assert.equal(promoted.qualified.length, 1);
+  assert.equal(promoted.qualified[0].fastTracked, true);
+  const checks = promoted.evaluated[0].checks;
+  assert.equal(checks.winRate, true, 'waived');
+  assert.equal(checks.onChainWinRate, true, 'waived');
+  assert.equal(checks.sample, true, 'waived');
+  assert.equal(checks.trades, true, 'waived');
+
+  // Rule 5 is NOT waived. A wallet that caught two 50x runners and is still net
+  // negative did not convert them.
+  const broke = { ...hunter, address: 'B', onChain: { ...hunter.onChain, netSol: -5 } };
+  assert.equal(applyEliteRules([broke], RULES5).qualified.length, 0);
+  assert.equal(applyEliteRules([broke], RULES5).evaluated[0].checks.netSol, false);
+
+  // One mega-win is not two.
+  assert.equal(applyEliteRules([{ ...hunter, megaWinCount: 1 }], RULES5).qualified.length, 0);
+  // Off unless configured.
+  assert.equal(
+    applyEliteRules([hunter], { ...RULES5, alphaHunterMegaWins: null }).qualified.length,
+    0,
+    'without the fast-track the hunter fails the win-rate floor'
+  );
+});
+
+test('Alpha Hunters lead the list, then everyone ranks by realized SOL', () => {
+  const hunter = { address: 'H', winRatePct: 10, gradedBuys: 0, lifetimeTrades: 2, megaWinCount: 2,
+    onChain: { winRatePct: 12, trades: 3, netSol: 1 } };
+  const rich = { ...solid, address: 'RICH', onChain: { winRatePct: 50, trades: 40, netSol: 90 } };
+  const poor = { ...solid, address: 'POOR', onChain: { winRatePct: 99, trades: 40, netSol: 2 } };
+
+  const order = applyEliteRules([poor, rich, hunter], RULES5).qualified.map((c) => c.address);
+  assert.equal(order[0], 'H', 'the hunter leads despite a 12% rate — it was exempted from that number');
+  assert.deepEqual(order.slice(1), ['RICH', 'POOR'], 'then by realized SOL, not by win rate');
+});
+
+test('/whales renders an Alpha Hunter as one, not as a win rate', async () => {
+  const out = await handleCommand({
+    command: 'whales',
+    args: [],
+    deps: {
+      loadConfig: async () => ({}),
+      loadWhales: async () => ({
+        generated: {},
+        wallets: [{
+          address: 'HunterWa11etAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+          label: 'Alpha Hunter (Spotted 2+ 50X-500X Gems Early)',
+          alpha_hunter: true, mega_wins: 2, mega_win_detail: ['60x MOON', '80x DOGE'],
+          all_time_win_rate: '12%', all_time_wins: 3, all_time_trades: 25,
+          all_time_net_sol: 44.2, all_time_complete: false,
+        }],
+      }),
+    },
+  });
+  assert.match(out, /<b>ALPHA HUNTER<\/b> — 2 mega-runner\(s\) caught early \(60x MOON, 80x DOGE\)/);
+  assert.match(out, /\+44\.2 SOL realized/);
+  // The low rate is still shown — the wallet was exempted from it, not cleared
+  // of it — but it no longer leads the row.
+  assert.match(out, /12% ALL-TIME WR/);
+  assert.ok(out.indexOf('ALPHA HUNTER') < out.indexOf('12% ALL-TIME WR'));
 });
 
 /* ------------------------------------------------------------------ *
