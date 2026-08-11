@@ -1247,8 +1247,10 @@ function whalesReport(whales, config = {}) {
     '',
   ];
 
-  const CAVEAT =
-    '<i>READ THE SAMPLE SIZE. These rates are computed over Aegis-observed buys only — not the wallets’ market-wide records — and the list is selected at a 75% bar over as few as 3 graded buys, which forces the top entries to read 100%. That is the threshold, not proof of edge. Estimated P&amp;L assumes the wallet still holds; Aegis never observes exits. Tap GMGN or Birdeye for real lifetime figures.</i>';
+  const anyAllTime = entries.some((w) => w.all_time_win_rate);
+  const CAVEAT = anyAllTime
+    ? '<i>ALL-TIME WR is the wallet’s own realized record from chain: every buy and sell of each token netted in SOL, a win being more SOL out than in. The "observed" figure beside it is Aegis’s view of the few buys it witnessed and reads far higher — measured across this list, observed rates of 75-100% corresponded to true on-chain rates of 8-63%. Trust the all-time number. [recent history] marks a wallet whose history hit the page cap, where the figures cover its most recent swaps rather than its whole career.</i>'
+    : '<i>READ THE SAMPLE SIZE. These rates are computed over Aegis-observed buys only — not the wallets’ market-wide records — and the list is selected at a 75% bar over as few as 3 graded buys, which forces the top entries to read 100%. That is the threshold, not proof of edge. Estimated P&amp;L assumes the wallet still holds; Aegis never observes exits. Tap GMGN or Birdeye for real lifetime figures.</i>';
 
   // Rows are fitted to a CHARACTER BUDGET rather than a fixed count, and the
   // caveat's cost is reserved before the first row is added.
@@ -1267,9 +1269,25 @@ function whalesReport(whales, config = {}) {
   for (const w of entries) {
     const short = `${w.address.slice(0, 6)}…${w.address.slice(-4)}`;
     const graded = w.graded_buys ?? w.trades ?? null;
+
+    // The TRUE on-chain rate leads when it exists. It is the wallet's own
+    // realized record; `win_rate` beside it is Aegis's observation of a handful
+    // of buys and reads far higher — measured 100% observed against 27% on
+    // chain for the same wallet. Leading with the observed number was the
+    // report telling its most flattering truth first.
+    const allTime =
+      w.all_time_win_rate && w.all_time_trades
+        ? `<b>${esc(String(w.all_time_win_rate))} ALL-TIME WR</b> (${esc(String(w.all_time_wins ?? '?'))} Wins / ${esc(String(w.all_time_trades))} Trades)` +
+          (w.all_time_complete === false ? ' <i>[recent history]</i>' : '')
+        : null;
+
     const bits = [
-      w.win_rate ? `<b>${esc(String(w.win_rate))}</b> win rate` : null,
-      graded !== null ? `${esc(String(graded))} graded buy(s)` : null,
+      allTime,
+      w.all_time_net_sol !== undefined && w.all_time_net_sol !== null
+        ? `${w.all_time_net_sol >= 0 ? '+' : ''}${esc(String(w.all_time_net_sol))} SOL realized`
+        : null,
+      // Kept, but demoted and labelled, so the two can never be confused.
+      w.win_rate ? `${esc(String(w.win_rate))} observed${graded !== null ? ` on ${esc(String(graded))}` : ''}` : null,
       w.net_profit_usd ? `${esc(String(w.net_profit_usd))} P&amp;L` : null,
       w.onchain_signatures ? `${esc(String(w.onchain_signatures))} sigs` : null,
     ].filter(Boolean);

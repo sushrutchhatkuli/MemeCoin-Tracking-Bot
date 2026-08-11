@@ -56,6 +56,13 @@ export const ELITE_RULES = {
   // A win rate over 2 graded trades is noise. Without a floor, the first wallet
   // to catch one pump would enter the list at 100%.
   minGradedBuys: 10,
+  // Rule 4, OFF by default. Null means "do not enforce", so a config that has
+  // not opted in keeps exactly the previous three-rule behaviour rather than
+  // emptying the watchlist on upgrade.
+  minAllTimeWinRatePct: null,
+  minAllTimeTrades: 15,
+  maxHistoryPages: 12,
+  dustTradeSol: 0.05,
 };
 
 /**
@@ -85,6 +92,20 @@ export function applyEliteRules(candidates, rules = ELITE_RULES) {
         ? true
         : c.netProfitUsd !== null && c.netProfitUsd >= rules.minNetProfitUsd,
       trades: c.lifetimeTrades !== null && c.lifetimeTrades >= rules.minLifetimeTrades,
+      // Rule 4 — the true on-chain rate, over its own minimum sample.
+      //
+      // Enforced only when a floor is configured, so an operator who has not
+      // opted in keeps the previous three-rule behaviour. UNMEASURED IS A
+      // FAILURE when the rule is on: a wallet whose history could not be read
+      // is not a wallet with a good record, and this rule exists precisely
+      // because the observed rate it sits beside is too generous.
+      onChainWinRate:
+        !rules.minAllTimeWinRatePct
+          ? true
+          : c.onChain?.winRatePct !== null &&
+            c.onChain?.winRatePct !== undefined &&
+            c.onChain.winRatePct >= rules.minAllTimeWinRatePct &&
+            (c.onChain.trades ?? 0) >= (rules.minAllTimeTrades ?? 0),
     };
     return { ...c, checks, qualified: Object.values(checks).every(Boolean) };
   });
@@ -126,11 +147,24 @@ export function buildWatchlist(qualified, { source, rules }) {
         ? 'net profit rule SKIPPED (lifetime realized P&L is not derivable from observation),'
         : `net profit >= $${rules.minNetProfitUsd.toLocaleString('en-US')},`,
       `on-chain activity >= ${rules.minLifetimeTrades} signatures.`,
+      ...(rules.minAllTimeWinRatePct
+        ? [
+            `TRUE ON-CHAIN win rate >= ${rules.minAllTimeWinRatePct}% over >= ${rules.minAllTimeTrades ?? 0} closed round trips.`,
+          ]
+        : []),
       `Selected top ${rules.topN} by win rate, then sample size.`,
       '',
-      'READ THE SAMPLE SIZE. A 100% win rate over 3 graded buys is not evidence',
-      'of edge — it is three trades. `graded_buys` is the number that matters',
-      'and it should grow over time; the win rate will fall as it does.',
+      'TWO WIN RATES LIVE IN THIS FILE AND THEY MEAN DIFFERENT THINGS.',
+      '`win_rate` is OBSERVED: computed over the handful of buys Aegis happened',
+      'to witness, graded by its own post-mortem, and biased upward because',
+      'buyer replay only reads tokens with a live pool.',
+      '`all_time_win_rate` is the wallet’s own realized record, netting every',
+      'buy and sell of each token from chain. Measured on 2026-08-10, the top',
+      'wallet here read 100% observed over 3 graded buys and 27% on-chain over',
+      '11 closed trades. Trust the second one.',
+      '',
+      '`all_time_complete: false` means the history hit the page cap, so those',
+      'figures describe the most recent swaps rather than the whole career.',
     ],
     generated: {
       at: new Date().toISOString(),
@@ -145,11 +179,29 @@ export function buildWatchlist(qualified, { source, rules }) {
         // the number is an artifact of observed spend (often single dollars) and
         // putting it next to "Elite Whale" reads as a credential it has not
         // earned.
-        label: profitSkipped
-          ? `Elite Whale #${i + 1} (${w.winRatePct.toFixed(0)}% WR on ${w.gradedBuys ?? '?'} graded)`
-          : `Elite Whale #${i + 1} (${w.winRatePct.toFixed(0)}% WR | ${money(w.netProfitUsd)})`,
+        // The label leads with the ON-CHAIN rate when there is one, because
+        // that is the trustworthy number. The observed rate stays in the entry
+        // but stops being the headline.
+        label: w.onChain?.winRatePct !== null && w.onChain?.winRatePct !== undefined
+          ? `Elite Whale #${i + 1} (${w.onChain.winRatePct.toFixed(0)}% all-time WR on ${w.onChain.trades} trades)`
+          : profitSkipped
+            ? `Elite Whale #${i + 1} (${w.winRatePct.toFixed(0)}% WR on ${w.gradedBuys ?? '?'} graded)`
+            : `Elite Whale #${i + 1} (${w.winRatePct.toFixed(0)}% WR | ${money(w.netProfitUsd)})`,
         win_rate: `${w.winRatePct.toFixed(0)}%`,
         graded_buys: w.gradedBuys ?? null,
+        // Rule 4's figures, kept as separate fields so nothing can confuse the
+        // observed rate with the on-chain one. `all_time_complete` is false
+        // when the history hit maxHistoryPages, in which case these describe
+        // the most recent N swaps rather than the wallet's career.
+        ...(w.onChain?.winRatePct !== null && w.onChain?.winRatePct !== undefined
+          ? {
+              all_time_win_rate: `${w.onChain.winRatePct.toFixed(0)}%`,
+              all_time_wins: w.onChain.wins,
+              all_time_trades: w.onChain.trades,
+              all_time_net_sol: Number(w.onChain.netSol.toFixed(3)),
+              all_time_complete: w.onChain.complete === true,
+            }
+          : {}),
         // getSignaturesForAddress caps at 1000, so an exact 1000 means "at least
         // 1000" — and these are signatures, not trades. Naming it accurately
         // stops it being read as a verified trade count.
@@ -402,6 +454,233 @@ export async function deriveRealizedPnl(wallet, { heliusKey, solUsd, cfg = {} })
     truncated,
     basis: swapsOnly ? 'net SOL through SWAP transactions' : 'net SOL across all transactions',
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * True on-chain win rate
+ * ------------------------------------------------------------------ *
+ *
+ * A win rate computed from the wallet's own realized SOL, not from Aegis's
+ * observations. Every buy and sell of a token is netted; a token the wallet got
+ * more SOL out of than it put in is a WIN.
+ *
+ * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+ * The observed win rate in smart_wallets.json is computed over the handful of
+ * buys Aegis happened to witness, graded by its own post-mortem, and the sample
+ * skews optimistic because buyer replay only reads tokens with a live pool. The
+ * file's own header says so. MEASURED on 2026-08-10 against the top watchlist
+ * wallet: observed 100% over 3 graded buys, true on-chain 27% over 11 closed
+ * positions. The two numbers are not close, and the optimistic one was the one
+ * being used to rank.
+ *
+ * ── THE SOL DELTA MUST COME FROM accountData ────────────────────────────────
+ * Not from nativeTransfers, which is the obvious place and is WRONG. Measured
+ * on a real pump.fun sell: the wallet's nativeTransfers contained only fee
+ * outflows (-0.0154, -0.0015) while the 1.5 SOL of sale proceeds appeared
+ * nowhere in them. Computing the delta that way makes every sell look like
+ * another buy, so no position ever closes — a first cut of this scored 62 mints
+ * with ZERO closed positions and would have reported "no win rate available"
+ * forever. `accountData[].nativeBalanceChange` is the wallet's true net lamport
+ * change and shows +1.5034 on that same transaction.
+ *
+ * ── "ALL-TIME" IS BOUNDED, AND SAYS SO ──────────────────────────────────────
+ * Full history is not affordable. Measured: four watchlist wallets held 51,979
+ * signatures between them (one hit a 25-page cap with more beyond), which at
+ * one getTransaction each is ~2.6 MILLION calls for a 200-wallet shortlist —
+ * days of RPC per two-hour sync.
+ *
+ * Helius's parsed-history endpoint returns 100 fully-parsed transactions per
+ * call instead of one, which is what makes this feasible at all: ~7s and 11
+ * calls for 1,100 transactions. maxHistoryPages bounds it further. A wallet
+ * whose history fits inside the cap is genuinely all-time and reports
+ * `complete: true`; a busier one is its most recent N trades and reports false.
+ * The distinction is carried into the watchlist file and the Telegram report,
+ * because "70% all-time" and "70% over the last 1,100 swaps" are different
+ * claims.
+ */
+
+const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+const LAMPORTS_PER_SOL = 1e9;
+
+/**
+ * Realized win rate from parsed transactions. PURE — no network, so it can be
+ * verified against recorded shapes.
+ *
+ * A "trade" is a CLOSED ROUND TRIP in one token: SOL went out and SOL came
+ * back. A position still open is neither a win nor a loss and is excluded from
+ * both sides of the ratio — counting open positions as losses would punish a
+ * wallet for still holding, and as wins would be worse.
+ */
+export function computeOnChainWinRate(transactions, { address, dustSol = 0.05 } = {}) {
+  const perMint = new Map();
+  let swapLegs = 0;
+  let dustSkipped = 0;
+  let ambiguous = 0;
+
+  for (const tx of transactions ?? []) {
+    if (!tx || tx.transactionError || tx.type !== 'SWAP') continue;
+
+    // Non-WSOL tokens this wallet actually moved. WSOL is excluded because it
+    // is the SOL side of the swap wearing a token's clothes — counting it as a
+    // position would make every trade look like a WSOL round trip.
+    const moved = (tx.tokenTransfers ?? []).filter(
+      (t) => (t.fromUserAccount === address || t.toUserAccount === address) && t.mint !== WSOL_MINT
+    );
+    if (!moved.length) continue;
+
+    const mints = [...new Set(moved.map((t) => t.mint))];
+    // A multi-token swap cannot be attributed to one position from balances
+    // alone. Counted and reported rather than guessed at.
+    if (mints.length !== 1) { ambiguous++; continue; }
+
+    const account = (tx.accountData ?? []).find((a) => a.account === address);
+    const netSol = (account?.nativeBalanceChange ?? 0) / LAMPORTS_PER_SOL;
+
+    // Dust filter. Fee-only legs and micro-trades say nothing about skill and
+    // would dominate the count on a wallet that farms airdrops.
+    if (Math.abs(netSol) < dustSol) { dustSkipped++; continue; }
+
+    swapLegs++;
+    const entry = perMint.get(mints[0]) ?? { solOut: 0, solIn: 0, legs: 0 };
+    if (netSol < 0) entry.solOut += -netSol;
+    else entry.solIn += netSol;
+    entry.legs++;
+    perMint.set(mints[0], entry);
+  }
+
+  const closed = [...perMint.entries()]
+    .filter(([, e]) => e.solOut > 0 && e.solIn > 0)
+    .map(([mint, e]) => ({ mint, ...e, netSol: e.solIn - e.solOut }));
+
+  const wins = closed.filter((c) => c.netSol > 0);
+
+  return {
+    trades: closed.length,
+    wins: wins.length,
+    losses: closed.length - wins.length,
+    winRatePct: closed.length ? (wins.length / closed.length) * 100 : null,
+    netSol: closed.reduce((a, c) => a + c.netSol, 0),
+    swapLegs,
+    dustSkipped,
+    ambiguous,
+    openPositions: perMint.size - closed.length,
+    dustSol,
+  };
+}
+
+/**
+ * Paginated parsed history for one wallet.
+ *
+ * The `type=SWAP` query parameter is deliberately NOT used: it truncates. An
+ * unfiltered page of this wallet returned 707 swaps out of 800 transactions,
+ * while the same request with type=SWAP stopped after 80 and reported itself
+ * complete. Filtering happens client-side in computeOnChainWinRate.
+ */
+export async function fetchWalletHistory(
+  address,
+  { heliusKey, maxPages = 12, timeoutMs = 30_000, pageDelayMs = 120, retries = 3, retryDelayMs = 1_500 } = {}
+) {
+  if (!heliusKey) return { ok: false, error: 'no Helius key', transactions: [], complete: false, pages: 0 };
+
+  const transactions = [];
+  let before = null;
+  let pages = 0;
+
+  // RETRIES ARE LOAD-BEARING, not defensive. Measured while building this:
+  // replaying 19 wallets back to back, 14 of them returned HTTP 200 with an
+  // EMPTY array — and retried individually with a 2s pause, the same wallets
+  // returned 100 transactions each. Without a retry the enrichment silently
+  // reports "no closed history" for a wallet that has plenty, and under Rule 4
+  // unmeasured is a failure, so a transient throttle would quietly delete
+  // wallets from the watchlist. enrichLifetimeTrades carries a note about
+  // exactly this failure mode; this is the same trap one endpoint over.
+  while (pages < maxPages) {
+    const url =
+      `https://api.helius.xyz/v0/addresses/${encodeURIComponent(address)}/transactions` +
+      `?api-key=${encodeURIComponent(heliusKey)}&limit=100${before ? `&before=${before}` : ''}`;
+
+    let batch = null;
+    let lastError = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, retryDelayMs * attempt));
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+        if (!res.ok) { lastError = `HTTP ${res.status}`; continue; }
+        const body = await res.json();
+        if (!Array.isArray(body)) { lastError = 'non-array response'; continue; }
+        // An empty FIRST page is the ambiguous case: it is either a wallet with
+        // no history or a throttle answering 200. Retried rather than believed,
+        // and only accepted once the retries are spent.
+        if (!body.length && pages === 0 && attempt < retries) { lastError = 'empty first page'; continue; }
+        batch = body;
+        break;
+      } catch (err) {
+        lastError = err.message;
+      }
+    }
+
+    if (batch === null) {
+      return { ok: pages > 0, error: lastError, transactions, complete: false, pages };
+    }
+    if (!batch.length) break;
+
+    transactions.push(...batch);
+    pages++;
+    before = batch[batch.length - 1]?.signature;
+    // A short page is the end of the wallet's history — the only way to know
+    // the window is genuinely all-time rather than merely capped.
+    if (batch.length < 100) return { ok: true, transactions, complete: true, pages };
+    if (pageDelayMs) await new Promise((r) => setTimeout(r, pageDelayMs));
+  }
+
+  return { ok: true, transactions, complete: pages < maxPages, pages };
+}
+
+/** Attach the true on-chain win rate to each candidate. Mutates in place. */
+async function enrichOnChainWinRate(candidates, { heliusKey, cfg }) {
+  if (!heliusKey) {
+    console.log('   No Helius API key — true on-chain win rate cannot be derived');
+    return { derived: 0, failed: candidates.length };
+  }
+  const maxPages = cfg?.maxHistoryPages ?? 12;
+  const dustSol = cfg?.dustTradeSol ?? 0.05;
+  let derived = 0;
+  let failed = 0;
+  let partial = 0;
+
+  for (const c of candidates) {
+    const history = await fetchWalletHistory(c.address, {
+      heliusKey,
+      maxPages,
+      pageDelayMs: cfg?.historyPageDelayMs ?? 120,
+    });
+    if (!history.ok || !history.transactions.length) {
+      failed++;
+      // Recorded so a wallet dropped by Rule 4 can be distinguished from one
+      // that genuinely has a bad record.
+      c.onChain = { winRatePct: null, trades: 0, unavailable: history.error ?? 'no history returned' };
+      continue;
+    }
+
+    const wr = computeOnChainWinRate(history.transactions, { address: c.address, dustSol });
+    c.onChain = { ...wr, complete: history.complete, pagesRead: history.pages };
+    if (wr.winRatePct !== null) {
+      derived++;
+      if (!history.complete) partial++;
+      c.basis +=
+        `; on-chain ${wr.winRatePct.toFixed(0)}% over ${wr.trades} closed trade(s)` +
+        `${history.complete ? ' (all-time)' : ` (most recent ${wr.swapLegs} swap legs, history truncated)`}`;
+    } else {
+      failed++;
+    }
+  }
+
+  console.log(
+    `   ↳ on-chain win rate derived for ${derived}/${candidates.length} wallet(s)` +
+      (partial ? `, ${partial} from a truncated history` : '') +
+      (failed ? `, ${failed} with too little closed history` : '')
+  );
+  return { derived, failed, partial };
 }
 
 /** Attach derived PnL to each candidate. Mutates in place, like enrichment. */
@@ -717,6 +996,38 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
         cfg: config.eliteWhales ?? {},
       });
     }
+
+    // Rule 4, LAST and on the SURVIVORS ONLY.
+    //
+    // The rules are AND, so a wallet already failing Rule 1 or 3 can never
+    // qualify however good its on-chain record is — replaying its history buys
+    // a number nothing will read. This ordering is not a micro-optimisation:
+    // measured at ~10s per wallet, running it across the full 200-wallet
+    // shortlist took the sync past 20 minutes, and eliteWhales.syncIntervalHours
+    // is 2 with the sync running inside the maintenance loop. The
+    // enrichShortlistCap note records what happened last time per-wallet work
+    // was allowed to dominate that loop: 468 skipped ticks.
+    //
+    // Rules 1 and 3 are evaluated here rather than reused from applyEliteRules
+    // because that function needs Rule 4's input to run at all — this is the
+    // same pre-filter, applied early, to decide who is worth measuring.
+    if (rules.minAllTimeWinRatePct) {
+      const heliusKey = (String(config.rpcUrl ?? '').match(/api-key=([\w-]+)/) ?? [])[1] ?? null;
+      const contenders = shortlist.filter(
+        (c) =>
+          c.winRatePct !== null &&
+          c.winRatePct >= rules.minWinRatePct &&
+          (c.gradedBuys ?? 0) >= (rules.minGradedBuys ?? 0) &&
+          c.lifetimeTrades !== null &&
+          c.lifetimeTrades >= rules.minLifetimeTrades
+      );
+      console.log(
+        `   ↳ replaying on-chain history for ${contenders.length} of ${shortlist.length} wallet(s) ` +
+          `— only those already passing rules 1-3 can qualify ` +
+          `(floor ${rules.minAllTimeWinRatePct}% over ${rules.minAllTimeTrades ?? 0}+ trades)…`
+      );
+      await enrichOnChainWinRate(contenders, { heliusKey, cfg: config.eliteWhales ?? {} });
+    }
   }
 
   // Anything flagged during screening cannot qualify, regardless of its stats.
@@ -850,6 +1161,13 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     return { qualified, evaluated, written: false };
   }
 
+  // NOTE: an empty result never reaches here. The `!qualified.length` branch
+  // above returns first, leaving smart_wallets.json untouched — which is the
+  // behaviour that matters when a rule is tightened, since a watchlist
+  // overwritten with zero wallets does not fail loudly. matchSmartMoney would
+  // simply stop matching and the scanner would go quiet for a reason nothing
+  // reports. A second guard was written here before that path was traced; it
+  // was unreachable and is not worth the code.
   const watchlist = buildWatchlist(qualified, { source, rules });
   if (!dryRun) {
     await writeFile(

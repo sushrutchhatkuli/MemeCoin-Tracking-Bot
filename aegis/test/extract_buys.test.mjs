@@ -93,7 +93,7 @@ import {
   mergeCandidates,
   websocketUrlFor,
 } from '../discovery_daemon.mjs';
-import { capEnrichmentShortlist } from '../auto_top_whales.mjs';
+import { capEnrichmentShortlist, computeOnChainWinRate, applyEliteRules, ELITE_RULES } from '../auto_top_whales.mjs';
 import { extractMints, channelMatches, SeenCache } from '../telegram_listener.mjs';
 
 const MINT = 'MintAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -2286,6 +2286,186 @@ test('end to end: a single-buy token cannot reach EARLY-STAGE INSIDER SCALP', ()
 });
 
 /* ------------------------------------------------------------------ *
+ * True on-chain win rate
+ *
+ * The load-bearing detail is that the SOL delta comes from accountData, not
+ * nativeTransfers. On a real pump.fun sell the wallet's nativeTransfers hold
+ * only fee outflows while the sale proceeds appear nowhere in them, so the
+ * obvious implementation makes every sell look like another buy and no position
+ * ever closes.
+ * ------------------------------------------------------------------ */
+
+const TRADER = 'TraderWa11etAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+const WSOL_M = 'So11111111111111111111111111111111111111112';
+
+/** A parsed Helius SWAP in the shape the endpoint actually returns. */
+const swapTx = ({ mint, tokenOut = false, netSol, fees = -0.0015, err = null, extraMints = [] }) => ({
+  type: 'SWAP',
+  transactionError: err,
+  tokenTransfers: [
+    {
+      mint,
+      tokenAmount: 1000,
+      fromUserAccount: tokenOut ? TRADER : 'Pool',
+      toUserAccount: tokenOut ? 'Pool' : TRADER,
+    },
+    ...extraMints.map((m) => ({ mint: m, tokenAmount: 1, fromUserAccount: TRADER, toUserAccount: 'Pool' })),
+  ],
+  // Deliberately misleading, exactly like the real thing: on a sell these carry
+  // only fees, never the proceeds.
+  nativeTransfers: [{ fromUserAccount: TRADER, toUserAccount: 'Fee', amount: Math.abs(fees) * 1e9 }],
+  accountData: [{ account: TRADER, nativeBalanceChange: netSol * 1e9 }],
+});
+
+test('a closed round trip that returned more SOL than it cost is a win', () => {
+  const r = computeOnChainWinRate(
+    [
+      swapTx({ mint: 'TokenA', netSol: -1.0 }),
+      swapTx({ mint: 'TokenA', tokenOut: true, netSol: 2.5 }),
+    ],
+    { address: TRADER }
+  );
+  assert.equal(r.trades, 1);
+  assert.equal(r.wins, 1);
+  assert.equal(r.winRatePct, 100);
+  assert.equal(Number(r.netSol.toFixed(2)), 1.5);
+});
+
+test('the SOL delta is read from accountData, not nativeTransfers', () => {
+  // The sell's nativeTransfers show only a fee outflow. If that were the source,
+  // the leg would read as another BUY, the position would never close, and the
+  // wallet would report "no win rate" forever — which is what the first cut of
+  // this did across 62 mints.
+  const sell = swapTx({ mint: 'TokenA', tokenOut: true, netSol: 1.5 });
+  assert.ok(sell.nativeTransfers.every((n) => n.fromUserAccount === TRADER), 'fixture matches reality');
+
+  const r = computeOnChainWinRate([swapTx({ mint: 'TokenA', netSol: -0.5 }), sell], { address: TRADER });
+  assert.equal(r.trades, 1, 'the position closed');
+  assert.equal(r.wins, 1);
+});
+
+test('an open position is neither a win nor a loss', () => {
+  // Counting it as a loss punishes a wallet for still holding; as a win is worse.
+  const r = computeOnChainWinRate([swapTx({ mint: 'TokenA', netSol: -1.0 })], { address: TRADER });
+  assert.equal(r.trades, 0);
+  assert.equal(r.winRatePct, null);
+  assert.equal(r.openPositions, 1);
+});
+
+test('dust legs, failed transactions and WSOL are excluded', () => {
+  const txs = [
+    swapTx({ mint: 'TokenA', netSol: -0.01 }), // under the 0.05 dust floor
+    swapTx({ mint: 'TokenB', netSol: -1.0, err: { InstructionError: [0, 'X'] } }),
+    { type: 'TRANSFER', tokenTransfers: [], accountData: [] },
+    swapTx({ mint: WSOL_M, netSol: -5 }), // the SOL side wearing a token's clothes
+  ];
+  const r = computeOnChainWinRate(txs, { address: TRADER });
+  assert.equal(r.swapLegs, 0);
+  assert.equal(r.dustSkipped, 1);
+  assert.equal(r.trades, 0);
+
+  // The floor is configurable and inclusive-exclusive at the boundary.
+  assert.equal(computeOnChainWinRate([swapTx({ mint: 'T', netSol: -0.05 })], { address: TRADER }).swapLegs, 1);
+  assert.equal(
+    computeOnChainWinRate([swapTx({ mint: 'T', netSol: -0.5 })], { address: TRADER, dustSol: 1 }).dustSkipped,
+    1
+  );
+});
+
+test('a multi-token swap is counted as ambiguous, never attributed', () => {
+  // SOL cannot be split between two positions from balances alone.
+  const r = computeOnChainWinRate(
+    [swapTx({ mint: 'TokenA', netSol: -1, extraMints: ['TokenB'] })],
+    { address: TRADER }
+  );
+  assert.equal(r.ambiguous, 1);
+  assert.equal(r.swapLegs, 0);
+  assert.equal(r.trades, 0);
+});
+
+test('losses and mixed records compute correctly', () => {
+  const r = computeOnChainWinRate(
+    [
+      swapTx({ mint: 'Win1', netSol: -1 }), swapTx({ mint: 'Win1', tokenOut: true, netSol: 3 }),
+      swapTx({ mint: 'Loss1', netSol: -2 }), swapTx({ mint: 'Loss1', tokenOut: true, netSol: 0.5 }),
+      swapTx({ mint: 'Loss2', netSol: -1 }), swapTx({ mint: 'Loss2', tokenOut: true, netSol: 0.9 }),
+    ],
+    { address: TRADER }
+  );
+  assert.equal(r.trades, 3);
+  assert.equal(r.wins, 1);
+  assert.equal(r.losses, 2);
+  assert.equal(Math.round(r.winRatePct), 33);
+  assert.equal(Number(r.netSol.toFixed(2)), 0.4);
+});
+
+test('empty and malformed input yields no rate rather than a zero', () => {
+  for (const input of [[], null, undefined]) {
+    const r = computeOnChainWinRate(input, { address: TRADER });
+    assert.equal(r.winRatePct, null, String(input));
+    assert.equal(r.trades, 0);
+  }
+});
+
+test('Rule 4 blocks a wallet under the floor and is off unless configured', () => {
+  const base = { address: 'W', winRatePct: 100, gradedBuys: 5, lifetimeTrades: 500, netProfitUsd: 1 };
+  const rules = { ...ELITE_RULES, minWinRatePct: 75, minGradedBuys: 3, minLifetimeTrades: 100, profitRule: 'skip' };
+
+  // Off by default: a config that has not opted in keeps the old behaviour
+  // rather than emptying the watchlist on upgrade.
+  assert.equal(applyEliteRules([base], rules).qualified.length, 1);
+
+  const strict = { ...rules, minAllTimeWinRatePct: 70, minAllTimeTrades: 15 };
+  assert.equal(
+    applyEliteRules([{ ...base, onChain: { winRatePct: 63, trades: 89 } }], strict).qualified.length,
+    0,
+    '63% is the best rate measured on the real list and still fails 70'
+  );
+  assert.equal(
+    applyEliteRules([{ ...base, onChain: { winRatePct: 71, trades: 20 } }], strict).qualified.length,
+    1
+  );
+  // Sample floor bites independently of the rate.
+  assert.equal(
+    applyEliteRules([{ ...base, onChain: { winRatePct: 100, trades: 14 } }], strict).qualified.length,
+    0
+  );
+  // UNMEASURED IS A FAILURE. A wallet whose history could not be read is not a
+  // wallet with a good record — this rule exists because the number beside it
+  // is too generous.
+  for (const onChain of [undefined, { winRatePct: null, trades: 0 }]) {
+    assert.equal(applyEliteRules([{ ...base, onChain }], strict).qualified.length, 0, JSON.stringify(onChain));
+  }
+});
+
+test('/whales leads with the all-time rate and labels the observed one', async () => {
+  const out = await handleCommand({
+    command: 'whales',
+    args: [],
+    deps: {
+      loadConfig: async () => ({}),
+      loadWhales: async () => ({
+        generated: {},
+        wallets: [
+          {
+            address: 'F5Hrs3fTxA6cPsdYa1r2zazymsetbFpXpzEuQWXPNusu',
+            win_rate: '100%', graded_buys: 3,
+            all_time_win_rate: '29%', all_time_wins: 29, all_time_trades: 101,
+            all_time_net_sol: -67.4, all_time_complete: false,
+          },
+        ],
+      }),
+    },
+  });
+
+  assert.match(out, /<b>29% ALL-TIME WR<\/b> \(29 Wins \/ 101 Trades\)/);
+  assert.match(out, /\[recent history\]/, 'a truncated history is marked');
+  assert.match(out, /-67\.4 SOL realized/);
+  assert.match(out, /100% observed on 3/, 'the observed rate is kept but demoted and labelled');
+  assert.match(out, /observed rates of 75-100% corresponded to true on-chain rates of 8-63%/);
+});
+
+/* ------------------------------------------------------------------ *
  * 1-tap wallet profile links
  * ------------------------------------------------------------------ */
 
@@ -3956,8 +4136,13 @@ test('/whales lists the watchlist with win rates and their sample sizes', async 
   assert.doesNotMatch(out, /7ztfru/, 'enabled:false stays off the list');
 
   assert.match(out, /F5Hrs3…Nusu/);
-  assert.match(out, /<b>100%<\/b> win rate · 3 graded buy\(s\)/);
-  assert.match(out, /<b>75%<\/b> win rate · 4 graded buy\(s\)/);
+  // The observed rate is DEMOTED and labelled: unbolded, and explicitly marked
+  // "observed" so it cannot be mistaken for the wallet's realized record. It was
+  // the bolded headline until the on-chain rate showed the same wallets at
+  // 8-63% rather than 75-100%.
+  assert.match(out, /100% observed on 3/);
+  assert.match(out, /75% observed on 4/);
+  assert.doesNotMatch(out, /<b>100%<\/b> win rate/, 'no longer the headline');
   assert.match(out, /list rebuilt 1\.5h ago/);
   assert.match(out, /solscan\.io\/account\/F5Hrs3/);
   assert.match(out, /gmgn\.ai/);
