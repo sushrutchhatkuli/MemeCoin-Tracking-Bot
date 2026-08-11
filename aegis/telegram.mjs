@@ -164,6 +164,64 @@ export function executionLinks(address, chain, tradeLink, size = null) {
   return links;
 }
 
+/* ------------------------------------------------------------------ *
+ * Wallet profile links
+ * ------------------------------------------------------------------ *
+ *
+ * ONE definition, used by /whales, the insider roster, the whale block and the
+ * candidate swarm. Before this there were four, and they had already drifted:
+ * the insider block offered three destinations but only for the lead wallet,
+ * while the whale and swarm blocks offered Solscan alone. A wallet you could
+ * check the P&L of depended on which block it happened to render in.
+ *
+ * GMGN LEADS DELIBERATELY. It is the destination that answers the question
+ * someone taps a wallet to ask — live P&L and holdings — and Aegis cannot fetch
+ * those itself (403 Cloudflare, documented in the networkDiscovery notes). The
+ * link is the whole mechanism for that data, so it goes first.
+ *
+ * ── ON MEME TERMINAL ────────────────────────────────────────────────────────
+ * Requested as `https://memeterminal.com/solana/wallet/<wallet>` and NOT shipped
+ * enabled, because the domain is not a product. Measured 2026-08-10: every path
+ * on memeterminal.com returns an identical 114-byte document whose only content
+ * is a redirect to /lander, and /lander is a GoDaddy "memeterminal.com is for
+ * sale" page. The wallet route does not exist; a tap from a phone lands on a
+ * domain listing.
+ *
+ * It is left in config as a DISABLED entry rather than deleted, so if the
+ * intended product lives at another domain it is one edit away — change the url
+ * and set enabled. A dead link in an alert is worse than a missing one: it
+ * looks like a working feature until the moment you need it.
+ */
+export const DEFAULT_WALLET_PROFILES = [
+  { label: 'GMGN', url: 'https://gmgn.ai/sol/address/{wallet}', enabled: true },
+  { label: 'Solscan', url: 'https://solscan.io/account/{wallet}', enabled: true },
+  { label: 'Birdeye', url: 'https://birdeye.so/profile/{wallet}', enabled: true },
+];
+
+/** Configured profile destinations for one wallet. Pure. */
+export function walletProfileLinks(wallet, config = {}) {
+  if (typeof wallet !== 'string' || !wallet) return [];
+  const configured = config.telegram?.walletProfiles;
+  const profiles = Array.isArray(configured) && configured.length ? configured : DEFAULT_WALLET_PROFILES;
+
+  return profiles
+    .filter((p) => p?.enabled !== false && typeof p?.url === 'string' && p.url.includes('{wallet}') && p?.label)
+    .map((p) => ({ label: String(p.label), url: p.url.replaceAll('{wallet}', encodeURIComponent(wallet)) }));
+}
+
+/**
+ * The tappable link row.
+ *
+ * Rendered as separate anchors rather than one combined link because each is a
+ * distinct tap target — on a phone that is the difference between reaching GMGN
+ * in one tap and reaching it after a page load and a menu.
+ */
+export function renderProfileLinks(wallet, config = {}, { separator = ' · ' } = {}) {
+  const links = walletProfileLinks(wallet, config);
+  if (!links.length) return '';
+  return links.map((l) => `<a href="${esc(l.url)}">${esc(l.label)}</a>`).join(separator);
+}
+
 const usdShort = (n) => {
   if (n === null || n === undefined || Number.isNaN(n)) return '?';
   if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
@@ -300,7 +358,7 @@ function scorecardLines(sc) {
  * gate — coordinated buying of a rug is still a rug, so this never appears on a
  * blocked token.
  */
-function renderClusters(clusters) {
+function renderClusters(clusters, config = {}) {
   if (!clusters?.detected) return [];
 
   const count = clusters.insiderCount ?? 0;
@@ -350,10 +408,12 @@ function renderClusters(clusters) {
       m.secondsAfterLaunch !== null && m.secondsAfterLaunch !== undefined
         ? ` (${m.secondsAfterLaunch < 60 ? `${Math.round(m.secondsAfterLaunch)}s` : `${Math.round(m.secondsAfterLaunch / 60)}m`} after launch)`
         : '';
-    lines.push(
-      `• <b>Insider #${i + 1}</b> (${esc(m.short)}): ${esc(spend + mc + timing)} | ` +
-        `<a href="${esc(m.solscan)}">Solscan</a>`
-    );
+    lines.push(`• <b>Insider #${i + 1}</b> (${esc(m.short)}): ${esc(spend + mc + timing)}`);
+    // EVERY insider gets the full link row, not just the lead. Previously only
+    // wallet #1 had a P&L destination and the rest offered Solscan alone, which
+    // made "check the others" a manual copy-paste.
+    const links = renderProfileLinks(m.wallet, config);
+    if (links) lines.push(`   ${links}`);
     for (const row of scorecardLines(m.scorecard)) lines.push(row);
   });
 
@@ -379,17 +439,16 @@ function renderClusters(clusters) {
     }
   }
 
-  // Direct profile links for the lead wallet. Three destinations because each
-  // shows something different: Solscan for raw transactions, GMGN for trader
-  // stats, Birdeye for portfolio analytics. Aegis cannot read the latter two
-  // (403/401), so these are how you check win rate and PnL yourself.
+  // The lead wallet gets a labelled block as well as its inline row: it is the
+  // largest position and the one most likely to be checked first, so it is
+  // worth a target that does not require finding the right line.
   const lead = members[0];
   if (lead?.wallet) {
-    lines.push('');
-    lines.push('<b>DIRECT INSIDER WALLET LINKS:</b>');
-    lines.push(`• <a href="https://solscan.io/account/${esc(lead.wallet)}">Solscan Wallet</a>`);
-    lines.push(`• <a href="https://gmgn.ai/sol/address/${esc(lead.wallet)}">GMGN Trader Profile</a>`);
-    lines.push(`• <a href="https://birdeye.so/profile/${esc(lead.wallet)}">Birdeye Analytics</a>`);
+    const leadLinks = walletProfileLinks(lead.wallet, config);
+    if (leadLinks.length) {
+      lines.push('', `<b>LEAD INSIDER — ${esc(lead.short ?? '')} :</b>`);
+      for (const l of leadLinks) lines.push(`• <a href="${esc(l.url)}">${esc(l.label)}</a>`);
+    }
   }
 
   // Stated every time. A shared funder is frequently just a CEX hot wallet, and
@@ -403,7 +462,7 @@ function renderClusters(clusters) {
 }
 
 /** Whale detail block — only ever reached on a token that passed every gate. */
-function renderWhales(smartMoney) {
+function renderWhales(smartMoney, config = {}) {
   if (!smartMoney?.detected) return [];
 
   const lines = [
@@ -415,7 +474,10 @@ function renderWhales(smartMoney) {
   for (const w of smartMoney.matches) {
     const shortAddr = `${w.address.slice(0, 6)}…${w.address.slice(-4)}`;
     lines.push(`• Wallet: <code>${esc(shortAddr)}</code> (${esc(w.displayLabel)})`);
-    lines.push(`• Whale Profile: <a href="${esc(w.solscanUrl)}">solscan.io/account/${esc(shortAddr)}</a>`);
+    // Was Solscan alone. A matched whale is exactly the wallet whose live P&L
+    // you want before acting, and Solscan is the one destination that does not
+    // show it.
+    lines.push(`• Profile: ${renderProfileLinks(w.address, config)}`);
 
     if (w.usdSpent && w.solSpent) {
       const atMcap = w.entryMarketCapUsd ? ` at ${usdShort(w.entryMarketCapUsd)} Market Cap` : '';
@@ -662,7 +724,7 @@ function renderNewsAndSocial(news, social) {
  * traders agreed. They did not necessarily agree about anything — they may all
  * follow the same caller.
  */
-function renderCandidateSwarm(swarm) {
+function renderCandidateSwarm(swarm, config = {}) {
   if (!swarm?.qualifies) return [];
 
   const lines = [
@@ -679,9 +741,9 @@ function renderCandidateSwarm(swarm) {
     const spend =
       w.solSpent !== null && w.solSpent !== undefined ? `${w.solSpent.toFixed(2)} SOL` : 'spend not attributable';
     lines.push(
-      `• <code>${esc(w.short)}</code> — ${w.wins}/${w.gradedBuys} graded (${w.winRatePct.toFixed(0)}%), ${esc(spend)}, ${esc(timing)} · ` +
-        `<a href="${esc(w.solscan)}">Solscan</a>`
+      `• <code>${esc(w.short)}</code> — ${w.wins}/${w.gradedBuys} graded (${w.winRatePct.toFixed(0)}%), ${esc(spend)}, ${esc(timing)}`
     );
+    lines.push(`   ${renderProfileLinks(w.address, config)}`);
   }
   if (swarm.wallets.length > 8) lines.push(`• <i>… and ${swarm.wallets.length - 8} more</i>`);
 
@@ -846,14 +908,16 @@ export function buildMessage({ pair, demand, verdictInfo, smartMoney, deployer, 
     ...(signalCategory?.advice ? ['', `<b>${esc(signalCategory.advice)}</b>`] : []),
     ...sizeLines,
     ...renderNewsAndSocial(news, social),
-    ...renderCandidateSwarm(candidateSwarm),
+    ...renderCandidateSwarm(candidateSwarm, sizerConfig ?? {}),
     ...renderMomentum(momentum),
     ...renderNarrative(narrative),
     ...renderJitoTip(jitoTip),
     ...renderMegaRunner(megaRunner),
     ...renderCto(cto),
-    ...renderClusters(clusters),
-    ...renderWhales(smartMoney),
+    // sizerConfig is the whole config object, despite the name — it is what
+    // buildMessage is already handed and what carries telegram.walletProfiles.
+    ...renderClusters(clusters, sizerConfig ?? {}),
+    ...renderWhales(smartMoney, sizerConfig ?? {}),
     ...renderShield(
       evaluateSecurityShield({
         security,
@@ -1158,7 +1222,7 @@ function statusReport({ config, positions, watchlist, observations, alertLog, he
  * sell the real figures and are gated (403/401), so each row links out rather
  * than inventing them.
  */
-function whalesReport(whales) {
+function whalesReport(whales, config = {}) {
   const entries = (whales?.wallets ?? []).filter(
     (w) => w?.address && w.enabled !== false && !String(w.address).startsWith('EXAMPLE_')
   );
@@ -1212,9 +1276,9 @@ function whalesReport(whales) {
 
     const row = [
       `${shown + 1}. <code>${esc(short)}</code> — ${bits.join(' · ') || '<i>no stats on file</i>'}`,
-      `    <a href="https://solscan.io/account/${esc(w.address)}">Solscan</a> · ` +
-        `<a href="https://gmgn.ai/sol/address/${esc(w.address)}">GMGN</a> · ` +
-        `<a href="https://birdeye.so/profile/${esc(w.address)}">Birdeye</a>`,
+      // Indented so the links read as belonging to the wallet above them and
+      // sit as their own tap targets rather than running into the stats line.
+      `    ${renderProfileLinks(w.address, config)}`,
     ];
 
     const cost = row.join('\n').length + 1;
@@ -1365,7 +1429,9 @@ export async function handleCommand({ command, args, deps = {} }) {
     // cost a full state load.
     case 'whales': {
       if (!loaders.loadWhales) return 'The watchlist loader is not wired up on this bot.';
-      return whalesReport(await loaders.loadWhales());
+      // The config is loaded so the profile roster is the configured one rather
+      // than the built-in default. Optional: a bot wired without it still works.
+      return whalesReport(await loaders.loadWhales(), (await loaders.loadConfig?.()) ?? {});
     }
 
     case 'audit':
@@ -1428,9 +1494,11 @@ export async function runCommandBot({ credentials, deps, log = console.log, sign
     } catch (err) {
       // Long-poll timeouts are normal and expected; anything else gets a
       // short backoff rather than taking the bot down.
-      if (!/abort|timeout/i.test(err.message)) {
+      if (!/abort|timeout|fetch failed/i.test(err.message)) {
         log(`   poll error: ${err.message}`);
         await new Promise((r) => setTimeout(r, 3000));
+      } else {
+        await new Promise((r) => setTimeout(r, 1000));
       }
     }
   }

@@ -127,6 +127,14 @@ export function buildDeps({ here = HERE } = {}) {
         wallets: [],
       });
     },
+
+    /**
+     * The config, for renderers that need it — currently the wallet profile
+     * roster behind the 1-tap links. Separate from loadWhales so a caller that
+     * only wants the watchlist does not pay for a second file read, and re-read
+     * per call for the same reason every other loader here is.
+     */
+    loadConfig,
   };
 }
 
@@ -140,6 +148,11 @@ export function buildDeps({ here = HERE } = {}) {
 export function toPlainText(html) {
   return String(html)
     .replace(/<br\s*\/?>/gi, '\n')
+    // Anchors keep their URL. In Telegram the label IS the tap target, but a
+    // terminal cannot tap anything — stripping the href left "/whales" printing
+    // a list of bare words where the links used to be, which is precisely the
+    // information --once exists to show.
+    .replace(/<a\s+href="([^"]*)"[^>]*>([^<]*)<\/a>/gi, (_, url, label) => `${label}: ${url}`)
     .replace(/<[^>]+>/g, '')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')

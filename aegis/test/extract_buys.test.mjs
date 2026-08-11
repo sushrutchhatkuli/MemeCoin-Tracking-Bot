@@ -11,6 +11,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import {
   extractBuys,
@@ -41,7 +42,16 @@ import {
   resolveHolderFloor,
   SIGNAL_CATEGORY,
 } from '../audit.mjs';
-import { alertHeaderLines, buildMessage, maybeAlert, parseCommand, handleCommand } from '../telegram.mjs';
+import {
+  alertHeaderLines,
+  buildMessage,
+  maybeAlert,
+  parseCommand,
+  handleCommand,
+  walletProfileLinks,
+  renderProfileLinks,
+  DEFAULT_WALLET_PROFILES,
+} from '../telegram.mjs';
 import { buildDeps, toPlainText } from '../bot.mjs';
 import {
   buildPrompt,
@@ -2273,6 +2283,141 @@ test('end to end: a single-buy token cannot reach EARLY-STAGE INSIDER SCALP', ()
     clusters: clusterOf({ count: 2, clusterSize: 2 }), audit: PASSED,
   });
   assert.equal(allowed.category, SIGNAL_CATEGORY.INSIDER_EARLY);
+});
+
+/* ------------------------------------------------------------------ *
+ * 1-tap wallet profile links
+ * ------------------------------------------------------------------ */
+
+const WALLET = 'F5Hrs3fTxA6cPsdYa1r2zazymsetbFpXpzEuQWXPNusu';
+
+test('GMGN leads, because it is the destination the tap is for', () => {
+  // Aegis cannot fetch live P&L (403 Cloudflare), so the link IS the mechanism
+  // for that data. Solscan, which is first alphabetically and was first in the
+  // old hardcoded rows, is the one destination that does not show it.
+  const links = walletProfileLinks(WALLET, {});
+  assert.equal(links[0].label, 'GMGN');
+  assert.equal(links[0].url, `https://gmgn.ai/sol/address/${WALLET}`);
+  assert.deepEqual(links.map((l) => l.label), ['GMGN', 'Solscan', 'Birdeye']);
+});
+
+test('the profile roster is configurable and skips malformed entries', () => {
+  const config = {
+    telegram: {
+      walletProfiles: [
+        { label: 'Custom', url: 'https://example.test/w/{wallet}', enabled: true },
+        { label: 'Disabled', url: 'https://example.test/x/{wallet}', enabled: false },
+        { label: 'NoPlaceholder', url: 'https://example.test/static' },
+        { url: 'https://example.test/y/{wallet}' },
+        { label: 'NoUrl' },
+        null,
+      ],
+    },
+  };
+  const links = walletProfileLinks(WALLET, config);
+  assert.deepEqual(links.map((l) => l.label), ['Custom'], 'only the well-formed enabled entry');
+  assert.equal(links[0].url, `https://example.test/w/${WALLET}`);
+});
+
+test('MEME Terminal is present in config but disabled — the domain is parked', () => {
+  // MEASURED 2026-08-10: every path on memeterminal.com returns the same
+  // 114-byte redirect to /lander, which is a GoDaddy "for sale" listing. A tap
+  // reaches a domain-sales page, so it must not render as a working link.
+  const shipped = JSON.parse(readFileSync(new URL('../config.json', import.meta.url), 'utf8'));
+  const meme = shipped.telegram.walletProfiles.find((p) => p.label === 'MEME Terminal');
+  assert.ok(meme, 'kept in config so re-enabling is one edit if the product moves');
+  assert.equal(meme.enabled, false);
+  assert.equal(
+    walletProfileLinks(WALLET, shipped).some((l) => /memeterminal/.test(l.url)),
+    false,
+    'and it must never render'
+  );
+});
+
+test('a wallet address is URL-encoded and junk input yields no links', () => {
+  const config = { telegram: { walletProfiles: [{ label: 'X', url: 'https://e.test/{wallet}/p' }] } };
+  assert.equal(walletProfileLinks('a/b?c=d', config)[0].url, 'https://e.test/a%2Fb%3Fc%3Dd/p');
+  for (const bad of [null, undefined, '', 42, {}]) {
+    assert.deepEqual(walletProfileLinks(bad, config), [], String(bad));
+  }
+  assert.equal(renderProfileLinks(null, config), '');
+});
+
+test('every wallet in every block gets the full link row, not just the lead', () => {
+  // The drift this consolidation fixes: the insider block offered three
+  // destinations for wallet #1 and Solscan alone for the rest, while the
+  // smart-money and swarm blocks offered Solscan alone for everyone.
+  const w = (i) => `Wallet${i}${'x'.repeat(38)}`;
+  const body = buildMessage({
+    pair: { chainId: 'solana', baseToken: { symbol: 'LINKS', address: MINT } },
+    demand: { ...strongDemand, liqToMcapPct: 40 },
+    verdictInfo: { score: 88, securityStatus: 'PASSED', holderGate: { floor: 150 } },
+    deployer: null, security: cleanSecurity(),
+    tradeLink: { template: 'https://x.test/{chain}/{address}', label: 'Trade' },
+    reaudit: { ran: false }, signalCategory: {}, thresholds, sizerConfig: {},
+    clusters: {
+      detected: true, insiderCount: 2, label: 'INSIDER CLUSTER', networks: [], oversized: [],
+      uniqueInsiders: [
+        { wallet: w(1), short: 'Wallet1…xxxx', solSpent: 2 },
+        { wallet: w(2), short: 'Wallet2…xxxx', solSpent: 1 },
+      ],
+    },
+    smartMoney: {
+      detected: true, count: 1,
+      matches: [{ address: w(3), displayLabel: 'Elite Whale #1', pct: 1.2, via: 'holder', entryMinutesAfterLaunch: null, stats: null }],
+    },
+    candidateSwarm: {
+      detected: true, qualifies: true, count: 5, earlyCount: 5, effectiveCount: 5,
+      minWallets: 5, poolSize: 376, earlyWindowSec: 300, requireEarly: true,
+      label: 'MASSIVE 5+ CABAL SWARM DETECTED (5 Candidate Whales Bought Same Token!)',
+      wallets: [{ address: w(4), short: 'Wallet4…xxxx', gradedBuys: 4, wins: 3, winRatePct: 75, solSpent: 1, secondsAfterLaunch: 12 }],
+    },
+  });
+
+  // Insider #2 is not the lead and must still have GMGN.
+  for (const i of [1, 2, 3, 4]) {
+    assert.match(body, new RegExp(`gmgn\\.ai/sol/address/${w(i)}`), `wallet ${i} is missing GMGN`);
+  }
+  assert.match(body, /LEAD INSIDER/, 'the lead still gets its own labelled block');
+  assert.doesNotMatch(body, /memeterminal/, 'the parked domain never renders');
+});
+
+test('/whales renders GMGN first for every wallet', async () => {
+  const out = await handleCommand({
+    command: 'whales',
+    args: [],
+    deps: {
+      loadWhales: async () => whaleFile,
+      loadConfig: async () => ({}),
+    },
+  });
+  assert.match(out, new RegExp(`<a href="https://gmgn\\.ai/sol/address/F5Hrs3[^"]*">GMGN</a>`));
+  // Both listed wallets, not only the first.
+  assert.equal((out.match(/>GMGN</g) ?? []).length, 2);
+  assert.equal((out.match(/>Solscan</g) ?? []).length, 2);
+});
+
+test('/whales still works on a bot wired without loadConfig', async () => {
+  // The loader is optional; an older bot must fall back to the defaults rather
+  // than throwing into the poller.
+  const out = await handleCommand({ command: 'whales', args: [], deps: { loadWhales: async () => whaleFile } });
+  assert.match(out, />GMGN</);
+});
+
+test('terminal rendering keeps the URL an anchor was hiding', () => {
+  // In Telegram the label is the tap target. A terminal cannot tap, so --once
+  // printing bare words where links used to be would hide the one thing it
+  // exists to show.
+  assert.equal(
+    toPlainText('<a href="https://gmgn.ai/sol/address/ABC">GMGN</a>'),
+    'GMGN: https://gmgn.ai/sol/address/ABC'
+  );
+  assert.equal(
+    toPlainText('• <a href="https://a.test">A</a> · <a href="https://b.test">B</a>'),
+    '• A: https://a.test · B: https://b.test'
+  );
+  // Non-anchor markup is still stripped, and entities still decode correctly.
+  assert.equal(toPlainText('<b>P&amp;L</b>'), 'P&L');
 });
 
 /* ------------------------------------------------------------------ *
