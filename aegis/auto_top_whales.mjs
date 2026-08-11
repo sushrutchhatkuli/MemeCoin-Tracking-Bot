@@ -69,6 +69,8 @@ export const ELITE_RULES = {
   alphaHunterMegaWins: null,
   alphaHunterMinMultiplier: 50,
   alphaHunterMaxMultiplier: 500,
+  // Bounds the on-chain replay, which is the expensive half of a sync.
+  maxOnChainReplays: 40,
 };
 
 /**
@@ -154,9 +156,23 @@ export function applyEliteRules(candidates, rules = ELITE_RULES) {
         c.gradedBuys === null ||
         c.gradedBuys >= (rules.minGradedBuys ?? 0),
       winRate: fastTracked || (c.winRatePct !== null && c.winRatePct >= rules.minWinRatePct),
+      // Rule 2 — REALIZED DOLLARS.
+      //
+      // Reads allTimeNetProfitUsd, which is the wallet's own realized SOL priced
+      // in dollars, and falls back to netProfitUsd only when that is absent.
+      // The distinction is the whole rule: netProfitUsd is ESTIMATED from
+      // observation — spend x later price change on the few buys Aegis saw,
+      // assuming the wallet still holds — and runs to single dollars. A $30k
+      // threshold against that figure rejects everyone for a reason that has
+      // nothing to do with their trading.
+      //
+      // Now that a real figure exists, profitRule 'skip' is no longer the only
+      // honest setting. It is still respected when set.
       netProfit: skipProfit
         ? true
-        : c.netProfitUsd !== null && c.netProfitUsd >= rules.minNetProfitUsd,
+        : typeof c.allTimeNetProfitUsd === 'number' && Number.isFinite(c.allTimeNetProfitUsd)
+          ? c.allTimeNetProfitUsd >= rules.minNetProfitUsd
+          : c.netProfitUsd !== null && c.netProfitUsd >= rules.minNetProfitUsd,
       trades:
         fastTracked || (c.lifetimeTrades !== null && c.lifetimeTrades >= rules.minLifetimeTrades),
       // Rule 5 — REALIZED SOL. Never waived, including by the fast-track.
@@ -742,7 +758,7 @@ export async function fetchWalletHistory(
 }
 
 /** Attach the true on-chain win rate to each candidate. Mutates in place. */
-async function enrichOnChainWinRate(candidates, { heliusKey, cfg }) {
+async function enrichOnChainWinRate(candidates, { heliusKey, cfg, solUsd = 0 }) {
   if (!heliusKey) {
     console.log('   No Helius API key — true on-chain win rate cannot be derived');
     return { derived: 0, failed: candidates.length };
@@ -769,6 +785,17 @@ async function enrichOnChainWinRate(candidates, { heliusKey, cfg }) {
 
     const wr = computeOnChainWinRate(history.transactions, { address: c.address, dustSol });
     c.onChain = { ...wr, complete: history.complete, pagesRead: history.pages };
+
+    // REAL realized profit, in dollars, from the wallet's own closed positions.
+    //
+    // This is what Rule 2 was always supposed to read. `netProfitUsd` beside it
+    // is ESTIMATED from observation — spend x later price change on the handful
+    // of buys Aegis witnessed, assuming the wallet still holds — and the config
+    // note calls it single dollars. Ranking a $30k threshold against that
+    // number would reject everyone for a reason unrelated to their trading.
+    if (wr.winRatePct !== null && solUsd > 0) {
+      c.allTimeNetProfitUsd = wr.netSol * solUsd;
+    }
     if (wr.winRatePct !== null) {
       derived++;
       if (!history.complete) partial++;
@@ -1092,7 +1119,16 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     // Only worth paying for when Rule 2 is actually going to read it. Under
     // profitRule 'skip' the figure is never consulted, and deriving it would
     // add ~4s per wallet for nothing.
-    if (rules.profitRule !== 'skip') {
+    //
+    // ALSO SKIPPED when the on-chain replay below is going to run, because that
+    // produces allTimeNetProfitUsd and Rule 2 prefers it. Without this guard,
+    // flipping profitRule to 'enforce' silently turned on TWO history walks
+    // over the same wallets with two different implementations — 198 wallets at
+    // ~4s here, plus the replay after it. Observed directly: the sync printed
+    // "deriving on-chain realized PnL for 198 wallet(s)" before it had replayed
+    // anything, and did not finish inside ten minutes.
+    const replayWillRun = Boolean(rules.minAllTimeWinRatePct) || rules.minAllTimeNetSol !== null;
+    if (rules.profitRule !== 'skip' && !replayWillRun) {
       const heliusKey = (String(config.rpcUrl ?? '').match(/api-key=([\w-]+)/) ?? [])[1] ?? null;
       console.log(`   ↳ deriving on-chain realized PnL for ${shortlist.length} wallet(s)…`);
       await enrichRealizedPnl(shortlist, {
@@ -1119,6 +1155,19 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     if (rules.minAllTimeWinRatePct || rules.minAllTimeNetSol !== null) {
       const heliusKey = (String(config.rpcUrl ?? '').match(/api-key=([\w-]+)/) ?? [])[1] ?? null;
       const fastTrackAt = rules.alphaHunterMegaWins ?? null;
+      // REPLAY CAP. The pre-filter below is only as narrow as minWinRatePct,
+      // and that number is a ranking choice rather than a cost control — moving
+      // it from 45 to 40 took the contender set from 19 wallets to enough that
+      // the sync ran past 30 minutes and had to be killed. eliteWhales
+      // .syncIntervalHours is 2 and the sync runs inside the maintenance loop,
+      // so an unbounded replay here starves the scanner exactly the way the
+      // enrichShortlistCap note describes (468 skipped ticks).
+      //
+      // The shortlist arrives ranked by observed activity, so slicing keeps the
+      // wallets most likely to qualify. A wallet cut here is not rejected — it
+      // is unmeasured, and unmeasured fails Rules 4 and 5, so the cap is a
+      // COVERAGE limit and worth raising if a sync has time to spare.
+      const replayCap = rules.maxOnChainReplays ?? 40;
       const contenders = shortlist.filter((c) => {
         // An Alpha Hunter skips rules 1-3, so it would never appear in this
         // pre-filter — and it still NEEDS the replay, because the net-SOL rule
@@ -1134,12 +1183,16 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
           c.lifetimeTrades >= rules.minLifetimeTrades
         );
       });
+      const replaying = contenders.slice(0, replayCap);
       console.log(
-        `   ↳ replaying on-chain history for ${contenders.length} of ${shortlist.length} wallet(s) ` +
-          `— only those already passing rules 1-3 can qualify ` +
-          `(floor ${rules.minAllTimeWinRatePct}% over ${rules.minAllTimeTrades ?? 0}+ trades)…`
+        `   ↳ replaying on-chain history for ${replaying.length} of ${shortlist.length} wallet(s) ` +
+          `— only those already passing rules 1-3 can qualify` +
+          (contenders.length > replaying.length
+            ? `, ${contenders.length - replaying.length} more eligible but over the ${replayCap} replay cap`
+            : '') +
+          ` (floor ${rules.minAllTimeWinRatePct}% over ${rules.minAllTimeTrades ?? 0}+ trades)…`
       );
-      await enrichOnChainWinRate(contenders, { heliusKey, cfg: config.eliteWhales ?? {} });
+      await enrichOnChainWinRate(replaying, { heliusKey, cfg: config.eliteWhales ?? {}, solUsd });
     }
   }
 
@@ -1209,10 +1262,20 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     // netProfitUsd from walletStats (an estimate from observed spend), and
     // mixing the two would report a spread across 10,000 wallets when 48 were
     // actually measured.
+    // Reads the SAME field Rule 2 judged on. It previously read netProfitUsd
+    // unconditionally, which after Rule 2 moved to allTimeNetProfitUsd made the
+    // diagnostic report "no Helius key, or every lookup failed" on a run where
+    // the key was present and 26 replays had succeeded — a false explanation
+    // for a real rejection, which is worse than no explanation.
     const derived = evaluated
-      .filter((c) => c.realizedPnl?.ok)
-      .map((c) => c.netProfitUsd)
-      .filter((n) => typeof n === 'number')
+      .map((c) =>
+        typeof c.allTimeNetProfitUsd === 'number' && Number.isFinite(c.allTimeNetProfitUsd)
+          ? c.allTimeNetProfitUsd
+          : c.realizedPnl?.ok
+            ? c.netProfitUsd
+            : null
+      )
+      .filter((n) => typeof n === 'number' && Number.isFinite(n))
       .sort((a, b) => b - a);
     if (derived.length) {
       const median = derived[Math.floor(derived.length / 2)];

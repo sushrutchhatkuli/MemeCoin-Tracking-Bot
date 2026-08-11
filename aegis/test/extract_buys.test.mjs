@@ -2511,6 +2511,38 @@ test('a net-negative wallet is rejected however often it was right', () => {
   );
 });
 
+test('Rule 2 reads REALIZED dollars, not the observation estimate', () => {
+  // netProfitUsd is estimated from the few buys Aegis witnessed and runs to
+  // single dollars — Rule 2 was skipped for years because of it. A $30k
+  // threshold against that number rejects everyone for a reason unrelated to
+  // their trading. allTimeNetProfitUsd is realized SOL priced at spot.
+  const rules = { ...RULES5, profitRule: 'enforce', minNetProfitUsd: 30_000, minWinRatePct: 40, minAllTimeWinRatePct: 40 };
+  const base = { address: 'W', winRatePct: 60, gradedBuys: 5, lifetimeTrades: 500,
+    onChain: { winRatePct: 55, trades: 40, netSol: 500 } };
+
+  // Realized $37,500 clears it even though the observed estimate is $12.
+  assert.equal(
+    applyEliteRules([{ ...base, netProfitUsd: 12, allTimeNetProfitUsd: 37_500 }], rules).qualified.length,
+    1
+  );
+  // Realized $5,600 — the best figure actually measured on the real list — does not.
+  assert.equal(
+    applyEliteRules([{ ...base, netProfitUsd: 12, allTimeNetProfitUsd: 5_600 }], rules).qualified.length,
+    0
+  );
+  // The observation estimate is only a fallback, and cannot clear the bar alone.
+  assert.equal(
+    applyEliteRules([{ ...base, netProfitUsd: 40_000, allTimeNetProfitUsd: 100 }], rules).qualified.length,
+    0,
+    'the real figure wins when both are present'
+  );
+  // profitRule 'skip' still disables the rule entirely.
+  assert.equal(
+    applyEliteRules([{ ...base, allTimeNetProfitUsd: 1 }], { ...rules, profitRule: 'skip' }).qualified.length,
+    1
+  );
+});
+
 test('mega-wins are counted inside the band, with a ceiling as well as a floor', () => {
   assert.equal(countMegaWins({ alpha: { awarded: { a: { multiplier: 60 }, b: { multiplier: 120 } } } }).megaWinCount, 2);
   // The only credits actually on file are 42x — below the 50x floor.
