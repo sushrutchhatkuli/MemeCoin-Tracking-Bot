@@ -1049,6 +1049,44 @@ export function classifyCacheEntry(entry, { ttlHours = 24, now = Date.now(), dus
   return entry.newestSignature ? 'incremental' : 'miss';
 }
 
+/**
+ * Split replay contenders into those the cache can serve for free and those
+ * that need network. PURE — no clock, no IO, so the cap's behaviour can be
+ * verified without a Helius key.
+ *
+ * ── WHY THE SPLIT EXISTS ────────────────────────────────────────────────────
+ * maxOnChainReplays is a COST control: it exists so a sync running inside the
+ * maintenance loop cannot starve the scanner (see enrichShortlistCap's note and
+ * its 468 skipped ticks). A wallet served from the history cache costs zero RPC
+ * and a map lookup, so counting it against that budget bounds the wrong thing —
+ * it converts a cost limit into a coverage limit, and because unmeasured fails
+ * Rules 4 and 5, a qualifying wallet gets dropped for want of a slot it did not
+ * need. The visible symptom is a watchlist that churns between syncs while the
+ * wallets themselves have not changed.
+ *
+ * 'incremental' is deliberately grouped with 'miss'. It has an entry, but the
+ * entry is past TTL and topping it up still costs at least one call — usually
+ * exactly one, since the endpoint pages backwards from the newest transaction,
+ * but one is not zero and the cap is about calls.
+ *
+ * Order is preserved inside both groups: contenders arrive ranked by observed
+ * activity, and the cap slices the cold group, so the wallets most likely to
+ * qualify keep the scarce slots.
+ */
+export function partitionByCacheDisposition(
+  contenders = [],
+  cache = {},
+  { ttlHours = 24, dustSol = 0.05, now = Date.now() } = {}
+) {
+  const cached = [];
+  const cold = [];
+  for (const c of contenders) {
+    const disposition = classifyCacheEntry(cache[c.address], { ttlHours, now, dustSol });
+    (disposition === 'fresh' ? cached : cold).push(c);
+  }
+  return { cached, cold };
+}
+
 /** Attach the true on-chain win rate to each candidate. Mutates in place. */
 async function enrichOnChainWinRate(candidates, { heliusKey, cfg, solUsd = 0, cache = {}, now = Date.now() }) {
   if (!heliusKey) {
@@ -1711,6 +1749,30 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
       // wallets most likely to qualify. A wallet cut here is not rejected — it
       // is unmeasured, and unmeasured fails Rules 4 and 5, so the cap is a
       // COVERAGE limit and worth raising if a sync has time to spare.
+      //
+      // ── THE CAP BOUNDS NETWORK WORK, NOT MEASUREMENT ───────────────────────
+      // Wallets already in the history cache are served at ZERO RPC, so capping
+      // them buys nothing and costs coverage. Applying the cap before consulting
+      // the cache was a real defect and its signature was watchlist CHURN:
+      // entries appearing and vanishing between syncs for reasons unrelated to
+      // how the wallets traded.
+      //
+      // MEASURED on the 2026-08-12 sync that exposed it: 40 slots spent, only 10
+      // of them cache hits, 360 pages fetched for the other 30 — while three
+      // wallets holding FRESH entries 1.9 hours old (TTL 24h) sat outside the cap
+      // and were dropped as "unmeasured": Ar2Y6o (+31.2 SOL over 155 closed
+      // trades), BEvw9m (+13.5/132) and mpXCgP (+2.2/159). All three qualified on
+      // merit and all three had been on the previous list. Ar2Y6o is the best
+      // wallet in the measured population.
+      //
+      // So contenders are partitioned by cache disposition and the cap is applied
+      // ONLY to the wallets that would need a fetch. 'incremental' counts as cold:
+      // it is past TTL and still costs at least one call, even if usually only one.
+      //
+      // CACHED WALLETS GO FIRST in the replay list, which also hardens the quota
+      // path — enrichOnChainWinRate stops serving anything but cache hits once it
+      // sees a hard 429, so doing the free ones first means a mid-pass quota death
+      // costs only cold wallets.
       const replayCap = rules.maxOnChainReplays ?? 40;
       const contenders = shortlist.filter((c) => {
         // An Alpha Hunter skips rules 1-3, so it would never appear in this
@@ -1727,13 +1789,26 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
           c.lifetimeTrades >= rules.minLifetimeTrades
         );
       });
-      const replaying = contenders.slice(0, replayCap);
+      // ONE timestamp for both the partition and the enrichment. Two Date.now()
+      // calls would let a wallet classify 'fresh' here and 'incremental' inside
+      // enrichOnChainWinRate — it would then be admitted past the cap AND make a
+      // network call, which is the one combination this split exists to prevent.
+      const replayNow = Date.now();
+      const { cached, cold } = partitionByCacheDisposition(contenders, onChainCache, {
+        ttlHours: rules.historyCacheTtlHours ?? 24,
+        dustSol: rules.dustTradeSol ?? 0.05,
+        now: replayNow,
+      });
+      const coldReplaying = cold.slice(0, replayCap);
+      const replaying = [...cached, ...coldReplaying];
+      const skipped = cold.length - coldReplaying.length;
+
       console.log(
         `   ↳ replaying on-chain history for ${replaying.length} of ${shortlist.length} wallet(s) ` +
           `— only those already passing rules 1-3 can qualify` +
-          (contenders.length > replaying.length
-            ? `, ${contenders.length - replaying.length} more eligible but over the ${replayCap} replay cap`
-            : '') +
+          ` (${cached.length} cached, 0 RPC and exempt from the cap` +
+          `; ${coldReplaying.length} cold against the ${replayCap} cap)` +
+          (skipped ? `, ${skipped} cold wallet(s) over the cap and left unmeasured` : '') +
           ` (floor ${rules.minAllTimeWinRatePct}% over ${rules.minAllTimeTrades ?? 0}+ trades)…`
       );
       await enrichOnChainWinRate(replaying, {
@@ -1741,7 +1816,7 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
         cfg: config.eliteWhales ?? {},
         solUsd,
         cache: onChainCache,
-        now: Date.now(),
+        now: replayNow,
       });
     }
   }

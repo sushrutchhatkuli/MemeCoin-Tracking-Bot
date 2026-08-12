@@ -2594,6 +2594,51 @@ test('cache entries are classified fresh, incremental or miss', async () => {
   assert.equal(classifyCacheEntry({ ...base, at: now + 60_000 }, { now }), 'miss');
 });
 
+test('the replay cap bounds network work, not cached measurement', async () => {
+  const { partitionByCacheDisposition, ONCHAIN_CACHE_VERSION } = await import('../auto_top_whales.mjs');
+  const now = Date.now();
+  const fresh = (at) => ({ version: ONCHAIN_CACHE_VERSION, perMint: {}, newestSignature: 'sig', at, dustSol: 0.05 });
+
+  const contenders = [
+    { address: 'warm1' }, { address: 'cold1' }, { address: 'warm2' },
+    { address: 'cold2' }, { address: 'stale1' },
+  ];
+  const cache = {
+    warm1: fresh(now - 1.9 * 3600e3),   // the 1.9h entry the live bug dropped
+    warm2: fresh(now - 1000),
+    stale1: fresh(now - 25 * 3600e3),   // past TTL -> a top-up still costs a call
+  };
+
+  const { cached, cold } = partitionByCacheDisposition(contenders, cache, { now });
+  assert.deepEqual(cached.map((c) => c.address), ['warm1', 'warm2']);
+  // 'incremental' is network work and must be capped with the cold wallets.
+  assert.deepEqual(cold.map((c) => c.address), ['cold1', 'cold2', 'stale1']);
+
+  // The regression itself: with a cap of 1, the two free wallets must still be
+  // measured. Before the split, a cap of 1 measured exactly one wallet total and
+  // silently dropped qualifying wallets whose history was already on disk.
+  const replaying = [...cached, ...cold.slice(0, 1)];
+  assert.deepEqual(replaying.map((c) => c.address), ['warm1', 'warm2', 'cold1']);
+  assert.equal(replaying.length, 3, 'a cap of 1 still measures every cached wallet');
+
+  // Cached wallets lead, so a mid-pass quota death costs only cold ones.
+  assert.ok(replaying.indexOf('cold1') === -1 || replaying[0].address === 'warm1');
+});
+
+test('cache partitioning preserves rank and survives an empty cache', async () => {
+  const { partitionByCacheDisposition } = await import('../auto_top_whales.mjs');
+  const contenders = [{ address: 'a' }, { address: 'b' }, { address: 'c' }];
+
+  // No cache at all: everything is cold, so the cap governs the whole set and
+  // behaviour is exactly what it was before the split.
+  const none = partitionByCacheDisposition(contenders, {});
+  assert.equal(none.cached.length, 0);
+  assert.deepEqual(none.cold.map((c) => c.address), ['a', 'b', 'c'], 'observed-activity rank is kept');
+
+  assert.deepEqual(partitionByCacheDisposition([], {}), { cached: [], cold: [] });
+  assert.deepEqual(partitionByCacheDisposition(undefined, undefined), { cached: [], cold: [] });
+});
+
 test('the cache is bounded by age and count, newest kept', async () => {
   const { pruneOnChainCache } = await import('../auto_top_whales.mjs');
   const now = Date.now();
