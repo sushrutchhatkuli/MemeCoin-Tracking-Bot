@@ -7473,3 +7473,192 @@ test('the screen is only wiped on a watched TTY', async () => {
   assert.equal(shouldWipeScreen({ intervalSec: 0, isTTY: true }), false);
   assert.equal(shouldWipeScreen({}), false);
 });
+
+/* ------------------------------------------------------------------ *
+ * Pure mirror mode
+ * ------------------------------------------------------------------ */
+
+test('pure mirror silences every exit the book would take on its own', async () => {
+  const { createBook, openPaperPosition, evaluatePaperExits, markPosition, paperConfig } =
+    await import('../paper_copytrade.mjs');
+  const normal = paperConfig({ perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const pure = paperConfig({ perTradeSol: 1, slippagePct: 0, feeSol: 0, pureMirror: true });
+
+  const book = createBook({ budgetSol: 10 });
+  openPaperPosition(book, { mint: 'M', priceUsd: 100, cfg: normal, now: 0 });
+  const p = book.positions.M;
+
+  // Every trigger that fires normally must fire NOT AT ALL under pure mirror.
+  assert.deepEqual(evaluatePaperExits(p, 200, normal).map((e) => e.trigger), ['TP1']);
+  assert.deepEqual(evaluatePaperExits(p, 200, pure), []);
+
+  assert.ok(evaluatePaperExits(p, 55, normal).some((e) => e.trigger === 'HARD_STOP'));
+  assert.deepEqual(evaluatePaperExits(p, 55, pure), []);
+
+  markPosition(p, 400, 1);
+  assert.ok(evaluatePaperExits(p, 210, normal).some((e) => e.trigger === 'TRAILING_STOP'));
+  assert.deepEqual(evaluatePaperExits(p, 210, pure), []);
+
+  // Even a total collapse is held — the downside is genuinely unbounded, which
+  // is the trade being made, not an oversight.
+  assert.deepEqual(evaluatePaperExits(p, 0.0001, pure), []);
+});
+
+test('pure mirror forces the chain feed on, since it is the only exit path', async () => {
+  const { paperConfig } = await import('../paper_copytrade.mjs');
+
+  // The ledger records buys only. Pure mirror over the ledger would be a book
+  // that can never sell, and it would look like it was working.
+  const cfg = paperConfig({ pureMirror: true, rpcMirror: { enabled: false, mirrorSells: false } });
+  assert.equal(cfg.rpcMirror.enabled, true);
+  assert.equal(cfg.rpcMirror.mirrorSells, true);
+
+  // Off by default, and only `true` enables it — a truthy string must not.
+  assert.equal(paperConfig({}).pureMirror, false);
+  assert.equal(paperConfig({ pureMirror: 'yes' }).pureMirror, false);
+  assert.equal(paperConfig({ pureMirror: 1 }).pureMirror, false);
+});
+
+test('in pure mirror only the whale opens and only the whale closes', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, pureMirror: true });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  // Whale buys -> we buy.
+  await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now,
+    priceFetcher: async () => new Map([['M', 1]]),
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S1', trades: [{ kind: 'BUY', mint: 'M', solSpent: 1, blockTime: now }],
+    }),
+  });
+  assert.ok(book.positions.M);
+
+  // Price 10x with NO whale sell: a normal book would have taken TP1 and TP2.
+  const runUp = await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now: now + 1,
+    priceFetcher: async () => new Map([['M', 10]]),
+    tradeFetcher: async () => ({ ok: true, newestSignature: 'S1', trades: [] }),
+  });
+  assert.deepEqual(runUp.exits, [], 'no take-profit without a whale sell');
+  assert.equal(book.positions.M.stakeSol, 1, 'stake untouched');
+
+  // Then a 90% collapse, still no whale sell: a normal book would have stopped
+  // out at -40%. This one holds.
+  const crash = await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now: now + 2,
+    priceFetcher: async () => new Map([['M', 0.1]]),
+    tradeFetcher: async () => ({ ok: true, newestSignature: 'S1', trades: [] }),
+  });
+  assert.deepEqual(crash.exits, [], 'no stop-loss without a whale sell');
+  assert.ok(book.positions.M);
+
+  // The whale sells -> and only then do we.
+  const exit = await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now: now + 3,
+    priceFetcher: async () => new Map([['M', 0.1]]),
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S2', trades: [{ kind: 'SELL', mint: 'M', sellFraction: 1, blockTime: now }],
+    }),
+  });
+  assert.deepEqual(exit.exits.map((e) => e.trigger), ['WHALE_SELL']);
+  assert.equal(book.positions.M, undefined);
+});
+
+test('pure mirror holds an unpriceable position and says so', async () => {
+  const { createBook, runPaperTick, openPaperPosition, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, staleExitHours: 1, pureMirror: true });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+  openPaperPosition(book, { mint: 'DEAD', priceUsd: 1, cfg, now: now - 10 * 3.6e6 });
+
+  const r = await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now,
+    priceFetcher: async () => new Map(),
+    tradeFetcher: async () => ({ ok: true, newestSignature: 'S1', trades: [] }),
+  });
+
+  // A stale exit is still a sell the target did not make.
+  assert.deepEqual(r.exits, []);
+  assert.ok(book.positions.DEAD);
+  // But the overstatement is reported rather than silently taken.
+  assert.equal(r.unpriced, 1);
+});
+
+/* ------------------------------------------------------------------ *
+ * Ticker resolution
+ * ------------------------------------------------------------------ */
+
+test('fetchMarketData carries the ticker alongside the price', async () => {
+  const { fetchMarketData, fetchPrices } = await import('../paper_copytrade.mjs');
+  const batch = new Map([
+    ['mint1', { baseToken: { address: 'MINT1', symbol: 'Call' }, priceUsd: '0.004' }],
+    ['mint2', { baseToken: { address: 'MINT2', symbol: '  UNITE  ' }, priceUsd: '2' }],
+    ['mint3', { baseToken: { address: 'MINT3' }, priceUsd: '3' }],
+    ['dead', { baseToken: { address: 'DEAD', symbol: 'X' }, priceUsd: '0' }],
+  ]);
+  const batchFetcher = async () => batch;
+
+  const data = await fetchMarketData(['MINT1', 'MINT2', 'MINT3', 'DEAD'], { batchFetcher });
+  assert.deepEqual(data.get('MINT1'), { priceUsd: 0.004, symbol: 'Call' });
+  assert.deepEqual(data.get('MINT2'), { priceUsd: 2, symbol: 'UNITE' }, 'trimmed');
+  assert.deepEqual(data.get('MINT3'), { priceUsd: 3, symbol: null }, 'no symbol is null, not empty string');
+  assert.equal(data.has('DEAD'), false, 'an unpriceable pair is omitted entirely');
+
+  // fetchPrices stays a bare mint->price map so existing callers are unaffected.
+  const prices = await fetchPrices(['MINT1'], { batchFetcher });
+  assert.equal(prices.get('MINT1'), 0.004);
+});
+
+test('formatTicker renders $SYMBOL and falls back to the mint', async () => {
+  const { formatTicker } = await import('../paper_copytrade.mjs');
+  assert.equal(formatTicker('Call', 'Abc123456789'), '$Call');
+  assert.equal(formatTicker('FORTNITEKID', 'X'), '$FORTNITEKID');
+  assert.equal(formatTicker('  Broccoli ', 'X'), '$Broccoli');
+  // No symbol: a short mint prefix, so the row is still identifiable.
+  assert.equal(formatTicker(null, 'Abc123456789'), 'Abc12345');
+  assert.equal(formatTicker('', 'Abc123456789'), 'Abc12345');
+  assert.equal(formatTicker(undefined, ''), '(unknown)');
+});
+
+test('readQuote accepts a bare price or a full quote', async () => {
+  const { readQuote } = await import('../paper_copytrade.mjs');
+  // Both shapes exist because the injectable priceFetcher is used by callers
+  // that only have prices; ignoring a number would make them mirror nothing.
+  assert.deepEqual(readQuote(5), { priceUsd: 5, symbol: null });
+  assert.deepEqual(readQuote({ priceUsd: 5, symbol: 'ONE' }), { priceUsd: 5, symbol: 'ONE' });
+  for (const bad of [0, -1, NaN, null, undefined, {}, { priceUsd: 0 }, 'x']) {
+    assert.equal(readQuote(bad), null, `must reject ${JSON.stringify(bad)}`);
+  }
+});
+
+test('a chain-mirrored position learns its ticker from the mark', async () => {
+  const { createBook, runPaperTick, renderPositions, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  // parseWalletSwap reads balance deltas, which carry no name — the entry
+  // arrives with symbol null and the quote supplies it.
+  const r = await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now,
+    priceFetcher: async () => new Map([['MINT', { priceUsd: 1, symbol: 'Call' }]]),
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S1', trades: [{ kind: 'BUY', mint: 'MINT', solSpent: 1, blockTime: now }],
+    }),
+  });
+
+  assert.equal(r.opened[0].symbol, 'Call');
+  assert.equal(book.positions.MINT.symbol, 'Call');
+  assert.match(renderPositions(book, 100), /\$Call/);
+
+  // A later pair reporting a different symbol for the same mint must NOT churn
+  // the label — tickers are unrestricted and the mint is the identity.
+  await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now: now + 1,
+    priceFetcher: async () => new Map([['MINT', { priceUsd: 1.1, symbol: 'IMPOSTOR' }]]),
+    tradeFetcher: async () => ({ ok: true, newestSignature: 'S1', trades: [] }),
+  });
+  assert.equal(book.positions.MINT.symbol, 'Call');
+});

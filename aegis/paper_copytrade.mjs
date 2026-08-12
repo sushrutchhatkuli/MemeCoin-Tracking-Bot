@@ -18,6 +18,9 @@
  *   --no-chain                                  ignore the live RPC mirror and
  *                                               fall back to the ledger
  *   --rpc <url>                                 use a different keyless node
+ *   --pure-mirror                               copy the target and nothing
+ *                                               else: no take-profit, no
+ *                                               trailing stop, no hard stop
  *
  * A short --watch interval re-prices and re-renders quickly, but it CANNOT make
  * the mirror faster than the ledger it reads: see the latency note below. At 5s
@@ -121,6 +124,10 @@ export const PAPER_DEFAULTS = {
   // Floor for a proportional position. 0 means "no floor", which is faithful to
   // a bare --pct-whale and is why the CLI warns instead of silently clamping.
   minTradeSol: 0,
+  // PURE MIRROR. The book takes no exit decision of its own — no take-profit
+  // ladder, no trailing stop, no hard stop. It buys when the target buys and
+  // sells when the target sells, and that is all. See evaluatePaperExits.
+  pureMirror: false,
   // LIVE ON-CHAIN MIRROR. Reads the target's own transactions from a free
   // public RPC — 0 Helius credits — instead of waiting for the observation
   // ledger. Sees sells too, which the ledger never recorded.
@@ -205,7 +212,15 @@ export function paperConfig(overrides = {}) {
   // nothing forever, which is a config mistake rather than a strategy.
   cfg.pctWhale =
     Number.isFinite(Number(cfg.pctWhale)) && Number(cfg.pctWhale) > 0 ? Number(cfg.pctWhale) : null;
+  cfg.pureMirror = cfg.pureMirror === true;
   cfg.rpcMirror = { ...PAPER_DEFAULTS.rpcMirror, ...(cfg.rpcMirror ?? {}) };
+  // Pure mirror without the chain feed would be a book that can never sell:
+  // the ledger records buys only, so the sole exit path would be gone. Forced
+  // rather than warned, because the resulting book looks like it is working.
+  if (cfg.pureMirror) {
+    cfg.rpcMirror.enabled = true;
+    cfg.rpcMirror.mirrorSells = true;
+  }
   // A blank or non-http url would silently disable the mirror while the config
   // still claimed it was on.
   if (!/^https?:\/\//.test(String(cfg.rpcMirror.url ?? ''))) {
@@ -345,6 +360,18 @@ export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, no
  */
 export function evaluatePaperExits(position, priceUsd, cfg) {
   const exits = [];
+  // PURE MIRROR: the book holds until the target sells, and takes no view of
+  // its own. Returning early rather than zeroing the thresholds keeps the
+  // distinction honest — a +100% rung that never fires and no rung at all are
+  // different configurations, and only one of them is what was asked for.
+  //
+  // WHAT THIS GIVES UP, stated plainly because it is the entire trade: the
+  // stop-loss is the only thing that bounded a position's downside, and a whale
+  // that abandons a rug without selling never produces the exit that would have
+  // closed it. The book then rides that position to zero, which a -40% hard
+  // stop would have cut. Copying someone completely means copying their losses
+  // completely.
+  if (cfg?.pureMirror) return exits;
   if (!position || !Number.isFinite(priceUsd) || priceUsd <= 0) return exits;
 
   const entry = position.entryPriceUsd;
@@ -937,18 +964,67 @@ export async function saveBook(book, path = BOOK_PATH) {
  * there is no venue selection to redo here.
  */
 export async function fetchPrices(mints, { batchFetcher = fetchPairsBatch } = {}) {
-  const prices = new Map();
-  if (!mints?.length) return prices;
+  const quotes = await fetchMarketData(mints, { batchFetcher });
+  return new Map([...quotes].map(([mint, q]) => [mint, q.priceUsd]));
+}
+
+/**
+ * Price AND ticker for a set of mints.
+ *
+ * ── WHY THE SYMBOL COMES FROM THE SAME CALL AS THE PRICE ───────────────────
+ * The chain mirror learns a mint and nothing else — parseWalletSwap reads
+ * balance deltas, and a balance carries no name. Without this the dashboard
+ * shows `opUSE74F` where GMGN shows `$Call`, which is unreadable next to any
+ * other tool. The pair payload already being fetched for the mark carries
+ * baseToken.symbol, so the ticker costs no extra request.
+ *
+ * The symbol is a LABEL AND NOTHING ELSE. Solana's ticker namespace is
+ * unrestricted — this session already measured ten distinct mints all symboled
+ * "SOL" at five different prices — so it is never matched on, compared, or used
+ * to identify a position. The mint remains the key everywhere.
+ */
+export async function fetchMarketData(mints, { batchFetcher = fetchPairsBatch } = {}) {
+  const out = new Map();
+  if (!mints?.length) return out;
 
   const byAddress = await batchFetcher(mints).catch(() => new Map());
-  if (!byAddress || typeof byAddress.get !== 'function') return prices;
+  if (!byAddress || typeof byAddress.get !== 'function') return out;
 
   for (const mint of mints) {
     const pair = byAddress.get(String(mint).toLowerCase());
-    const price = Number(pair?.priceUsd);
-    if (Number.isFinite(price) && price > 0) prices.set(mint, price);
+    const priceUsd = Number(pair?.priceUsd);
+    if (!Number.isFinite(priceUsd) || priceUsd <= 0) continue;
+    const symbol = typeof pair?.baseToken?.symbol === 'string' ? pair.baseToken.symbol.trim() : null;
+    out.set(mint, { priceUsd, symbol: symbol || null });
   }
-  return prices;
+  return out;
+}
+
+/**
+ * Read a quote that may be a bare price or a {priceUsd, symbol} record. PURE.
+ *
+ * Both shapes exist on purpose: runPaperTick's injectable priceFetcher is used
+ * by tests and callers that only have prices, and silently ignoring a number
+ * would make every one of those mirror nothing.
+ */
+export function readQuote(value) {
+  if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? { priceUsd: value, symbol: null } : null;
+  const priceUsd = Number(value?.priceUsd);
+  if (!Number.isFinite(priceUsd) || priceUsd <= 0) return null;
+  return { priceUsd, symbol: value?.symbol ?? null };
+}
+
+/**
+ * Ticker for display. PURE.
+ *
+ * `$SYMBOL` when one is known, matching how GMGN and every Solana front-end
+ * render it; a short mint prefix otherwise, so a token whose pair carries no
+ * symbol is still identifiable rather than blank.
+ */
+export function formatTicker(symbol, mint = '') {
+  const clean = typeof symbol === 'string' ? symbol.trim() : '';
+  if (clean) return `$${clean}`;
+  return String(mint).slice(0, 8) || '(unknown)';
 }
 
 /**
@@ -962,7 +1038,10 @@ export async function runPaperTick({
   watchlist,
   cfg,
   now = Date.now(),
-  priceFetcher = fetchPrices,
+  // Defaults to the symbol-carrying fetcher so a chain-mirrored entry can
+  // learn its ticker; readQuote still accepts a bare price map from any
+  // caller or test that injects one.
+  priceFetcher = fetchMarketData,
   tradeFetcher = fetchWhaleTrades,
 } = {}) {
   const report = { opened: [], exits: [], marked: 0, declined: [], target: null, chain: null };
@@ -1040,15 +1119,29 @@ export async function runPaperTick({
   if (report.chain) report.chain.staleSkipped = staleChainBuys;
   const openMints = Object.keys(book.positions);
   const needPrices = [...new Set([...openMints, ...candidates.map((c) => c.mint)])];
-  const prices = await priceFetcher(needPrices);
+  const raw = await priceFetcher(needPrices);
+  // Normalised once, so every reader below sees one shape whether the fetcher
+  // returned bare numbers or {priceUsd, symbol} records.
+  const quotes = new Map();
+  const prices = new Map();
+  for (const [mint, value] of raw ?? []) {
+    const q = readQuote(value);
+    if (!q) continue;
+    quotes.set(mint, q);
+    prices.set(mint, q.priceUsd);
+  }
 
   // Mark first, so an exit fires on this tick's price rather than last tick's.
   for (const mint of openMints) {
-    const price = prices.get(mint);
-    if (Number.isFinite(price)) {
-      markPosition(book.positions[mint], price, now);
-      report.marked++;
-    }
+    const q = quotes.get(mint);
+    if (!q) continue;
+    markPosition(book.positions[mint], q.priceUsd, now);
+    // BACKFILLED, not overwritten. A chain-mirrored entry knows only a mint —
+    // balance deltas carry no name — so the ticker arrives with the first mark
+    // that resolves it and then stays put, rather than churning if a pair later
+    // reports a different symbol for the same mint.
+    if (!book.positions[mint].symbol && q.symbol) book.positions[mint].symbol = q.symbol;
+    report.marked++;
   }
 
   // ---- mirrored sells, BEFORE the paper's own exit rules -----------
@@ -1097,6 +1190,16 @@ export async function runPaperTick({
     const price = prices.get(mint);
     if (!Number.isFinite(price)) {
       const ageH = (now - (p.lastPricedAt ?? p.openedAt)) / 3.6e6;
+      // NOT IN PURE MIRROR. A stale exit is still a sell the target did not
+      // make, and "only sell when the whale sells" has to mean that or it means
+      // nothing. The cost is real and is surfaced instead of silently taken:
+      // an unpriceable position keeps its last mark, so equity counts a token
+      // that may be worthless. staleUnpriced on the report drives the dashboard
+      // warning that says so.
+      if (cfg.pureMirror) {
+        report.unpriced = (report.unpriced ?? 0) + 1;
+        continue;
+      }
       if (ageH >= cfg.staleExitHours) {
         // Unpriceable for two days is a delisting, and a delisting is a loss,
         // not a hold. Marked at the last price rather than zero: the pair may
@@ -1124,7 +1227,8 @@ export async function runPaperTick({
     const price = prices.get(c.mint);
     const res = openPaperPosition(book, {
       mint: c.mint,
-      symbol: c.symbol,
+      // A chain buy arrives with no symbol; the quote that priced it has one.
+      symbol: c.symbol ?? quotes.get(c.mint)?.symbol ?? null,
       priceUsd: price,
       cfg,
       now,
@@ -1134,7 +1238,7 @@ export async function runPaperTick({
     if (res.ok) {
       report.opened.push({
         mint: c.mint,
-        symbol: c.symbol,
+        symbol: res.position?.symbol ?? c.symbol ?? null,
         sizeSol: res.sizeSol,
         basis: res.basis ?? null,
         whaleSpendSol: c.whaleSpendSol ?? null,
@@ -1312,13 +1416,16 @@ export function renderPositions(book, solUsd) {
       const mark = Number.isFinite(solUsd) && solUsd > 0 ? usd(valueSol * solUsd, { sign: false }) : `${valueSol.toFixed(3)} SOL`;
       const tp = p.firedRungs?.length ? ` ${p.firedRungs.join(',')}` : '';
       return (
-        `  ${(p.symbol ?? p.mint.slice(0, 8)).padEnd(12).slice(0, 12)}` +
+        `  ${formatTicker(p.symbol, p.mint).padEnd(14).slice(0, 14)}` +
         `${mark.padStart(12)}` +
         `${`${gain >= 0 ? '+' : ''}${gain.toFixed(1)}%`.padStart(10)}` +
         `${p.demo ? '  [DEMO]' : ''}${tp}`
       );
     });
-  return ['  POSITION         VALUE     CHANGE', ...rows].join('\n');
+  // Built from the same widths the rows use, so widening the ticker column
+  // cannot leave the header pointing at the wrong place.
+  const header = `  ${'TICKER'.padEnd(14)}${'VALUE'.padStart(12)}${'CHANGE'.padStart(10)}`;
+  return [header, ...rows].join('\n');
 }
 
 export async function main(argv = []) {
@@ -1348,6 +1455,18 @@ export async function main(argv = []) {
     process.exitCode = 1;
     return;
   }
+  // PURE MIRROR. Re-run through paperConfig so the invariants it enforces —
+  // chain feed on, sells mirrored — apply to a flag exactly as they do to a
+  // config file, rather than being set here and drifting from it.
+  if (argv.includes('--pure-mirror')) {
+    Object.assign(cfg, paperConfig({ ...cfg, pureMirror: true }));
+    console.log('Pure mirror: the target decides every entry AND every exit.');
+    console.log('  Take-profit ladder, trailing stop and hard stop are OFF.');
+    console.log('  Nothing bounds a position\'s downside — a target that abandons a rug');
+    console.log('  without selling never produces the exit, and the book rides it down.');
+    console.log('');
+  }
+
   // Escape hatch back to the ledger path, and a way to point at a different
   // keyless node without editing config.
   if (argv.includes('--no-chain')) cfg.rpcMirror.enabled = false;
@@ -1466,7 +1585,7 @@ export async function main(argv = []) {
     }
     await saveBook(book);
     console.log(
-      `DEMO PAPER BUY ${token.symbol ?? token.mint.slice(0, 8)} — ` +
+      `DEMO PAPER BUY ${formatTicker(token.symbol, token.mint)} — ` +
         `${res.sizeSol.toFixed(3)} SOL${solUsd ? ` (${usd(res.sizeSol * solUsd, { sign: false })})` : ''} @ $${token.priceUsd.toPrecision(4)}`
     );
     console.log('This position is TAGGED as a demo and is not mirrored from the target.');
@@ -1535,13 +1654,13 @@ export async function main(argv = []) {
       // half: "0.012 SOL" alone does not say whether that was 10% of a nibble
       // or a cap biting on a conviction buy.
       recent.push(
-        `[${stamp}] BUY  ${o.symbol ?? o.mint.slice(0, 8)} — ${o.sizeSol.toFixed(4)} SOL` +
+        `[${stamp}] BUY  ${formatTicker(o.symbol, o.mint)} — ${o.sizeSol.toFixed(4)} SOL` +
           (o.basis && cfg.pctWhale ? `  (${o.basis})` : '')
       );
     }
     for (const e of report.exits) {
       recent.push(
-        `[${stamp}] SELL ${e.symbol ?? e.mint.slice(0, 8)} — ${e.label ?? e.trigger}` +
+        `[${stamp}] SELL ${formatTicker(e.symbol, e.mint)} — ${e.label ?? e.trigger}` +
           `${Number.isFinite(e.gainPct) ? ` (${e.gainPct >= 0 ? '+' : ''}${e.gainPct.toFixed(0)}%)` : ''}`
       );
     }
@@ -1571,6 +1690,16 @@ export async function main(argv = []) {
           ` · ${new URL(cfg.rpcMirror.url).host} · 0 Helius credits` +
           (c?.ok ? ` · ${c.scanned} new tx scanned${c.pending ? `, ${c.pending} queued` : ''}` : '')
       );
+    }
+    if (cfg.pureMirror) {
+      console.log('  MODE   pure mirror — no take-profit, no stop-loss; the target decides');
+      // Silence here would be the dangerous kind: equity counts these at their
+      // last mark, and with no stale exit they never leave the book.
+      if (report.unpriced) {
+        console.log(
+          `  ⚠ ${report.unpriced} position(s) could not be priced — held at last mark, so equity may overstate.`
+        );
+      }
     }
     if (intervalSec) {
       console.log(`  updated ${stamp} · every ${intervalSec}s · Ctrl+C to stop`);
