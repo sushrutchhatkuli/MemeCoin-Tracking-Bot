@@ -945,22 +945,38 @@ export async function runScan(args = {}) {
     // So streamed mints are floated to the front, capped so a burst of launches
     // cannot displace the entire established pool — 24 creations/minute against
     // a 15-token budget would otherwise crowd out everything else.
-    const streamedAddresses = new Set(
-      candidates.filter((c) => c.via === 'ws-mint' || c.streamed).map((c) => c.tokenAddress)
+    // ORDERED BY SIGHTING TIME, not by volume. Sorting streamed mints among
+    // themselves by 1h volume is meaningless — a mint caught seconds after
+    // creation has none by construction, so the "ranking" was whatever order
+    // DexScreener returned. Newest first is the actual signal: the freshest
+    // mint takes slot #1.
+    const streamedSeenAt = new Map(
+      candidates
+        .filter((c) => c.via === 'ws-mint' || c.streamed)
+        .map((c) => [c.tokenAddress, c.firstSeenAt ?? 0])
     );
     const priorityCap = config.discovery?.mintStream?.priorityAuditSlots ?? 3;
 
     pairs.sort((a, b) => (b.volume?.h1 ?? 0) - (a.volume?.h1 ?? 0));
 
-    if (streamedAddresses.size && config.discovery?.mintStream?.priorityAudit !== false) {
-      const streamed = pairs.filter((p) => streamedAddresses.has(p.baseToken?.address)).slice(0, priorityCap);
+    if (streamedSeenAt.size && config.discovery?.mintStream?.priorityAudit !== false) {
+      const streamed = pairs
+        .filter((p) => streamedSeenAt.has(p.baseToken?.address))
+        .sort(
+          (a, b) =>
+            (streamedSeenAt.get(b.baseToken?.address) ?? 0) - (streamedSeenAt.get(a.baseToken?.address) ?? 0)
+        )
+        .slice(0, priorityCap);
+
       if (streamed.length) {
-        const rest = pairs.filter((p) => !streamed.includes(p));
-        pairs = [...streamed, ...rest];
+        const promoted = new Set(streamed);
+        pairs = [...streamed, ...pairs.filter((p) => !promoted.has(p))];
+        const ageSec = (Date.now() - (streamedSeenAt.get(streamed[0].baseToken?.address) ?? Date.now())) / 1000;
         console.log(
-          `   ${streamed.length} streamed mint(s) promoted to the front of the audit queue` +
-            (streamedAddresses.size > streamed.length
-              ? ` (${streamedAddresses.size - streamed.length} more streamed, over the ${priorityCap}-slot cap)`
+          `   ${streamed.length} streamed mint(s) promoted — slot #1 is ` +
+            `$${streamed[0].baseToken?.symbol ?? '?'} (streamed ${ageSec.toFixed(0)}s ago)` +
+            (streamedSeenAt.size > streamed.length
+              ? `, ${streamedSeenAt.size - streamed.length} more over the ${priorityCap}-slot cap`
               : '')
         );
       }

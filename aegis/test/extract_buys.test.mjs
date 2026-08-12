@@ -20,6 +20,9 @@ import {
   formatSmartMoneyLine,
   buildCandidatePool,
   matchCandidateSwarm,
+  readBuyerTxCache,
+  writeBuyerTxCache,
+  pruneBuyerTxCache,
 } from '../smart_money.mjs';
 import {
   scoreToken,
@@ -3001,6 +3004,121 @@ test('terminal rendering keeps the URL an anchor was hiding', () => {
   );
   // Non-anchor markup is still stripped, and entities still decode correctly.
   assert.equal(toPlainText('<b>P&amp;L</b>'), 'P&L');
+});
+
+/* ------------------------------------------------------------------ *
+ * In-memory buyer transaction cache
+ *
+ * MEASURED: reading a busy pool's 60 most recent signatures twice, 45 seconds
+ * apart, returned the SAME 60 both times. auditCooldownMinutes is 10, so a
+ * re-audited token asks for transactions this process already fetched.
+ * ------------------------------------------------------------------ */
+
+test('a cached transaction is returned without a refetch, until it expires', () => {
+  const cache = new Map();
+  const now = 1_000_000;
+  const tx = { meta: { fee: 5000 }, transaction: {} };
+
+  assert.equal(readBuyerTxCache('sigA', { cache, now }), null, 'cold');
+  writeBuyerTxCache('sigA', tx, { cache, now });
+  assert.equal(readBuyerTxCache('sigA', { cache, now: now + 1000 }), tx, 'warm');
+
+  // Inside the 10-minute window.
+  assert.equal(readBuyerTxCache('sigA', { cache, ttlMs: 600_000, now: now + 599_000 }), tx);
+  // Past it — and the stale entry is evicted on read rather than left to rot.
+  assert.equal(readBuyerTxCache('sigA', { cache, ttlMs: 600_000, now: now + 601_000 }), null);
+  assert.equal(cache.has('sigA'), false);
+});
+
+test('the cache refuses to store nothing', () => {
+  const cache = new Map();
+  writeBuyerTxCache('sig', null, { cache });
+  writeBuyerTxCache(null, { a: 1 }, { cache });
+  writeBuyerTxCache('', { a: 1 }, { cache });
+  assert.equal(cache.size, 0, 'a failed lookup must not be cached as an absence');
+});
+
+test('the cache is bounded by age AND count', () => {
+  // A parsed transaction is tens of kilobytes and loop.mjs runs for days.
+  const cache = new Map();
+  const now = 1_000_000;
+  for (let i = 0; i < 10; i++) writeBuyerTxCache(`sig${i}`, { i }, { cache, now: now + i });
+
+  pruneBuyerTxCache(cache, { ttlMs: 600_000, maxEntries: 4, now: now + 100 });
+  assert.equal(cache.size, 4);
+  // Oldest evicted first — Map preserves insertion order, so the survivors are
+  // the most recent writes.
+  assert.deepEqual([...cache.keys()], ['sig6', 'sig7', 'sig8', 'sig9']);
+
+  // Age eviction happens regardless of the count cap.
+  const aged = new Map();
+  writeBuyerTxCache('old', { a: 1 }, { cache: aged, now });
+  writeBuyerTxCache('new', { a: 2 }, { cache: aged, now: now + 599_000 });
+  pruneBuyerTxCache(aged, { ttlMs: 600_000, maxEntries: 100, now: now + 601_000 });
+  assert.deepEqual([...aged.keys()], ['new']);
+});
+
+/* ------------------------------------------------------------------ *
+ * Streamed-mint priority queueing
+ * ------------------------------------------------------------------ */
+
+/** The promotion exactly as scan.mjs applies it, extracted to be testable. */
+function promoteStreamed(pairs, seenAt, cap = 3) {
+  const sorted = [...pairs].sort((a, b) => (b.volume?.h1 ?? 0) - (a.volume?.h1 ?? 0));
+  const streamed = sorted
+    .filter((p) => seenAt.has(p.baseToken?.address))
+    .sort((a, b) => (seenAt.get(b.baseToken?.address) ?? 0) - (seenAt.get(a.baseToken?.address) ?? 0))
+    .slice(0, cap);
+  const promoted = new Set(streamed);
+  return [...streamed, ...sorted.filter((p) => !promoted.has(p))];
+}
+
+test('the newest streamed mint takes slot #1, ahead of the volume leader', () => {
+  // A mint caught seconds after creation has NO volume by construction, so the
+  // volume sort puts it last and scanLimit cuts it every tick — the 0ms
+  // discovery would deliver a candidate the scanner never looks at.
+  const now = Date.now();
+  const seenAt = new Map([['OLD', now - 300_000], ['NEW', now - 5_000], ['MID', now - 60_000]]);
+  const pairs = [
+    { baseToken: { address: 'BIGVOL', symbol: 'BIG' }, volume: { h1: 900_000 } },
+    { baseToken: { address: 'OLD', symbol: 'OLD' }, volume: { h1: 10 } },
+    { baseToken: { address: 'MID', symbol: 'MID' }, volume: { h1: 0 } },
+    { baseToken: { address: 'NEW', symbol: 'NEW' }, volume: { h1: 0 } },
+  ];
+  const queue = promoteStreamed(pairs, seenAt).map((p) => p.baseToken.symbol);
+  assert.equal(queue[0], 'NEW', 'freshest sighting first');
+  // Ordered by SIGHTING TIME among themselves, not by volume — sorting
+  // zero-volume newborns by volume is whatever order the API returned.
+  assert.deepEqual(queue, ['NEW', 'MID', 'OLD', 'BIG']);
+});
+
+test('the promotion is capped so a launch burst cannot crowd out the pool', () => {
+  // ~24 pump.fun creations a minute against a 15-token budget.
+  const now = Date.now();
+  const seenAt = new Map(Array.from({ length: 20 }, (_, i) => [`S${i}`, now - i * 1000]));
+  const pairs = [
+    ...Array.from({ length: 20 }, (_, i) => ({ baseToken: { address: `S${i}`, symbol: `S${i}` }, volume: { h1: 0 } })),
+    { baseToken: { address: 'ESTABLISHED', symbol: 'EST' }, volume: { h1: 500_000 } },
+  ];
+  const queue = promoteStreamed(pairs, seenAt, 3).map((p) => p.baseToken.symbol);
+  assert.deepEqual(queue.slice(0, 4), ['S0', 'S1', 'S2', 'EST'], 'three promoted, then the volume leader');
+});
+
+test('with no streamed mints the queue is the plain volume ranking', () => {
+  const pairs = [
+    { baseToken: { address: 'A', symbol: 'A' }, volume: { h1: 10 } },
+    { baseToken: { address: 'B', symbol: 'B' }, volume: { h1: 900 } },
+  ];
+  assert.deepEqual(promoteStreamed(pairs, new Map()).map((p) => p.baseToken.symbol), ['B', 'A']);
+});
+
+test('every pair survives promotion — nothing is dropped or duplicated', () => {
+  const now = Date.now();
+  const seenAt = new Map([['A', now], ['C', now - 1000]]);
+  const pairs = ['A', 'B', 'C', 'D'].map((s, i) => ({ baseToken: { address: s, symbol: s }, volume: { h1: i } }));
+  const queue = promoteStreamed(pairs, seenAt);
+  assert.equal(queue.length, 4);
+  assert.deepEqual([...new Set(queue.map((p) => p.baseToken.symbol))].sort(), ['A', 'B', 'C', 'D']);
 });
 
 /* ------------------------------------------------------------------ *

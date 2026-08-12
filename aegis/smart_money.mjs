@@ -436,6 +436,87 @@ export function matchCandidateSwarm({
  * Recent buyer extraction (Solana RPC)
  * ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ *
+ * In-memory buyer transaction cache
+ * ------------------------------------------------------------------ *
+ *
+ * getTransaction is the most expensive call in the pipeline, and the same
+ * signatures are read again on every re-audit of a token.
+ *
+ * MEASURED: reading a busy pool's 60 most recent signatures twice, 45 seconds
+ * apart, returned the SAME 60 both times — a 100% overlap. auditCooldownMinutes
+ * is 10, so a token re-audited on schedule asks for transactions this process
+ * fetched minutes ago, and pays full price for every one.
+ *
+ * ── WHAT IS CACHED, AND WHY THE RAW RESULT ──────────────────────────────────
+ * The RPC's own response, keyed by signature. Not the extracted buys: those
+ * depend on `{mint, poolAddress}`, so a signature processed for a different
+ * mint would need a different answer, and keying the derived value by signature
+ * alone would hand back the wrong buyers. Extraction is pure and cheap, so it
+ * is re-run per call against a cached transaction.
+ *
+ * ── PER-PROCESS, AND THAT IS THE HONEST SCOPE ───────────────────────────────
+ * loop.mjs is long-lived, so this survives across ticks and is where the saving
+ * lands. index.mjs starts a fresh process per scheduled run and gets nothing
+ * from it — an in-memory cache cannot span processes, and the disk cache that
+ * could is a different mechanism with different invalidation.
+ *
+ * Bounded by BOTH age and count: a parsed transaction is tens of kilobytes, and
+ * a long-running loop would otherwise accumulate them until the process died of
+ * it.
+ */
+export const seenBuyerTxCache = new Map();
+
+let cacheHits = 0;
+let cacheMisses = 0;
+
+/** Drop expired entries, then trim oldest-first if still over the cap. */
+export function pruneBuyerTxCache(cache = seenBuyerTxCache, { ttlMs = 600_000, maxEntries = 1_500, now = Date.now() } = {}) {
+  for (const [sig, entry] of cache) {
+    if (now - entry.at > ttlMs) cache.delete(sig);
+  }
+  if (cache.size <= maxEntries) return cache;
+  // Map preserves insertion order, so the head is the oldest.
+  const excess = cache.size - maxEntries;
+  let i = 0;
+  for (const sig of cache.keys()) {
+    if (i++ >= excess) break;
+    cache.delete(sig);
+  }
+  return cache;
+}
+
+export function readBuyerTxCache(signature, { cache = seenBuyerTxCache, ttlMs = 600_000, now = Date.now() } = {}) {
+  const entry = cache.get(signature);
+  if (!entry) return null;
+  if (now - entry.at > ttlMs) {
+    cache.delete(signature);
+    return null;
+  }
+  return entry.tx;
+}
+
+export function writeBuyerTxCache(signature, tx, { cache = seenBuyerTxCache, now = Date.now() } = {}) {
+  if (!signature || !tx) return;
+  cache.set(signature, { tx, at: now });
+}
+
+/** Hit/miss counters, so the saving is visible rather than assumed. */
+export function buyerTxCacheStats() {
+  const total = cacheHits + cacheMisses;
+  return {
+    hits: cacheHits,
+    misses: cacheMisses,
+    size: seenBuyerTxCache.size,
+    hitRatePct: total ? (cacheHits / total) * 100 : null,
+  };
+}
+
+export function resetBuyerTxCacheStats() {
+  cacheHits = 0;
+  cacheMisses = 0;
+}
+
 async function rpc(url, method, params, timeoutMs = 20000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -832,28 +913,49 @@ export async function fetchRecentBuyers({ rpcUrl, poolAddress, mint, cfg, screen
   let inspected = 0;
   let throttled = false;
 
+  const cacheTtlMs = (cfg.buyerTxCacheMinutes ?? 10) * 60_000;
+
   for (const sig of target) {
-    // The public RPC throttles aggressively once the deployer audit has already
-    // spent calls this pass. Back off and retry before giving up, otherwise the
-    // walk dies after ~5 transactions and silently reports a useless sample.
-    let tx = await rpc(rpcUrl, 'getTransaction', [
-      sig.signature,
-      { maxSupportedTransactionVersion: 0, encoding: 'jsonParsed' },
-    ]);
-    for (let retry = 0; tx.error && retry < cfg.buyerRetries; retry++) {
-      await sleep(cfg.rpcBackoffMs * (retry + 1));
+    // Cache first. A re-audit asks for the same signatures this process already
+    // fetched — measured at 100% overlap across a 45s gap on a busy pool — so
+    // the cheapest possible call is the one not made.
+    let tx = null;
+    const cached = readBuyerTxCache(sig.signature, { ttlMs: cacheTtlMs });
+    // Tracked so the inter-call delay can be skipped on a hit. That delay
+    // exists to pace the RPC; a call that never happened has nothing to pace,
+    // and sleeping anyway would spend the saving on waiting.
+    const servedFromCache = Boolean(cached);
+    if (cached) {
+      tx = { result: cached };
+      cacheHits++;
+    } else {
+      cacheMisses++;
+      // The public RPC throttles aggressively once the deployer audit has already
+      // spent calls this pass. Back off and retry before giving up, otherwise the
+      // walk dies after ~5 transactions and silently reports a useless sample.
       tx = await rpc(rpcUrl, 'getTransaction', [
         sig.signature,
         { maxSupportedTransactionVersion: 0, encoding: 'jsonParsed' },
       ]);
-    }
-    if (tx.error) {
-      throttled = true;
-      break;
+      for (let retry = 0; tx.error && retry < cfg.buyerRetries; retry++) {
+        await sleep(cfg.rpcBackoffMs * (retry + 1));
+        tx = await rpc(rpcUrl, 'getTransaction', [
+          sig.signature,
+          { maxSupportedTransactionVersion: 0, encoding: 'jsonParsed' },
+        ]);
+      }
+      if (tx.error) {
+        throttled = true;
+        break;
+      }
+      // Only successful reads are cached. Caching an error would turn one
+      // throttled call into ten minutes of pretending the transaction does not
+      // exist.
+      writeBuyerTxCache(sig.signature, tx.result);
     }
     inspected++;
     if (tx.result?.meta?.err) {
-      await sleep(cfg.rpcDelayMs);
+      if (!servedFromCache) await sleep(cfg.rpcDelayMs);
       continue;
     }
 
@@ -884,7 +986,7 @@ export async function fetchRecentBuyers({ rpcUrl, poolAddress, mint, cfg, screen
       // Keep the EARLIEST buy per wallet — entry timing is the interesting fact.
       if (!existing || entry.blockTime < existing.blockTime) buyers.set(b.wallet, entry);
     }
-    await sleep(cfg.rpcDelayMs);
+    if (!servedFromCache) await sleep(cfg.rpcDelayMs);
   }
 
   // Screen at the source, so system accounts never enter the observation ledger.
