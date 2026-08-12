@@ -15,6 +15,9 @@
  *   --pct-whale <percent>                       size each mirrored entry at
  *                                               this % of what the whale spent,
  *                                               e.g. --pct-whale 10
+ *   --no-chain                                  ignore the live RPC mirror and
+ *                                               fall back to the ledger
+ *   --rpc <url>                                 use a different keyless node
  *
  * A short --watch interval re-prices and re-renders quickly, but it CANNOT make
  * the mirror faster than the ledger it reads: see the latency note below. At 5s
@@ -118,6 +121,23 @@ export const PAPER_DEFAULTS = {
   // Floor for a proportional position. 0 means "no floor", which is faithful to
   // a bare --pct-whale and is why the CLI warns instead of silently clamping.
   minTradeSol: 0,
+  // LIVE ON-CHAIN MIRROR. Reads the target's own transactions from a free
+  // public RPC — 0 Helius credits — instead of waiting for the observation
+  // ledger. Sees sells too, which the ledger never recorded.
+  rpcMirror: {
+    enabled: true,
+    url: 'https://api.mainnet-beta.solana.com',
+    signatureLimit: 25,
+    maxTxLookupsPerTick: 12,
+    delayMs: 120,
+    // Mirror the target's exits as well as its entries. The paper stop and
+    // take-profit ladder still run underneath, on whatever the whale exit
+    // leaves behind — BOTH can act in one tick. A 40% whale sell into a price
+    // that has doubled books the whale exit first and then takes the +100%
+    // rung on the remainder, which is two independent risk rules agreeing
+    // rather than one overriding the other.
+    mirrorSells: true,
+  },
 };
 
 /* ------------------------------------------------------------------ *
@@ -185,6 +205,12 @@ export function paperConfig(overrides = {}) {
   // nothing forever, which is a config mistake rather than a strategy.
   cfg.pctWhale =
     Number.isFinite(Number(cfg.pctWhale)) && Number(cfg.pctWhale) > 0 ? Number(cfg.pctWhale) : null;
+  cfg.rpcMirror = { ...PAPER_DEFAULTS.rpcMirror, ...(cfg.rpcMirror ?? {}) };
+  // A blank or non-http url would silently disable the mirror while the config
+  // still claimed it was on.
+  if (!/^https?:\/\//.test(String(cfg.rpcMirror.url ?? ''))) {
+    cfg.rpcMirror.url = PAPER_DEFAULTS.rpcMirror.url;
+  }
   cfg.takeProfit = (Array.isArray(cfg.takeProfit) ? cfg.takeProfit : [])
     .map((r) => ({
       gainPct: Number(r?.gainPct),
@@ -657,6 +683,221 @@ export function pendingMirrorBuys(observations, { target, book, cfg, now = Date.
 }
 
 /* ------------------------------------------------------------------ *
+ * Live on-chain mirror — free public RPC
+ * ------------------------------------------------------------------ *
+ *
+ * Reads the target's OWN transactions instead of waiting for Aegis to audit a
+ * token the target happened to buy. That closes most of the latency this
+ * module's header describes, and it costs ZERO Helius credits: standard
+ * JSON-RPC, no key, against api.mainnet-beta.solana.com.
+ *
+ * ── WHY THIS IS STRICTLY BETTER THAN THE LEDGER PATH, AND WHAT IT COSTS ────
+ * The ledger only ever contained the whale's buys on tokens that reached an
+ * audit, among the first buyerMaxTxLookups (12) buyers, at scan cadence. This
+ * sees EVERY transaction the wallet signs, seconds after it lands, including
+ * the SELLS the ledger never recorded at all.
+ *
+ * MEASURED 2026-08-12 against the live target over its last 10 signatures:
+ *   api.mainnet-beta.solana.com   getSignaturesForAddress   223ms
+ *                                 getTransaction             47ms
+ *   solana-rpc.publicnode.com     connection failure
+ *   solana.drpc.org              HTTP 400 "not available on free plan"
+ *   rpc.ankr.com                 HTTP 403 "API key is not allowed"
+ * So the Foundation endpoint is the one that works keyless, and the rpcPool
+ * note in config.json — which recorded all four as unreachable — is out of date
+ * for this one. The other three remain unusable without a key.
+ *
+ * All ten signatures were under an hour old and eight were clean swaps, four of
+ * them completing round trips visible in the same window (bought 9P3hk33M at
+ * -1.2378 SOL, sold at +1.0991; bought BwCstN7x at -1.9523, sold at +2.3319).
+ * Two were failed transactions, which is why the parser drops meta.err rather
+ * than trusting a signature to mean a trade happened.
+ */
+
+export const PUBLIC_SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
+const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+
+/** Minimal JSON-RPC. No key, no provider-specific extensions. */
+export async function solanaRpc(url, method, params, { timeoutMs = 15_000, fetchImpl = fetch } = {}) {
+  try {
+    const res = await fetchImpl(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+    const body = await res.json();
+    if (body?.error) return { ok: false, error: body.error.message ?? 'rpc error' };
+    return { ok: true, result: body?.result ?? null };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Turn one raw `jsonParsed` transaction into a trade by this wallet. PURE.
+ *
+ * ── HOW A BUY AND A SELL ARE TOLD APART ────────────────────────────────────
+ * From BALANCE DELTAS, not from instruction decoding. Every AMM, aggregator and
+ * router has its own instruction layout and they change; a balance delta is the
+ * same fact whichever program produced it. The wallet's lamport change comes
+ * from pre/postBalances at its account index, and its token change from the
+ * pre/postTokenBalances rows it OWNS.
+ *
+ *   SOL out + token in   -> BUY
+ *   SOL in  + token out  -> SELL
+ *
+ * WSOL is skipped for the same reason computeOnChainWinRate skips it: it is the
+ * SOL side of the swap wearing a token's clothes, and counting it would make
+ * every trade look like a WSOL round trip.
+ *
+ * A transaction touching MORE THAN ONE non-WSOL mint is not attributed. A
+ * multi-hop route or a two-token action cannot be split into "the position"
+ * from balances alone, and guessing which leg mattered would put the wrong mint
+ * in the book.
+ *
+ * `sellFraction` is what makes a mirrored sell proportional: the whale's own
+ * pre-balance is in the payload, so selling 40% of their bag closes 40% of the
+ * paper position rather than all of it. Falling back to a full exit when the
+ * pre-balance is missing is the safe direction — it closes a position the whale
+ * has demonstrably left.
+ *
+ * The BUY's `solSpent` is |lamport delta| and therefore includes the network
+ * fee and any rent for a new token account. It slightly overstates what went
+ * into the token, by a fraction of the fee, and is the only spend figure
+ * derivable without decoding every instruction.
+ */
+export function parseWalletSwap(tx, { wallet } = {}) {
+  if (!tx || !wallet) return null;
+  const meta = tx.meta;
+  // A signature is not a trade. Two of the ten sampled were failed
+  // transactions, and a failed swap moves nothing.
+  if (!meta || meta.err) return null;
+
+  const keys = (tx.transaction?.message?.accountKeys ?? []).map((k) => (typeof k === 'string' ? k : k?.pubkey));
+  const idx = keys.indexOf(wallet);
+  if (idx === -1) return null;
+
+  const pre = meta.preBalances?.[idx];
+  const post = meta.postBalances?.[idx];
+  if (!Number.isFinite(pre) || !Number.isFinite(post)) return null;
+  const solDelta = (post - pre) / 1e9;
+
+  const owned = (rows) => {
+    const m = new Map();
+    for (const b of rows ?? []) {
+      if (b?.owner !== wallet || !b?.mint || b.mint === WSOL_MINT) continue;
+      m.set(b.mint, Number(b.uiTokenAmount?.uiAmount ?? 0));
+    }
+    return m;
+  };
+  const before = owned(meta.preTokenBalances);
+  const after = owned(meta.postTokenBalances);
+
+  const moved = [];
+  for (const mint of new Set([...before.keys(), ...after.keys()])) {
+    const delta = (after.get(mint) ?? 0) - (before.get(mint) ?? 0);
+    if (delta !== 0) moved.push({ mint, delta, preAmount: before.get(mint) ?? 0 });
+  }
+  if (moved.length !== 1) return null;
+
+  const { mint, delta, preAmount } = moved[0];
+  const base = {
+    signature: tx.transaction?.signatures?.[0] ?? null,
+    blockTime: tx.blockTime ? tx.blockTime * 1000 : null,
+    mint,
+    solDelta,
+  };
+
+  if (delta > 0 && solDelta < 0) {
+    return { ...base, kind: 'BUY', solSpent: Math.abs(solDelta), tokenDelta: delta };
+  }
+  if (delta < 0 && solDelta > 0) {
+    const sold = Math.abs(delta);
+    const fraction = preAmount > 0 ? Math.min(1, sold / preAmount) : 1;
+    return { ...base, kind: 'SELL', solReceived: solDelta, tokenDelta: delta, sellFraction: fraction };
+  }
+  // Transfers in or out, airdrops, and anything where SOL and the token moved
+  // the same way are not trades.
+  return null;
+}
+
+/**
+ * The target's recent trades, newest signature first.
+ *
+ * `sinceSignature` stops the walk as soon as a known signature is seen, so a
+ * steady-state poll costs ONE getSignaturesForAddress and nothing else. That is
+ * what makes a 5-second cadence affordable on a public endpoint.
+ */
+export async function fetchWhaleTrades({
+  wallet,
+  rpcUrl = PUBLIC_SOLANA_RPC,
+  sinceSignature = null,
+  signatureLimit = 25,
+  maxTxLookups = 12,
+  delayMs = 120,
+  rpcImpl = solanaRpc,
+} = {}) {
+  if (!wallet) return { ok: false, error: 'no wallet', trades: [], newestSignature: null };
+
+  const sigs = await rpcImpl(rpcUrl, 'getSignaturesForAddress', [wallet, { limit: signatureLimit }]);
+  if (!sigs.ok) return { ok: false, error: sigs.error, trades: [], newestSignature: null };
+  const list = Array.isArray(sigs.result) ? sigs.result : [];
+  if (!list.length) return { ok: true, trades: [], newestSignature: null, scanned: 0 };
+
+  // Everything newer than the last one seen. On a cold start that is the whole
+  // page, which is bounded by signatureLimit.
+  const fresh = [];
+  for (const s of list) {
+    if (sinceSignature && s.signature === sinceSignature) break;
+    if (s.err) continue;
+    fresh.push(s);
+  }
+
+  // ── OLDEST FIRST, AND THE CURSOR ONLY MOVES AS FAR AS WE ACTUALLY READ ────
+  // Two reasons, and the first was a live bug: taking the NEWEST maxTxLookups
+  // and then setting the cursor to the page's newest signature drops everything
+  // in between. Observed on a cold start — "12 new tx scanned, 8 queued",
+  // then 0 forever, with those 8 never read despite the code claiming they
+  // would be caught up. Walking forward from the cursor and advancing only to
+  // the last signature actually parsed makes a burst take several ticks instead
+  // of losing its tail.
+  //
+  // Oldest-first is also required for correctness within a batch: a buy and a
+  // later sell of the same mint must apply in that order, or the sell arrives
+  // before the position exists and is discarded.
+  const batch = fresh.slice().reverse().slice(0, maxTxLookups);
+
+  const trades = [];
+  let looked = 0;
+  for (const s of batch) {
+    looked++;
+    const tx = await rpcImpl(rpcUrl, 'getTransaction', [
+      s.signature,
+      { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 },
+    ]);
+    if (tx.ok && tx.result) {
+      const trade = parseWalletSwap(tx.result, { wallet });
+      if (trade) trades.push(trade);
+    }
+    if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+  }
+
+  return {
+    ok: true,
+    trades,
+    // The newest signature PARSED, not the newest that exists. When nothing was
+    // fresh the cursor lands on the page head, which is where it already was.
+    newestSignature: batch.length ? batch[batch.length - 1].signature : (list[0]?.signature ?? null),
+    scanned: looked,
+    // Still newer than the cursor and not yet read. These are picked up by the
+    // next tick now that the cursor advances incrementally.
+    pending: Math.max(0, fresh.length - looked),
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * IO shell
  * ------------------------------------------------------------------ */
 
@@ -722,20 +963,81 @@ export async function runPaperTick({
   cfg,
   now = Date.now(),
   priceFetcher = fetchPrices,
+  tradeFetcher = fetchWhaleTrades,
 } = {}) {
-  const report = { opened: [], exits: [], marked: 0, declined: [], target: null };
+  const report = { opened: [], exits: [], marked: 0, declined: [], target: null, chain: null };
 
   const resolved = resolveTarget(watchlist, book);
   report.target = resolved;
   if (resolved.target) {
     if (!book.target || book.target.address !== resolved.target.address) {
       book.target = { ...resolved.target, since: now };
+      // A new target's cursor cannot carry over: its signatures are unrelated,
+      // and reusing the old one would replay the new wallet's whole first page
+      // or skip it entirely depending on ordering.
+      book.lastSignature = null;
     } else {
       book.target.label = resolved.target.label ?? book.target.label;
     }
   }
 
-  const candidates = pendingMirrorBuys(observations, { target: book.target, book, cfg, now });
+  // ---- live on-chain trades, free public RPC -----------------------
+  let liveBuys = [];
+  let liveSells = [];
+  if (cfg.rpcMirror?.enabled && book.target?.address) {
+    const live = await tradeFetcher({
+      wallet: book.target.address,
+      rpcUrl: cfg.rpcMirror.url,
+      sinceSignature: book.lastSignature ?? null,
+      signatureLimit: cfg.rpcMirror.signatureLimit,
+      maxTxLookups: cfg.rpcMirror.maxTxLookupsPerTick,
+      delayMs: cfg.rpcMirror.delayMs,
+    });
+    report.chain = { ok: live.ok, error: live.error ?? null, scanned: live.scanned ?? 0, pending: live.pending ?? 0 };
+
+    if (live.ok) {
+      // ONLY advanced on success. A failed poll must not skip the window it
+      // failed to read, or a transient RPC error would silently drop every
+      // trade the whale made during it.
+      if (live.newestSignature) book.lastSignature = live.newestSignature;
+      for (const t of live.trades) {
+        if (t.kind === 'BUY') liveBuys.push(t);
+        else if (t.kind === 'SELL') liveSells.push(t);
+      }
+    }
+  }
+
+  // Chain buys take precedence: they carry the real spend and arrive seconds
+  // after the trade rather than at scan cadence. The ledger path stays as a
+  // fallback for a run with the mirror disabled.
+  const ledgerCandidates = cfg.rpcMirror?.enabled
+    ? []
+    : pendingMirrorBuys(observations, { target: book.target, book, cfg, now });
+  const held = new Set(Object.keys(book.positions));
+  const everSeen = new Set([...held, ...(book.closed ?? []).map((c) => c.mint)]);
+  // maxBuyAgeMinutes applies to chain buys exactly as it does to ledger ones,
+  // and it is load-bearing on the first tick: a cold start reads a whole page
+  // of history, and without this the book would enter tokens the whale bought
+  // an hour ago at prices that have already moved — copying a decision whose
+  // moment has passed, which is the thing the ledger path's own age bound
+  // exists to prevent. A trade with no blockTime is treated as current, since
+  // the only way it reached this page is by being recent.
+  const buyCutoff = now - cfg.maxBuyAgeMinutes * 60_000;
+  let staleChainBuys = 0;
+  const candidates = [
+    ...liveBuys
+      .filter((t) => {
+        if (everSeen.has(t.mint)) return false;
+        if (Number.isFinite(t.blockTime) && t.blockTime < buyCutoff) {
+          staleChainBuys++;
+          return false;
+        }
+        return true;
+      })
+      .map((t) => ({ mint: t.mint, symbol: null, observedAt: t.blockTime ?? now, whaleSpendSol: t.solSpent })),
+    ...ledgerCandidates,
+  ];
+  if (report.chain) report.chain.staleSkipped = staleChainBuys;
   const openMints = Object.keys(book.positions);
   const needPrices = [...new Set([...openMints, ...candidates.map((c) => c.mint)])];
   const prices = await priceFetcher(needPrices);
@@ -746,6 +1048,44 @@ export async function runPaperTick({
     if (Number.isFinite(price)) {
       markPosition(book.positions[mint], price, now);
       report.marked++;
+    }
+  }
+
+  // ---- mirrored sells, BEFORE the paper's own exit rules -----------
+  //
+  // The target leaving a position is a stronger signal than any threshold this
+  // engine computes: it is the person being copied acting on the trade, while
+  // a trailing stop is an inference from price. So a whale exit is applied
+  // first, and the ladder and stops below then run on whatever remains.
+  //
+  // PROPORTIONAL, using the fraction of THEIR bag they actually sold — the
+  // pre-balance is in the same payload. Selling 40% closes 40% of the paper
+  // position, so a partial de-risk is mirrored as a partial de-risk rather
+  // than being rounded up into a full exit.
+  if (cfg.rpcMirror?.mirrorSells !== false) {
+    for (const sell of liveSells) {
+      const p = book.positions[sell.mint];
+      if (!p) continue;
+      const price = prices.get(sell.mint) ?? p.markPriceUsd;
+      if (!Number.isFinite(price) || price <= 0) continue;
+      const fraction = Number.isFinite(sell.sellFraction) ? sell.sellFraction : 1;
+      const res = applyPaperExit(book, sell.mint, {
+        priceUsd: price,
+        trigger: 'WHALE_SELL',
+        sellFraction: fraction,
+        cfg,
+        now,
+        label: `target sold ${(fraction * 100).toFixed(0)}% of its bag`,
+      });
+      if (res.ok) {
+        report.exits.push({
+          mint: sell.mint,
+          symbol: p.symbol,
+          trigger: 'WHALE_SELL',
+          label: `target sold ${(fraction * 100).toFixed(0)}%`,
+          gainPct: p.entryPriceUsd > 0 ? (price / p.entryPriceUsd - 1) * 100 : null,
+        });
+      }
     }
   }
 
@@ -972,6 +1312,14 @@ export async function main(argv = []) {
     process.exitCode = 1;
     return;
   }
+  // Escape hatch back to the ledger path, and a way to point at a different
+  // keyless node without editing config.
+  if (argv.includes('--no-chain')) cfg.rpcMirror.enabled = false;
+  const rpcIdx = argv.indexOf('--rpc');
+  if (rpcIdx !== -1 && /^https?:\/\//.test(String(argv[rpcIdx + 1] ?? ''))) {
+    cfg.rpcMirror.url = argv[rpcIdx + 1];
+  }
+
   if (pctFlag.value !== null) {
     cfg.pctWhale = pctFlag.value;
     // WARNED, NOT CLAMPED. The measured consequence is specific enough to state
@@ -1173,8 +1521,20 @@ export async function main(argv = []) {
       console.log('\n  RECENT ACTIVITY');
       for (const line of recent) console.log(`  ${line}`);
     }
+    // The chain line is load-bearing on a dashboard that otherwise looks
+    // identical whether the mirror is live or silently failing: an unreachable
+    // RPC produces no buys, and "no buys" is exactly what a quiet whale looks
+    // like too.
+    if (cfg.rpcMirror?.enabled) {
+      const c = report.chain;
+      console.log(
+        `\n  CHAIN  ${c?.ok ? 'live' : `UNREACHABLE — ${c?.error ?? 'unknown'}`}` +
+          ` · ${new URL(cfg.rpcMirror.url).host} · 0 Helius credits` +
+          (c?.ok ? ` · ${c.scanned} new tx scanned${c.pending ? `, ${c.pending} queued` : ''}` : '')
+      );
+    }
     if (intervalSec) {
-      console.log(`\n  updated ${stamp} · every ${intervalSec}s · Ctrl+C to stop`);
+      console.log(`  updated ${stamp} · every ${intervalSec}s · Ctrl+C to stop`);
     }
   };
 

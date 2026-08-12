@@ -6216,7 +6216,12 @@ test('only recent, unseen buys by the target are mirrored', async () => {
 
 test('a paper tick marks, exits and enters against injected prices', async () => {
   const { createBook, runPaperTick, paperConfig, openPaperPosition } = await PC();
-  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, trailingStopPct: 30 });
+  // Ledger path: this test predates the live chain mirror and is about the
+  // mark/exit/enter ordering, not about where the buys came from.
+  const cfg = paperConfig({
+    budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, trailingStopPct: 30,
+    rpcMirror: { enabled: false },
+  });
   const now = 1_000_000_000;
   const book = createBook({ budgetSol: 10, target: { address: 'TARGET' } });
   openPaperPosition(book, { mint: 'RUNNER', priceUsd: 100, cfg, now: now - 1000 });
@@ -7033,7 +7038,12 @@ test('the whale spend is carried from the ledger into the mirror', async () => {
 
 test('a tick sizes each mirrored entry proportionally', async () => {
   const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
-  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, pctWhale: 10, slippagePct: 0, feeSol: 0, maxOpenPositions: 5 });
+  // LEDGER PATH explicitly: the live chain mirror is the default and would make
+  // the observations below irrelevant. This test is about sizing, not sourcing.
+  const cfg = paperConfig({
+    budgetSol: 10, perTradeSol: 1, pctWhale: 10, slippagePct: 0, feeSol: 0, maxOpenPositions: 5,
+    rpcMirror: { enabled: false },
+  });
   const now = 1_000_000_000;
   const book = createBook({ budgetSol: 10, target: { address: 'T' } });
 
@@ -7066,4 +7076,368 @@ test('a tick sizes each mirrored entry proportionally', async () => {
   // the whole point of proportional sizing over a flat one.
   assert.ok(size('BIG') > size('SMALL') * 10 - 1e-9);
   assert.ok(Math.abs(book.balanceSol - (10 - 0.4 - 0.02 - 1)) < 1e-9);
+});
+
+/* ------------------------------------------------------------------ *
+ * Live on-chain mirror (free public RPC)
+ * ------------------------------------------------------------------ */
+
+const CHAIN_WSOL = 'So11111111111111111111111111111111111111112';
+
+// Shaped exactly like a real getTransaction(jsonParsed) payload — the fields
+// below are the ones a live probe of the target actually returned.
+function chainTx({ wallet = 'W', solBefore = 10e9, solAfter = 10e9, pre = [], post = [], err = null, sig = 'SIG', blockTime = 1_700_000 } = {}) {
+  return {
+    blockTime,
+    transaction: { signatures: [sig], message: { accountKeys: [{ pubkey: wallet }, { pubkey: 'OTHER' }] } },
+    meta: {
+      err,
+      preBalances: [solBefore, 0],
+      postBalances: [solAfter, 0],
+      preTokenBalances: pre,
+      postTokenBalances: post,
+    },
+  };
+}
+const chainBal = (mint, uiAmount, owner = 'W') => ({ mint, owner, uiTokenAmount: { uiAmount } });
+
+test('parseWalletSwap tells a buy from a sell using balance deltas', async () => {
+  const { parseWalletSwap } = await import('../paper_copytrade.mjs');
+
+  // SOL out, token in -> BUY. Matches the live shape: -1.2378 SOL, +3.05e6.
+  const buy = parseWalletSwap(
+    chainTx({ solBefore: 10e9, solAfter: 8.7622e9, pre: [], post: [chainBal('MINT', 3.05e6)] }),
+    { wallet: 'W' }
+  );
+  assert.equal(buy.kind, 'BUY');
+  assert.equal(buy.mint, 'MINT');
+  assert.ok(Math.abs(buy.solSpent - 1.2378) < 1e-6);
+
+  // SOL in, token out -> SELL, with the fraction of THEIR bag they sold.
+  const sell = parseWalletSwap(
+    chainTx({ solBefore: 8.7622e9, solAfter: 9.8613e9, pre: [chainBal('MINT', 3.05e6)], post: [chainBal('MINT', 0)] }),
+    { wallet: 'W' }
+  );
+  assert.equal(sell.kind, 'SELL');
+  assert.ok(Math.abs(sell.solReceived - 1.0991) < 1e-6);
+  assert.equal(sell.sellFraction, 1);
+
+  // A PARTIAL de-risk is mirrored as partial, not rounded up to a full exit.
+  const partial = parseWalletSwap(
+    chainTx({ solBefore: 1e9, solAfter: 1.4e9, pre: [chainBal('MINT', 1000)], post: [chainBal('MINT', 600)] }),
+    { wallet: 'W' }
+  );
+  assert.equal(partial.kind, 'SELL');
+  assert.ok(Math.abs(partial.sellFraction - 0.4) < 1e-9);
+});
+
+test('parseWalletSwap refuses everything that is not an attributable trade', async () => {
+  const { parseWalletSwap } = await import('../paper_copytrade.mjs');
+  const W = { wallet: 'W' };
+
+  // A FAILED transaction moves nothing. Two of ten live signatures were failed
+  // ones, so a signature is not a trade.
+  assert.equal(parseWalletSwap(chainTx({ err: { InstructionError: [] }, post: [chainBal('M', 1)] }), W), null);
+
+  // WSOL is the SOL side wearing a token's clothes — counting it would make
+  // every swap look like a WSOL round trip.
+  assert.equal(parseWalletSwap(chainTx({ solAfter: 9e9, post: [chainBal(CHAIN_WSOL, 1)] }), W), null);
+
+  // Two non-WSOL mints cannot be split into "the position" from balances alone.
+  assert.equal(
+    parseWalletSwap(chainTx({ solBefore: 10e9, solAfter: 9e9, post: [chainBal('A', 1), chainBal('B', 1)] }), W),
+    null
+  );
+
+  // Someone else's token rows are not this wallet's position.
+  assert.equal(parseWalletSwap(chainTx({ solAfter: 9e9, post: [chainBal('M', 5, 'SOMEONE_ELSE')] }), W), null);
+
+  // A transfer in (token up, SOL up) and a transfer out (token down, SOL down)
+  // are not trades in either direction.
+  assert.equal(parseWalletSwap(chainTx({ solBefore: 9e9, solAfter: 10e9, post: [chainBal('M', 5)] }), W), null);
+  assert.equal(parseWalletSwap(chainTx({ solBefore: 10e9, solAfter: 9e9, pre: [chainBal('M', 5)], post: [chainBal('M', 0)] }), W), null);
+
+  // Wallet absent from the transaction, and structurally broken payloads.
+  assert.equal(parseWalletSwap(chainTx({ wallet: 'SOMEONE' }), W), null);
+  assert.equal(parseWalletSwap(null, W), null);
+  assert.equal(parseWalletSwap(chainTx({}), {}), null);
+  assert.equal(parseWalletSwap({ meta: null }, W), null);
+});
+
+test('fetchWhaleTrades stops at the cursor and orders oldest-first', async () => {
+  const { fetchWhaleTrades } = await import('../paper_copytrade.mjs');
+
+  const sigs = [{ signature: 'S3' }, { signature: 'S2' }, { signature: 'S1' }];
+  const bodies = {
+    S3: chainTx({ sig: 'S3', solBefore: 10e9, solAfter: 9e9, post: [chainBal('C', 1)] }),
+    S2: chainTx({ sig: 'S2', solBefore: 10e9, solAfter: 9e9, post: [chainBal('B', 1)] }),
+    S1: chainTx({ sig: 'S1', solBefore: 10e9, solAfter: 9e9, post: [chainBal('A', 1)] }),
+  };
+  const rpcImpl = async (_url, method, params) =>
+    method === 'getSignaturesForAddress'
+      ? { ok: true, result: sigs }
+      : { ok: true, result: bodies[params[0]] };
+
+  // Cold start reads the page.
+  const cold = await fetchWhaleTrades({ wallet: 'W', rpcImpl, delayMs: 0 });
+  assert.equal(cold.newestSignature, 'S3');
+  // OLDEST FIRST, so a buy and a later sell of one mint apply in order.
+  assert.deepEqual(cold.trades.map((t) => t.mint), ['A', 'B', 'C']);
+
+  // With a cursor, only what is newer than it — a steady-state poll costs one
+  // getSignaturesForAddress and nothing else.
+  const warm = await fetchWhaleTrades({ wallet: 'W', sinceSignature: 'S2', rpcImpl, delayMs: 0 });
+  assert.deepEqual(warm.trades.map((t) => t.mint), ['C']);
+
+  const caughtUp = await fetchWhaleTrades({ wallet: 'W', sinceSignature: 'S3', rpcImpl, delayMs: 0 });
+  assert.deepEqual(caughtUp.trades, []);
+  assert.equal(caughtUp.scanned, 0);
+
+  // A burst beyond the per-tick cap is QUEUED, not dropped.
+  const capped = await fetchWhaleTrades({ wallet: 'W', maxTxLookups: 2, rpcImpl, delayMs: 0 });
+  assert.equal(capped.trades.length, 2);
+  assert.equal(capped.pending, 1);
+
+  // An RPC failure reports itself rather than looking like a quiet whale.
+  const down = await fetchWhaleTrades({
+    wallet: 'W', rpcImpl: async () => ({ ok: false, error: 'ECONNRESET' }), delayMs: 0,
+  });
+  assert.equal(down.ok, false);
+  assert.match(down.error, /ECONNRESET/);
+  assert.deepEqual(down.trades, []);
+});
+
+test('a tick mirrors live chain buys at proportional size', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, pctWhale: 10, slippagePct: 0, feeSol: 0 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  const report = await runPaperTick({
+    book,
+    observations: { wallets: {} },
+    watchlist: { wallets: [{ address: 'W' }] },
+    cfg,
+    now,
+    priceFetcher: async () => new Map([['BIG', 1], ['SMALL', 1]]),
+    tradeFetcher: async () => ({
+      ok: true,
+      newestSignature: 'S9',
+      scanned: 2,
+      trades: [
+        { kind: 'BUY', mint: 'BIG', solSpent: 2.0, blockTime: now },
+        { kind: 'BUY', mint: 'SMALL', solSpent: 0.2, blockTime: now },
+      ],
+    }),
+  });
+
+  assert.equal(report.chain.ok, true);
+  const size = (m) => report.opened.find((o) => o.mint === m).sizeSol;
+  assert.ok(Math.abs(size('BIG') - 0.2) < 1e-9, '10% of the 2 SOL buy');
+  assert.ok(Math.abs(size('SMALL') - 0.02) < 1e-9);
+  // The cursor advances so the next tick does not replay these.
+  assert.equal(book.lastSignature, 'S9');
+});
+
+test('a whale sell closes the paper position proportionally', async () => {
+  const { createBook, runPaperTick, openPaperPosition, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+  openPaperPosition(book, { mint: 'M', symbol: 'M', priceUsd: 1, cfg, now: now - 1000 });
+
+  // The target dumps 40% of its bag at +50% — below the +100% take-profit rung,
+  // so the whale exit is the only thing acting on the position.
+  const partial = await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now,
+    priceFetcher: async () => new Map([['M', 1.5]]),
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S1', trades: [{ kind: 'SELL', mint: 'M', sellFraction: 0.4, blockTime: now }],
+    }),
+  });
+  assert.ok(partial.exits.some((e) => e.trigger === 'WHALE_SELL'));
+  // Still open on the remaining 60% — a partial de-risk is mirrored as one.
+  assert.ok(book.positions.M);
+  assert.ok(Math.abs(book.positions.M.stakeSol - 0.6) < 1e-9);
+
+  // Then the rest.
+  await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now: now + 1,
+    priceFetcher: async () => new Map([['M', 2]]),
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S2', trades: [{ kind: 'SELL', mint: 'M', sellFraction: 1, blockTime: now }],
+    }),
+  });
+  assert.equal(book.positions.M, undefined);
+  assert.equal(book.closed.at(-1).reason, 'WHALE_SELL');
+
+  // A sell of something never held is ignored rather than throwing.
+  const ghost = await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now: now + 2,
+    priceFetcher: async () => new Map(),
+    tradeFetcher: async () => ({ ok: true, newestSignature: 'S3', trades: [{ kind: 'SELL', mint: 'NEVER', sellFraction: 1 }] }),
+  });
+  assert.equal(ghost.exits.length, 0);
+});
+
+test('a whale sell and the paper ladder can both act in one tick', async () => {
+  const { createBook, runPaperTick, openPaperPosition, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+  openPaperPosition(book, { mint: 'M', symbol: 'M', priceUsd: 1, cfg, now: now - 1000 });
+
+  // A 40% whale exit into a price that has DOUBLED: the whale sell books first,
+  // then the +100% rung takes half of what is left. Two independent risk rules
+  // agreeing, not one overriding the other.
+  const r = await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now,
+    priceFetcher: async () => new Map([['M', 2]]),
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S1', trades: [{ kind: 'SELL', mint: 'M', sellFraction: 0.4, blockTime: now }],
+    }),
+  });
+
+  assert.deepEqual(r.exits.map((e) => e.trigger), ['WHALE_SELL', 'TP1']);
+  // 1.0 -> 0.6 after the whale exit -> 0.3 after TP1 halves the remainder.
+  assert.ok(Math.abs(book.positions.M.stakeSol - 0.3) < 1e-9);
+});
+
+test('a failed chain poll does not advance the cursor or fake a quiet whale', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1 });
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+  book.lastSignature = 'KNOWN';
+
+  const report = await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg,
+    priceFetcher: async () => new Map(),
+    tradeFetcher: async () => ({ ok: false, error: 'HTTP 429', trades: [], newestSignature: 'NEWER' }),
+  });
+
+  assert.equal(report.chain.ok, false);
+  assert.match(report.chain.error, /429/);
+  // THE CURSOR MUST NOT MOVE. Advancing it past a window that was never read
+  // would silently drop every trade the whale made during the outage.
+  assert.equal(book.lastSignature, 'KNOWN');
+  assert.equal(report.opened.length, 0);
+});
+
+test('switching target resets the signature cursor', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, rpcMirror: { enabled: false } });
+  const book = createBook({ budgetSol: 10, target: { address: 'OLD' } });
+  book.lastSignature = 'OLD_SIG';
+
+  await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'NEW' }] }, cfg,
+    priceFetcher: async () => new Map(),
+  });
+
+  // A different wallet's signatures are unrelated: reusing the cursor would
+  // replay the new wallet's whole first page or skip it entirely.
+  assert.equal(book.target.address, 'NEW');
+  assert.equal(book.lastSignature, null);
+});
+
+test('the rpc url is validated so a typo cannot silently disable the mirror', async () => {
+  const { paperConfig, PUBLIC_SOLANA_RPC } = await import('../paper_copytrade.mjs');
+  assert.equal(paperConfig({}).rpcMirror.url, PUBLIC_SOLANA_RPC);
+  assert.equal(paperConfig({ rpcMirror: { url: '' } }).rpcMirror.url, PUBLIC_SOLANA_RPC);
+  assert.equal(paperConfig({ rpcMirror: { url: 'not-a-url' } }).rpcMirror.url, PUBLIC_SOLANA_RPC);
+  assert.equal(
+    paperConfig({ rpcMirror: { url: 'https://other.node/rpc' } }).rpcMirror.url,
+    'https://other.node/rpc'
+  );
+  // Partial overrides keep the other defaults rather than blanking them.
+  assert.equal(paperConfig({ rpcMirror: { enabled: false } }).rpcMirror.signatureLimit, 25);
+});
+
+test('the cursor advances only as far as the batch actually read', async () => {
+  const { fetchWhaleTrades } = await import('../paper_copytrade.mjs');
+
+  // 5 fresh signatures, newest first, with a per-tick cap of 2.
+  const sigs = ['S5', 'S4', 'S3', 'S2', 'S1'].map((signature) => ({ signature }));
+  const body = (sig) => ({
+    blockTime: 1700,
+    transaction: { signatures: [sig], message: { accountKeys: [{ pubkey: 'W' }] } },
+    meta: {
+      err: null,
+      preBalances: [10e9],
+      postBalances: [9e9],
+      preTokenBalances: [],
+      postTokenBalances: [{ mint: sig, owner: 'W', uiTokenAmount: { uiAmount: 1 } }],
+    },
+  });
+  const rpcImpl = async (_u, method, params) =>
+    method === 'getSignaturesForAddress'
+      ? { ok: true, result: sigs }
+      : { ok: true, result: body(params[0]) };
+
+  // THE BUG THIS PINS, observed live: taking the NEWEST 2 and then jumping the
+  // cursor to the page head silently dropped S1-S3 forever, while the log
+  // claimed they were "queued". Walking forward reads the OLDEST unread pair
+  // and stops the cursor there.
+  const first = await fetchWhaleTrades({ wallet: 'W', maxTxLookups: 2, rpcImpl, delayMs: 0 });
+  assert.deepEqual(first.trades.map((t) => t.mint), ['S1', 'S2'], 'oldest unread first');
+  assert.equal(first.newestSignature, 'S2', 'cursor stops at the last one parsed');
+  assert.equal(first.pending, 3);
+
+  // The next tick continues from there rather than skipping the gap.
+  const second = await fetchWhaleTrades({ wallet: 'W', sinceSignature: 'S2', maxTxLookups: 2, rpcImpl, delayMs: 0 });
+  assert.deepEqual(second.trades.map((t) => t.mint), ['S3', 'S4']);
+  assert.equal(second.newestSignature, 'S4');
+
+  // Caught up: nothing read, cursor unchanged at the page head.
+  const done = await fetchWhaleTrades({ wallet: 'W', sinceSignature: 'S5', rpcImpl, delayMs: 0 });
+  assert.deepEqual(done.trades, []);
+  assert.equal(done.newestSignature, 'S5');
+});
+
+test('a stale chain buy is not mirrored', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, maxBuyAgeMinutes: 30 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  // A cold start reads a whole page of history. Entering a token the whale
+  // bought an hour ago copies a decision whose moment has passed — the same
+  // reason the ledger path bounds buys by age.
+  const r = await runPaperTick({
+    book,
+    observations: { wallets: {} },
+    watchlist: { wallets: [{ address: 'W' }] },
+    cfg,
+    now,
+    priceFetcher: async () => new Map([['FRESH', 1], ['STALE', 1]]),
+    tradeFetcher: async () => ({
+      ok: true,
+      newestSignature: 'S1',
+      trades: [
+        { kind: 'BUY', mint: 'STALE', solSpent: 1, blockTime: now - 90 * 60_000 },
+        { kind: 'BUY', mint: 'FRESH', solSpent: 1, blockTime: now - 60_000 },
+      ],
+    }),
+  });
+
+  assert.deepEqual(r.opened.map((o) => o.mint), ['FRESH']);
+  assert.equal(r.chain.staleSkipped, 1);
+
+  // A trade with no blockTime is treated as current — the only way it reached
+  // the page is by being recent.
+  const book2 = createBook({ budgetSol: 10, target: { address: 'W' } });
+  const r2 = await runPaperTick({
+    book: book2,
+    observations: { wallets: {} },
+    watchlist: { wallets: [{ address: 'W' }] },
+    cfg,
+    now,
+    priceFetcher: async () => new Map([['NOTIME', 1]]),
+    tradeFetcher: async () => ({
+      ok: true,
+      newestSignature: 'S2',
+      trades: [{ kind: 'BUY', mint: 'NOTIME', solSpent: 1, blockTime: null }],
+    }),
+  });
+  assert.deepEqual(r2.opened.map((o) => o.mint), ['NOTIME']);
 });
