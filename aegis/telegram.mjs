@@ -76,6 +76,11 @@ export async function loadEnv(path) {
     // Optional. Without it ai_narrative_scorer stays inert and the narrative
     // bonus is simply never awarded — never a penalty.
     geminiKey: pick('GEMINI_API_KEY'),
+    // Optional. Read here rather than straight from process.env in
+    // auto_top_whales.mjs because pick() is "process.env first, .env second"
+    // and the key in practice lives in .env — a bare process.env read would
+    // find nothing on a machine that has it configured.
+    gmgnKey: pick('GMGN_API_KEY'),
   };
 }
 

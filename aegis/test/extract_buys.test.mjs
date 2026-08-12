@@ -2646,6 +2646,123 @@ test('the ranking profit figure prefers realized over estimated', async () => {
   assert.equal(rankingProfitUsd(undefined), null);
 });
 
+test('GMGN payloads are parsed across shapes and field names', async () => {
+  const { parseGmgnMetrics } = await import('../auto_top_whales.mjs');
+
+  // Nesting: bare, under data, and double-wrapped.
+  assert.deepEqual(parseGmgnMetrics({ realized_profit: 1500, winrate: 0.62 }),
+    { netProfitUsd: 1500, winRatePct: 62 });
+  assert.deepEqual(parseGmgnMetrics({ data: { pnl_usd: 900, win_rate: '58%' } }),
+    { netProfitUsd: 900, winRatePct: 58 });
+  assert.deepEqual(parseGmgnMetrics({ data: { data: { total_profit: '2,400', winrate: 0.5 } } }),
+    { netProfitUsd: 2400, winRatePct: 50 });
+
+  // THE FRACTION IS THE WHOLE REASON normaliseWinRate IS IN THIS PATH. GMGN
+  // exports 0.62 where Birdeye exports "64%". Taken literally a 0.62 sorts
+  // below every observed wallet and reads as a terrible trader rather than a
+  // unit mismatch.
+  assert.equal(parseGmgnMetrics({ winrate: 0.62 }).winRatePct, 62);
+  assert.equal(parseGmgnMetrics({ winrate: 62 }).winRatePct, 62);
+
+  // Dollar formatting survives.
+  assert.equal(parseGmgnMetrics({ profit_usd: '$1,500,000' }).netProfitUsd, 1_500_000);
+
+  // A negative career is a real answer and must not be discarded.
+  assert.equal(parseGmgnMetrics({ realized_profit: -4200 }).netProfitUsd, -4200);
+  // Zero likewise.
+  assert.equal(parseGmgnMetrics({ realized_profit: 0 }).netProfitUsd, 0);
+
+  // Partial payloads keep the half they have.
+  assert.deepEqual(parseGmgnMetrics({ winrate: 0.7 }), { netProfitUsd: null, winRatePct: 70 });
+
+  // Nothing recognisable is null, NOT zero — "no data" and "no profit" must
+  // stay distinguishable or an unknown wallet outranks a genuine loss.
+  assert.equal(parseGmgnMetrics({ unrelated: 1 }), null);
+  assert.equal(parseGmgnMetrics({}), null);
+  assert.equal(parseGmgnMetrics(null), null);
+  assert.equal(parseGmgnMetrics('<!DOCTYPE html>'), null);
+});
+
+test('GMGN fetch reports a block distinctly from a miss, and never throws', async () => {
+  const { fetchGmgnWalletStats } = await import('../auto_top_whales.mjs');
+  const ADDR = 'Ar2Y6o1QmrRAskjii1cRfijeKugHH13ycxW5cd7rro1x';
+
+  // No key: inert, and explicitly not "blocked" — nothing was attempted.
+  const noKey = await fetchGmgnWalletStats(ADDR, { apiKey: null });
+  assert.equal(noKey.ok, false);
+  assert.equal(noKey.blocked, false);
+
+  // The measured live behaviour: 403 + Cloudflare HTML. Must be flagged
+  // blocked so the caller trips its breaker instead of retrying 165 times.
+  const blocked = await fetchGmgnWalletStats(ADDR, {
+    apiKey: 'k', fetchImpl: async () => new Response('<!DOCTYPE html>', { status: 403 }),
+  });
+  assert.equal(blocked.blocked, true);
+
+  // A challenge page served with HTTP 200 is still not a wallet record.
+  const htmlOk = await fetchGmgnWalletStats(ADDR, {
+    apiKey: 'k', fetchImpl: async () => new Response('<!DOCTYPE html>', { status: 200 }),
+  });
+  assert.equal(htmlOk.ok, false);
+  assert.equal(htmlOk.blocked, true);
+
+  // A 404 is an ordinary miss, not a wall — one unknown wallet must not stop
+  // the pass for every other wallet.
+  const miss = await fetchGmgnWalletStats(ADDR, {
+    apiKey: 'k', fetchImpl: async () => new Response('{}', { status: 404 }),
+  });
+  assert.equal(miss.blocked, false);
+
+  // A thrown network error is caught, not propagated.
+  const boom = await fetchGmgnWalletStats(ADDR, {
+    apiKey: 'k', fetchImpl: async () => { throw new Error('ECONNRESET'); },
+  });
+  assert.equal(boom.ok, false);
+  assert.match(boom.error, /ECONNRESET/);
+
+  // The happy path, for when the endpoint is reachable.
+  const good = await fetchGmgnWalletStats(ADDR, {
+    apiKey: 'k',
+    fetchImpl: async () => new Response(JSON.stringify({ data: { realized_profit: 1_500_000, winrate: 0.71 } }), { status: 200 }),
+  });
+  assert.equal(good.ok, true);
+  assert.deepEqual(good.metrics, { netProfitUsd: 1_500_000, winRatePct: 71 });
+});
+
+test('GMGN enrichment trips a breaker instead of walking into a wall', async () => {
+  const { enrichGmgnMetrics } = await import('../auto_top_whales.mjs');
+  const quiet = { log: () => {} };
+  const wallets = () => Array.from({ length: 50 }, (_, i) => ({ address: `w${i}`, basis: 'x' }));
+
+  // No key at all: nothing attempted, and the sync is untouched.
+  const off = await enrichGmgnMetrics(wallets(), { apiKey: null, log: quiet });
+  assert.equal(off.attempted, 0);
+
+  // A blocked endpoint must stop after ONE wallet, not 50. This is the
+  // difference between a quiet no-op and minutes added to every sync.
+  let calls = 0;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => { calls++; return new Response('<!DOCTYPE html>', { status: 403 }); };
+  try {
+    const r = await enrichGmgnMetrics(wallets(), { apiKey: 'k', cfg: { delayMs: 0 }, log: quiet });
+    assert.equal(r.blocked, true);
+    assert.equal(r.populated, 0);
+    assert.equal(calls, 1, 'a 403 wall must stop the pass immediately');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+
+  // Candidates must be left untouched so the ranking falls through cleanly.
+  const list = wallets();
+  globalThis.fetch = async () => new Response('<!DOCTYPE html>', { status: 403 });
+  try {
+    await enrichGmgnMetrics(list, { apiKey: 'k', cfg: { delayMs: 0 }, log: quiet });
+    assert.ok(list.every((c) => c.gmgnNetProfitUsd === undefined && c.gmgnWinRatePct === undefined));
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
 test('GMGN lifetime figures outrank the replay and the estimate', async () => {
   const { rankingProfitUsd, rankingWinRate } = await import('../auto_top_whales.mjs');
 

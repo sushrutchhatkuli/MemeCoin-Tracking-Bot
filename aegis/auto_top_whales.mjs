@@ -1185,6 +1185,201 @@ export function classifyCacheEntry(entry, { ttlHours = 24, now = Date.now(), dus
   return entry.newestSignature ? 'incremental' : 'miss';
 }
 
+/* ------------------------------------------------------------------ *
+ * GMGN lifetime metrics
+ * ------------------------------------------------------------------ *
+ *
+ * Populates candidate.gmgnNetProfitUsd and candidate.gmgnWinRatePct, which
+ * rankingProfitUsd and rankingWinRate read FIRST. A provider's career figure
+ * beats anything derivable here, because Aegis can only replay a bounded
+ * window while GMGN reports a whole history.
+ *
+ * ── STATUS: WIRED, KEYED, AND BLOCKED UPSTREAM ──────────────────────────────
+ * MEASURED 2026-08-12 with the configured GMGN_API_KEY (37 chars) against three
+ * endpoints x three auth schemes — Authorization: Bearer, X-API-KEY, and an
+ * api_key query parameter:
+ *   gmgn.ai/api/v1/wallet_stat/sol/<addr>/7d          403, Cloudflare HTML
+ *   gmgn.ai/defi/quotation/v1/smartmoney/sol/…        403, Cloudflare HTML
+ *   api.gmgn.ai/…                                     DNS / connect failure
+ * All nine combinations failed. The 403 is a Cloudflare bot challenge served
+ * BEFORE the application sees a credential, so the key is never evaluated and
+ * no auth scheme helps. Working around that challenge is out of scope.
+ *
+ * So this code is correct and currently yields nothing. That is why it is
+ * built to fail QUIETLY AND CHEAPLY rather than loudly: a wallet with no GMGN
+ * data simply keeps its Aegis-derived figures, and the ranking falls through
+ * exactly as it did before.
+ *
+ * THE CIRCUIT BREAKER IS THE LOAD-BEARING PART. Without it, 165 shortlisted
+ * wallets each pay a full round trip to a wall on every sync — minutes of
+ * wall-clock, every two hours, for zero data, inside the maintenance loop the
+ * enrichShortlistCap note already records starving the scanner. After
+ * maxConsecutiveFailures the pass gives up and says so once.
+ */
+
+const GMGN_PROFIT_FIELDS = [
+  'realized_profit_usd', 'realized_profit', 'total_profit_usd', 'total_profit',
+  'pnl_usd', 'pnl', 'profit_usd', 'profit', 'net_profit_usd', 'net_profit',
+];
+const GMGN_WINRATE_FIELDS = ['winrate', 'win_rate', 'winrate_pct', 'win_rate_pct', 'success_rate'];
+
+/**
+ * Pull lifetime P&L and win rate out of a GMGN payload. PURE.
+ *
+ * Field names are a LIST rather than one key because the shape is not
+ * contractual — it is a web app's internal endpoint, and the import path in
+ * this same file already carries a comment about GMGN exporting
+ * `realized_profit` where other providers use `pnl`. Reading one name and
+ * getting null would be indistinguishable from a wallet with no record.
+ *
+ * The win rate goes through normaliseWinRate, which is not decoration: GMGN
+ * exports fractions (0.62) where Birdeye exports "64%". Read literally, a 0.62
+ * ranks below every observed wallet and looks like a bad wallet rather than a
+ * unit mismatch. That exact bug is documented on normaliseWinRate.
+ *
+ * Returns null when neither figure is present, so "no data" and "zero profit"
+ * stay distinguishable.
+ */
+export function parseGmgnMetrics(payload) {
+  // Unwrapped defensively: the endpoints seen in the wild nest under `data`,
+  // sometimes twice, and sometimes not at all.
+  let node = payload;
+  for (let depth = 0; depth < 3 && node && typeof node === 'object'; depth++) {
+    if (Array.isArray(node)) node = node[0];
+    else if (node.data !== undefined) node = node.data;
+    else break;
+  }
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return null;
+
+  const num = (v) => {
+    if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+    if (typeof v === 'string') {
+      const n = Number(v.replace(/[$,\s]/g, ''));
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  };
+
+  let netProfitUsd = null;
+  for (const f of GMGN_PROFIT_FIELDS) {
+    const v = num(node[f]);
+    if (v !== null) { netProfitUsd = v; break; }
+  }
+
+  let winRatePct = null;
+  for (const f of GMGN_WINRATE_FIELDS) {
+    if (node[f] === undefined || node[f] === null || node[f] === '') continue;
+    const v = normaliseWinRate(node[f]);
+    if (v !== null && Number.isFinite(v)) { winRatePct = v; break; }
+  }
+
+  if (netProfitUsd === null && winRatePct === null) return null;
+  return { netProfitUsd, winRatePct };
+}
+
+/**
+ * One wallet's lifetime metrics from GMGN.
+ *
+ * Never throws. Returns a discriminated result so the caller can tell a hard
+ * block (403/401, which will repeat for every wallet and should trip the
+ * breaker) from an ordinary miss.
+ */
+export async function fetchGmgnWalletStats(address, { apiKey, period = '7d', timeoutMs = 10_000, fetchImpl = fetch } = {}) {
+  if (!apiKey) return { ok: false, blocked: false, error: 'no GMGN_API_KEY' };
+
+  const url = `https://gmgn.ai/api/v1/wallet_stat/sol/${encodeURIComponent(address)}/${encodeURIComponent(period)}`;
+  try {
+    const res = await fetchImpl(url, {
+      headers: {
+        // Sent three ways because GMGN publishes no auth contract. Harmless
+        // where unused; the alternative is guessing one and silently getting
+        // nothing if the guess is wrong.
+        Authorization: `Bearer ${apiKey}`,
+        'X-API-KEY': apiKey,
+        accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (!res.ok) {
+      // 403 here is Cloudflare, not "this wallet is unknown". Flagged as
+      // blocked so one wall stops the whole pass rather than being retried
+      // 165 times.
+      return { ok: false, blocked: res.status === 403 || res.status === 401, status: res.status, error: `HTTP ${res.status}` };
+    }
+
+    const text = await res.text();
+    if (!text.trimStart().startsWith('{') && !text.trimStart().startsWith('[')) {
+      // A challenge page answers 200 sometimes. HTML is not a wallet record.
+      return { ok: false, blocked: true, error: 'non-JSON response (challenge page?)' };
+    }
+
+    const metrics = parseGmgnMetrics(JSON.parse(text));
+    return metrics ? { ok: true, metrics } : { ok: false, blocked: false, error: 'no recognised profit or win-rate field' };
+  } catch (err) {
+    return { ok: false, blocked: false, error: err.message };
+  }
+}
+
+/**
+ * Attach GMGN lifetime figures to candidates. Mutates in place, like the other
+ * enrichers. Never throws, and never fails a sync: a wallet without GMGN data
+ * keeps its Aegis-derived numbers.
+ */
+export async function enrichGmgnMetrics(candidates, { apiKey, cfg = {}, log = console } = {}) {
+  if (!apiKey) return { attempted: 0, populated: 0, blocked: false, skipped: 'no GMGN_API_KEY' };
+  if (cfg.enabled === false) return { attempted: 0, populated: 0, blocked: false, skipped: 'disabled in config' };
+
+  const maxLookups = cfg.maxLookups ?? 60;
+  const maxConsecutiveFailures = cfg.maxConsecutiveFailures ?? 3;
+  const delayMs = cfg.delayMs ?? 200;
+  const targets = candidates.slice(0, maxLookups);
+
+  let attempted = 0;
+  let populated = 0;
+  let consecutiveFailures = 0;
+  let blocked = false;
+  let lastError = null;
+
+  for (const c of targets) {
+    attempted++;
+    const r = await fetchGmgnWalletStats(c.address, {
+      apiKey,
+      period: cfg.period ?? '7d',
+      timeoutMs: cfg.timeoutMs ?? 10_000,
+    });
+
+    if (r.ok) {
+      consecutiveFailures = 0;
+      if (typeof r.metrics.netProfitUsd === 'number') c.gmgnNetProfitUsd = r.metrics.netProfitUsd;
+      if (typeof r.metrics.winRatePct === 'number') c.gmgnWinRatePct = r.metrics.winRatePct;
+      c.basis += `; GMGN lifetime ${r.metrics.netProfitUsd !== null ? `$${Math.round(r.metrics.netProfitUsd)}` : 'n/a'}`;
+      populated++;
+    } else {
+      consecutiveFailures++;
+      lastError = r.error;
+      if (r.blocked) blocked = true;
+      // A wall answers identically for every address. Walking the rest of the
+      // shortlist into it costs minutes and returns nothing.
+      if (blocked || consecutiveFailures >= maxConsecutiveFailures) break;
+    }
+    if (delayMs) await new Promise((res) => setTimeout(res, delayMs));
+  }
+
+  if (populated) {
+    log.log(`   ↳ GMGN lifetime metrics for ${populated}/${attempted} wallet(s) — these outrank the Aegis replay in the sort`);
+  } else {
+    log.log(
+      `   ↳ GMGN unavailable after ${attempted} attempt(s) — ${lastError ?? 'no data'}` +
+        (blocked
+          ? '. That is a Cloudflare block on gmgn.ai, not a verdict on these wallets; the key is never'
+          : '') +
+        (blocked ? ' evaluated. Ranking falls back to the on-chain replay.' : '. Ranking falls back to the on-chain replay.')
+    );
+  }
+  return { attempted, populated, blocked, lastError };
+}
+
 /**
  * Split replay contenders into those the cache can serve for free and those
  * that need network. PURE — no clock, no IO, so the cap's behaviour can be
@@ -1953,6 +2148,22 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
         solUsd,
         cache: onChainCache,
         now: replayNow,
+      });
+
+      // GMGN LAST, and only over the wallets that were actually measured.
+      //
+      // Ordering matters for cost, not for correctness: a wallet that failed
+      // the replay cannot qualify under Rules 4 and 5 whatever GMGN says about
+      // it, so fetching a career P&L for it buys a number nothing will read —
+      // the same argument that puts the replay itself after Rules 1-3.
+      //
+      // Runs on the OBSERVE path only. An imported row already carries the
+      // provider's own lifetime figures in netProfitUsd/winRatePct with
+      // providerMetrics set, so re-fetching them would pay for data the file
+      // supplied.
+      await enrichGmgnMetrics(replaying, {
+        apiKey: env.gmgnKey,
+        cfg: config.eliteWhales?.gmgn ?? {},
       });
     }
   }
