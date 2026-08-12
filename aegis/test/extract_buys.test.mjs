@@ -92,6 +92,8 @@ import {
   extractMintFromTransaction,
   mergeCandidates,
   websocketUrlFor,
+  createRpcPool,
+  isFailoverWorthy,
 } from '../discovery_daemon.mjs';
 import {
   capEnrichmentShortlist,
@@ -2999,6 +3001,160 @@ test('terminal rendering keeps the URL an anchor was hiding', () => {
   );
   // Non-anchor markup is still stripped, and entities still decode correctly.
   assert.equal(toPlainText('<b>P&amp;L</b>'), 'P&L');
+});
+
+/* ------------------------------------------------------------------ *
+ * Multi-node RPC failover pool
+ *
+ * Tested entirely offline with an injected fetch. The shipped public endpoints
+ * could not be reached from the machine this was written on — all four failed
+ * at the connection layer while a control request succeeded — so the LOGIC is
+ * what can be verified here, and the endpoints ship disabled behind
+ * `--check-rpc`.
+ * ------------------------------------------------------------------ */
+
+const rpcOk = (result = 'fine') => ({
+  ok: true, status: 200, text: async () => JSON.stringify({ jsonrpc: '2.0', id: 1, result }),
+});
+const rpcFail = (status, body = '') => ({ ok: false, status, text: async () => body });
+
+test('a quota refusal moves to the next node and stays there', async () => {
+  // The failure that motivated this: HTTP 429 "max usage reached" is a hard
+  // plan cap, not a rate limit, and no retry clears it.
+  const calls = [];
+  const pool = createRpcPool({
+    primary: 'https://primary.test',
+    endpoints: [{ url: 'https://backup.test', label: 'backup' }],
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return url.includes('primary') ? rpcFail(429, 'max usage reached') : rpcOk('ok');
+    },
+  });
+
+  const first = await pool.call('getAccountInfo', ['x']);
+  assert.equal(first.ok, true);
+  assert.equal(first.endpoint, 'backup');
+  assert.deepEqual(calls, ['https://primary.test', 'https://backup.test']);
+
+  // STICKY. Without this a 200-wallet pass pays 200 failures to learn the same
+  // fact — the dead node is skipped, not re-probed.
+  const second = await pool.call('getAccountInfo', ['y']);
+  assert.equal(second.endpoint, 'backup');
+  assert.equal(calls.filter((u) => u.includes('primary')).length, 1, 'the dead node is not retried');
+});
+
+test('a connection failure fails over too', async () => {
+  const pool = createRpcPool({
+    primary: 'https://dead.test',
+    endpoints: [{ url: 'https://alive.test', label: 'alive' }],
+    fetchImpl: async (url) => {
+      if (url.includes('dead')) throw Object.assign(new Error('connect ECONNRESET'), { cause: { code: 'ECONNRESET' } });
+      return rpcOk(42);
+    },
+  });
+  const r = await pool.call('getHealth', []);
+  assert.equal(r.ok, true);
+  assert.equal(r.result, 42);
+  assert.equal(r.endpoint, 'alive');
+});
+
+test('a method-level error does NOT fail over', async () => {
+  // Bad params or an unsupported method answer the same on every node, so
+  // walking the pool would repeat one error N times and hide it behind
+  // "every endpoint failed".
+  let hits = 0;
+  const pool = createRpcPool({
+    primary: 'https://a.test',
+    endpoints: [{ url: 'https://b.test', label: 'b' }],
+    fetchImpl: async () => {
+      hits++;
+      return { ok: false, status: 400, text: async () => JSON.stringify({ error: { code: -32602, message: 'Invalid params' } }) };
+    },
+  });
+  const r = await pool.call('getThing', ['bad']);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /Invalid params/);
+  assert.equal(hits, 1, 'only the first node is asked');
+});
+
+test('when every node is down the caller is told, not left guessing', async () => {
+  const pool = createRpcPool({
+    primary: 'https://a.test',
+    endpoints: [{ url: 'https://b.test', label: 'b' }],
+    fetchImpl: async () => rpcFail(429, 'max usage reached'),
+  });
+  const r = await pool.call('getHealth', []);
+  assert.equal(r.ok, false);
+  assert.equal(r.exhausted, true);
+  assert.match(r.error, /every RPC endpoint failed/);
+  assert.match(r.error, /primary/);
+  assert.match(r.error, /b/);
+});
+
+test('a cooled-down node returns to service after its window', async () => {
+  let clock = 1_000_000;
+  let primaryUp = false;
+  const pool = createRpcPool({
+    primary: 'https://p.test',
+    endpoints: [{ url: 'https://s.test', label: 'secondary' }],
+    cooldownSeconds: 300,
+    now: () => clock,
+    fetchImpl: async (url) =>
+      url.includes('p.test') && !primaryUp ? rpcFail(429, 'max usage reached') : rpcOk('up'),
+  });
+
+  assert.equal((await pool.call('m', [])).endpoint, 'secondary');
+  primaryUp = true;
+  // Still cooling — the recovery is not noticed early.
+  assert.equal((await pool.call('m', [])).endpoint, 'secondary');
+  clock += 301_000;
+  const back = await pool.call('m', []);
+  assert.equal(back.ok, true, 'the pool works again once the window passes');
+});
+
+test('disabled endpoints never enter the pool, and an empty pool says so', async () => {
+  const pool = createRpcPool({
+    primary: null,
+    endpoints: [
+      { url: 'https://off.test', label: 'off', enabled: false },
+      { url: '', label: 'blank' },
+    ],
+    fetchImpl: async () => rpcOk(),
+  });
+  assert.equal(pool.nodes.length, 0);
+  const r = await pool.call('m', []);
+  assert.equal(r.ok, false);
+  assert.equal(r.exhausted, true);
+  assert.match(r.error, /no RPC endpoint configured/);
+});
+
+test('failover triggers on quota and node faults, not on ordinary answers', () => {
+  assert.equal(isFailoverWorthy(429, 'max usage reached'), true);
+  assert.equal(isFailoverWorthy(429, ''), true);
+  assert.equal(isFailoverWorthy(402, ''), true, 'payment required');
+  assert.equal(isFailoverWorthy(403, ''), true);
+  assert.equal(isFailoverWorthy(500, ''), true);
+  assert.equal(isFailoverWorthy(503, ''), true);
+  assert.equal(isFailoverWorthy(200, 'credits exhausted'), true, 'some nodes 200 a quota refusal');
+  assert.equal(isFailoverWorthy(400, 'Invalid params'), false);
+  assert.equal(isFailoverWorthy(404, ''), false);
+  assert.equal(isFailoverWorthy(200, ''), false);
+});
+
+test('the shipped endpoint pool is disabled until verified', () => {
+  // None could be reached from the machine this was written on. An enabled but
+  // unreachable node would turn a loud quota error into silent wrong results.
+  const shipped = JSON.parse(readFileSync(new URL('../config.json', import.meta.url), 'utf8'));
+  assert.equal(shipped.rpcPool.enabled, false);
+  for (const e of shipped.rpcPool.endpoints) {
+    assert.equal(e.enabled, false, `${e.label} must ship disabled`);
+    assert.equal(e.verified, false, `${e.label} must not claim verification`);
+  }
+  // QuickNode has no generic free URL — the slot is a placeholder, and a pool
+  // built from this config must not try to call it.
+  const qn = shipped.rpcPool.endpoints.find((e) => e.label === 'quicknode');
+  assert.match(qn.url, /PASTE_/);
+  assert.equal(createRpcPool({ endpoints: shipped.rpcPool.endpoints }).nodes.length, 0);
 });
 
 /* ------------------------------------------------------------------ *

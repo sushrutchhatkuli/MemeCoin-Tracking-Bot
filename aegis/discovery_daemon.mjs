@@ -42,6 +42,153 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export const SURFACED_PATH = join(HERE, '.state', 'surfaced_candidates.json');
 
 /* ------------------------------------------------------------------ *
+ * Multi-node RPC failover pool
+ * ------------------------------------------------------------------ *
+ *
+ * Tries the primary endpoint, and on a QUOTA or availability failure moves to
+ * the next node and stays there. Built after a live sync died on Helius
+ * returning HTTP 429 "max usage reached", which no amount of retrying clears.
+ *
+ * ── WHAT CAN AND CANNOT FAIL OVER ───────────────────────────────────────────
+ * Standard JSON-RPC only: getSignaturesForAddress, getTransaction,
+ * getAccountInfo, getBalance and friends. Those are the same on every node.
+ *
+ * It does NOT cover Helius's enhanced endpoints. The whale enrichment reads
+ * api.helius.xyz/v0/addresses/{a}/transactions, which returns pre-parsed
+ * transactions no generic node offers — there is nothing to fail over TO, and
+ * pretending otherwise would swap a clear quota error for a confusing parse
+ * failure. getTokenLargestAccounts is similar in practice: sources.mjs already
+ * records that every keyless endpoint refuses it.
+ *
+ * ── "0 MILLISECOND" FAILOVER ────────────────────────────────────────────────
+ * The DECISION is immediate — no backoff, no sleep, no retry of the dead node.
+ * The elapsed time is not zero: it is the failed request plus the successful
+ * one on the next node, and a connection-refused failure can take longer than a
+ * clean 429. What is genuinely zero is the delay this code adds.
+ *
+ * Once a node fails it is put in cooldown and SKIPPED, so the cost is paid once
+ * rather than on every subsequent call. Without that stickiness a pass of 200
+ * wallets against a dead primary pays 200 failures to learn the same fact.
+ *
+ * ── ON THE ENDPOINT LIST ────────────────────────────────────────────────────
+ * NONE OF THE PUBLIC ENDPOINTS COULD BE VERIFIED FROM THE MACHINE THIS WAS
+ * WRITTEN ON. rpc.ankr.com, api.mainnet-beta.solana.com, solana.drpc.org and
+ * solana-rpc.publicnode.com all failed at the connection layer (ECONNRESET, or
+ * a 10s connect timeout) while a control request to DexScreener succeeded — an
+ * environment-level block on those hosts, not evidence about the endpoints.
+ *
+ * They are therefore shipped DISABLED, with a checker so they can be verified
+ * from a network that can reach them:
+ *
+ *   node discovery_daemon.mjs --check-rpc
+ *
+ * Enabling an unverified endpoint is worse than having none: failover would
+ * "succeed" onto a node that answers nothing, converting a loud quota error
+ * into silent, wrong results.
+ */
+
+/** A failure that should move to the next node rather than be retried here. */
+export function isFailoverWorthy(status, body = '') {
+  if (status === 429) return true; // rate limit or hard plan cap
+  if (status === 402 || status === 403) return true; // credits exhausted / forbidden
+  if (status >= 500) return true; // node-side fault
+  return /max usage|quota|credit|payment required/i.test(String(body));
+}
+
+/**
+ * An RPC caller that walks a pool of endpoints.
+ *
+ * `call(method, params)` resolves `{ ok, result, endpoint }` or
+ * `{ ok:false, error, exhausted }` when every node has failed.
+ */
+export function createRpcPool({
+  primary = null,
+  endpoints = [],
+  cooldownSeconds = 300,
+  timeoutMs = 20_000,
+  now = () => Date.now(),
+  fetchImpl = null,
+} = {}) {
+  // Primary first, then the configured pool. Disabled entries never enter.
+  const nodes = [
+    ...(primary ? [{ url: primary, label: 'primary' }] : []),
+    ...endpoints.filter((e) => e?.enabled !== false && e?.url).map((e) => ({ url: e.url, label: e.label ?? e.url })),
+  ].map((n) => ({ ...n, cooldownUntil: 0, failures: 0, calls: 0 }));
+
+  let cursor = 0;
+
+  const available = () => nodes.filter((n) => n.cooldownUntil <= now());
+
+  const call = async (method, params) => {
+    if (!nodes.length) return { ok: false, error: 'no RPC endpoint configured', exhausted: true };
+
+    const doFetch = fetchImpl ?? fetch;
+    const tried = [];
+
+    // The starting point is captured BEFORE the loop. Reading the live `cursor`
+    // in the index expression while also assigning to it inside the loop made
+    // the walk revisit the node it had just retired — with two nodes it went
+    // primary, then primary again, and never reached the backup at all.
+    const start = cursor;
+
+    for (let i = 0; i < nodes.length; i++) {
+      // Sticky: start from the node that last worked, so a dead primary is
+      // paid for once rather than at the head of every call.
+      const index = (start + i) % nodes.length;
+      const node = nodes[index];
+      if (node.cooldownUntil > now()) continue;
+
+      tried.push(node.label);
+      node.calls++;
+      try {
+        const res = await doFetch(node.url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        const text = await res.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch { /* quota refusals are plain text */ }
+
+        if (!res.ok || json?.error) {
+          if (isFailoverWorthy(res.status, text)) {
+            node.failures++;
+            node.cooldownUntil = now() + cooldownSeconds * 1000;
+            cursor = (index + 1) % nodes.length;
+            continue;
+          }
+          // A method-level error (bad params, unsupported method) is the same
+          // on every node. Failing over would just repeat it N times.
+          return { ok: false, error: json?.error?.message ?? `HTTP ${res.status}`, endpoint: node.label };
+        }
+
+        cursor = index;
+        return { ok: true, result: json?.result, endpoint: node.label };
+      } catch (err) {
+        // A connection error is exactly the case the pool exists for.
+        node.failures++;
+        node.cooldownUntil = now() + cooldownSeconds * 1000;
+        cursor = (index + 1) % nodes.length;
+      }
+    }
+
+    return {
+      ok: false,
+      exhausted: true,
+      error: `every RPC endpoint failed or is cooling down (tried: ${tried.join(', ') || 'none available'})`,
+    };
+  };
+
+  return {
+    call,
+    nodes,
+    available,
+    stats: () => nodes.map((n) => ({ label: n.label, calls: n.calls, failures: n.failures, cooling: n.cooldownUntil > now() })),
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * WebSocket mint stream
  * ------------------------------------------------------------------ *
  *
@@ -328,6 +475,7 @@ export async function startMintStream({
   onMints,
   log = console.log,
   signal,
+  rpcPool = null,
 } = {}) {
   const cfg = config.discovery?.mintStream ?? {};
   const program = cfg.program ?? PUMP_FUN_PROGRAM;
@@ -340,18 +488,28 @@ export async function startMintStream({
   let windowStart = Date.now();
   let windowCount = 0;
 
+  // The mint stream is the heaviest RPC consumer in this file — one
+  // getTransaction per creation, ~1,440/hour at the measured rate — so it is
+  // the first thing to lose when a plan hits its cap. Routed through the pool.
+  const pool =
+    rpcPool ??
+    createRpcPool({
+      primary: rpcUrl,
+      endpoints: config.rpcPool?.enabled === true ? (config.rpcPool.endpoints ?? []) : [],
+      cooldownSeconds: config.rpcPool?.cooldownSeconds ?? 300,
+    });
+
+  let quotaWarned = false;
   const rpc = async (method, params) => {
-    try {
-      const res = await fetch(rpcUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-        signal: AbortSignal.timeout(15_000),
-      });
-      return (await res.json())?.result ?? null;
-    } catch {
-      return null;
+    const r = await pool.call(method, params);
+    if (r.ok) return r.result ?? null;
+    if (r.exhausted && !quotaWarned) {
+      quotaWarned = true;
+      log(`   🔴 [QUOTA] mint stream RPC unavailable — ${r.error}`);
+      log('      Creations are still detected on the socket; their mint addresses cannot be');
+      log('      resolved until a node recovers, so they are skipped rather than queued wrong.');
     }
+    return null;
   };
 
   const resolveMint = async (signature, slot) => {
@@ -462,6 +620,60 @@ export function websocketUrlFor(rpcUrl) {
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   const argv = process.argv.slice(2);
   const once = argv.includes('--once');
+
+  // --check-rpc: verify the pool from THIS network before trusting it.
+  //
+  // Exists because none of the shipped endpoints could be reached from the
+  // machine this was written on, and a pool of unreachable nodes is worse than
+  // no pool. Each node is asked for a real result, not just a 200.
+  if (argv.includes('--check-rpc')) {
+    const cfg = JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'));
+    const { loadEnv } = await import('./telegram.mjs');
+    const env = await loadEnv(join(HERE, '.env'));
+    const primary = env.rpcOverride || cfg.rpcUrl;
+
+    const candidates = [
+      { label: 'primary (configured)', url: primary },
+      ...(cfg.rpcPool?.endpoints ?? []).filter((e) => e.url && !e.url.startsWith('PASTE_')),
+    ];
+
+    console.log(`Checking ${candidates.length} endpoint(s). A node must return a real result, not just a 200.\n`);
+    const MINT = 'So11111111111111111111111111111111111111112';
+    let usable = 0;
+
+    for (const c of candidates) {
+      // One single-node pool per candidate, labelled as itself. Passing the url
+      // as `primary` made every failure read "tried: primary", which is the
+      // label of the node being tested rather than a useful fact.
+      const pool = createRpcPool({
+        primary: null,
+        endpoints: [{ url: c.url, label: c.label ?? c.url, enabled: true }],
+        cooldownSeconds: 0,
+      });
+      const t0 = Date.now();
+      const health = await pool.call('getAccountInfo', [MINT, { encoding: 'base64' }]);
+      const ms = Date.now() - t0;
+      const shown = c.url.replace(/api-key=[\w-]+/, 'api-key=***');
+
+      if (health.ok && health.result) {
+        // getSignaturesForAddress is the call the enrichment actually leans on.
+        const sigs = await pool.call('getSignaturesForAddress', [MINT, { limit: 2 }]);
+        const sigOk = sigs.ok && Array.isArray(sigs.result);
+        usable += sigOk ? 1 : 0;
+        console.log(`  [${sigOk ? 'OK  ' : 'PART'}] ${(c.label ?? '').padEnd(20)} ${ms}ms  ${shown}`);
+        if (!sigOk) console.log(`         getAccountInfo works but getSignaturesForAddress does not: ${sigs.error ?? 'no result'}`);
+      } else {
+        console.log(`  [FAIL] ${(c.label ?? '').padEnd(20)} ${ms}ms  ${shown}`);
+        console.log(`         ${health.error ?? 'no result'}`);
+      }
+    }
+
+    console.log(`\n${usable}/${candidates.length} endpoint(s) usable from this network.`);
+    console.log('Set rpcPool.enabled true and enabled:true on the nodes that passed.');
+    console.log('Do NOT enable a node that failed — failover onto a silent node is worse');
+    console.log('than a loud quota error.');
+    process.exit(0);
+  }
   const i = argv.indexOf('--interval');
   const config = JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'));
   const intervalSec =
