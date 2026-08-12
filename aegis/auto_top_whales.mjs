@@ -279,7 +279,25 @@ export function buildWatchlist(qualified, { source, rules }) {
             `TRUE ON-CHAIN win rate >= ${rules.minAllTimeWinRatePct}% over >= ${rules.minAllTimeTrades ?? 0} closed round trips.`,
           ]
         : []),
-      `Selected top ${rules.topN} by win rate, then sample size.`,
+      // Rule 5 was MISSING from this header, and it is the rule that decides
+      // what the list means. A reader checking "which floors produced these
+      // entries" — which the config notes explicitly send them here to do —
+      // saw win rate, profit and signature count, and no sign that a realized
+      // net-SOL floor had been applied at all.
+      ...(rules.minAllTimeNetSol !== null && rules.minAllTimeNetSol !== undefined
+        ? [
+            `REALIZED net SOL > ${rules.minAllTimeNetSol} over the replayed window ` +
+              `(strictly greater; unmeasured counts as a failure).`,
+          ]
+        : []),
+      // Describes the ACTUAL sort. This line claimed "by win rate, then sample
+      // size", which has not been true since realized SOL became the primary
+      // key — the ordering below is fast-track, then mega-wins, then net SOL,
+      // and win rate only breaks ties beneath all three. Ranking the file by
+      // one number while announcing another is the same trap the two win-rate
+      // fields further down exist to warn about.
+      `Selected top ${rules.topN}: Alpha Hunters first, then most mega-runners caught,`,
+      `then REALIZED net SOL, with on-chain and observed win rates as tie-breaks.`,
       '',
       'TWO WIN RATES LIVE IN THIS FILE AND THEY MEAN DIFFERENT THINGS.',
       '`win_rate` is OBSERVED: computed over the handful of buys Aegis happened',
