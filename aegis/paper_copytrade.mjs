@@ -125,6 +125,16 @@ export const PAPER_DEFAULTS = {
   // Floor for a proportional position. 0 means "no floor", which is faithful to
   // a bare --pct-whale and is why the CLI warns instead of silently clamping.
   minTradeSol: 0,
+  // IMPLIED ENTRY. Price a mirrored buy from the swap itself rather than
+  // waiting on a pair lookup — see impliedEntryPriceUsd for what that costs.
+  useImpliedEntry: true,
+  // What arriving after the target costs, on top of slippagePct. MEASURED at
+  // ~9% against this target; set to 0 to book at their fill and see the
+  // optimistic version.
+  copyImpactPct: 9,
+  // Below this the fee and rent inside solSpent distort the implied price
+  // enough to matter, so the pair lookup is used instead.
+  impliedMinSpendSol: 0.05,
   // SCALE IN. When the target buys MORE of something already held, add to the
   // position instead of declining the trade. A copy that ignores the second buy
   // mirrors a conviction the target expressed only once.
@@ -219,6 +229,9 @@ export function paperConfig(overrides = {}) {
     Number.isFinite(Number(cfg.pctWhale)) && Number(cfg.pctWhale) > 0 ? Number(cfg.pctWhale) : null;
   cfg.pureMirror = cfg.pureMirror === true;
   cfg.scaleIn = cfg.scaleIn !== false;
+  cfg.useImpliedEntry = cfg.useImpliedEntry !== false;
+  cfg.copyImpactPct = Math.max(0, Number(cfg.copyImpactPct) || 0);
+  cfg.impliedMinSpendSol = Math.max(0, Number(cfg.impliedMinSpendSol) || 0);
   cfg.rpcMirror = { ...PAPER_DEFAULTS.rpcMirror, ...(cfg.rpcMirror ?? {}) };
   // Pure mirror without the chain feed would be a book that can never sell:
   // the ledger records buys only, so the sole exit path would be gone. Forced
@@ -966,6 +979,45 @@ export function parseWalletSwap(tx, { wallet } = {}) {
 }
 
 /**
+ * The price the target actually paid, per token, in USD. PURE.
+ *
+ * solSpent / tokenDelta is the fill, straight out of the transaction — no
+ * DexScreener call, so an entry can be recorded the moment the swap is parsed
+ * instead of waiting on a pair lookup.
+ *
+ * ── IT IS THE WHALE'S FILL, WHICH IS NOT OUR FILL, AND THE GAP IS MEASURED ──
+ * MEASURED 2026-08-12 across 8 of this target's buys, comparing the implied
+ * fill against DexScreener minutes later:
+ *   -8.8%  -8.6%  -10.0%  -9.9%   (0.7-3.4 min later)
+ *   -14.2% -19.1%                 (2.8-3.7 min later)
+ *   +41.4% +39.4%                 (0.6-2.4 min later)
+ * The tight cluster around -9% is the signal: the target's fill sits BELOW the
+ * price shortly afterwards, because their own buy moves it and because
+ * everything watching them follows. Cya6eW35 shows it inside one position —
+ * three fills at 2.69e-5, 1.71e-5 and 1.54e-5.
+ *
+ * So booking an entry at this number would make the book optimistic by roughly
+ * that margin, systematically, on every mirrored trade. copyImpactPct exists to
+ * price that in, and defaults to the measured figure rather than to zero.
+ *
+ * ── AND IT INCLUDES FEES ───────────────────────────────────────────────────
+ * solSpent is the lamport delta, so it carries the network fee and any rent for
+ * a new token account (~0.002 SOL). On a 0.9 SOL buy that is 0.2% — noise next
+ * to the impact above. On a 0.02 SOL buy it is 10%, which is not. Below
+ * impliedMinSpendSol the number is refused and the pair lookup is used instead.
+ */
+export function impliedEntryPriceUsd(trade, { solUsd = null, minSpendSol = 0.05 } = {}) {
+  if (trade?.kind !== 'BUY') return null;
+  if (!Number.isFinite(solUsd) || solUsd <= 0) return null;
+  const spent = trade.solSpent;
+  const tokens = trade.tokenDelta;
+  if (!Number.isFinite(spent) || spent < minSpendSol) return null;
+  if (!Number.isFinite(tokens) || tokens <= 0) return null;
+  const priceUsd = (spent / tokens) * solUsd;
+  return Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : null;
+}
+
+/**
  * The target's recent trades, newest signature first.
  *
  * `sinceSignature` stops the walk as soon as a known signature is seen, so a
@@ -1351,6 +1403,10 @@ export async function runPaperTick({
   // caller or test that injects one.
   priceFetcher = fetchMarketData,
   tradeFetcher = fetchWhaleTrades,
+  // Needed to convert a swap's SOL-denominated fill into USD. Without it the
+  // implied path is simply skipped and the pair lookup is used, rather than a
+  // guessed rate producing a wrong entry.
+  solUsd = null,
 } = {}) {
   const report = { opened: [], exits: [], marked: 0, declined: [], target: null, chain: null };
 
@@ -1451,12 +1507,34 @@ export async function runPaperTick({
         }
         return true;
       })
-      .map((t) => ({ mint: t.mint, symbol: null, observedAt: t.blockTime ?? now, whaleSpendSol: t.solSpent })),
+      .map((t) => {
+        // Priced from the swap where possible, so the entry does not wait on a
+        // pair lookup. The impact premium is applied HERE rather than inside
+        // openPaperPosition, so the position's entry is the price we model
+        // ourselves paying and every later mark compares against that.
+        const implied = cfg.useImpliedEntry
+          ? impliedEntryPriceUsd(t, { solUsd, minSpendSol: cfg.impliedMinSpendSol })
+          : null;
+        return {
+          mint: t.mint,
+          symbol: null,
+          observedAt: t.blockTime ?? now,
+          whaleSpendSol: t.solSpent,
+          impliedPriceUsd: implied === null ? null : implied * (1 + cfg.copyImpactPct / 100),
+          whaleFillUsd: implied,
+        };
+      }),
     ...ledgerCandidates,
   ];
   if (report.chain) report.chain.staleSkipped = staleChainBuys;
   const openMints = Object.keys(book.positions);
-  const needPrices = [...new Set([...openMints, ...candidates.map((c) => c.mint)])];
+  // OPEN POSITIONS ALWAYS NEED A LOOKUP — they have to be marked, and no swap
+  // tells us today's price. Candidates only need one when the swap could not
+  // price them, which is the whole latency win: a mirrored entry no longer
+  // waits on a network round trip plus fetchPairsBatch's 250ms internal pace.
+  const needPrices = [
+    ...new Set([...openMints, ...candidates.filter((c) => !c.impliedPriceUsd).map((c) => c.mint)]),
+  ];
   const raw = await priceFetcher(needPrices);
   // Normalised once, so every reader below sees one shape whether the fetcher
   // returned bare numbers or {priceUsd, symbol} records.
@@ -1562,7 +1640,9 @@ export async function runPaperTick({
   }
 
   for (const c of candidates) {
-    const price = prices.get(c.mint);
+    // The swap's own price wins when it exists; the pair lookup is the
+    // fallback for a spend too small to imply one, or a ledger candidate.
+    const price = c.impliedPriceUsd ?? prices.get(c.mint);
     const res = openPaperPosition(book, {
       mint: c.mint,
       // A chain buy arrives with no symbol; the quote that priced it has one.
@@ -2025,7 +2105,7 @@ export async function main(argv = []) {
 
   const tick = async () => {
     const observations = intervalSec ? await loadObservationsCached() : await loadObservations(obsPath);
-    const report = await runPaperTick({ book, observations, watchlist, cfg, tradeFetcher: chainFetcher });
+    const report = await runPaperTick({ book, observations, watchlist, cfg, tradeFetcher: chainFetcher, solUsd: spotCache.value });
     await saveBook(book);
 
     let spot = spotCache.value;

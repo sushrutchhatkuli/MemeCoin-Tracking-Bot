@@ -8024,3 +8024,141 @@ test('a trade delivered twice is mirrored once', async () => {
   // The dedupe set is bounded so a busy wallet cannot grow the book forever.
   assert.ok(book.seenSignatures.length <= 400);
 });
+
+/* ------------------------------------------------------------------ *
+ * Implied entry price (no DexScreener in the entry path)
+ * ------------------------------------------------------------------ */
+
+test('the implied entry price is the fill straight out of the swap', async () => {
+  const { impliedEntryPriceUsd } = await import('../paper_copytrade.mjs');
+
+  // 1 SOL for 1,000,000 tokens at $75/SOL -> $7.5e-5 each.
+  const buy = { kind: 'BUY', solSpent: 1, tokenDelta: 1_000_000 };
+  assert.ok(Math.abs(impliedEntryPriceUsd(buy, { solUsd: 75 }) - 7.5e-5) < 1e-12);
+
+  // Sells carry no entry price — solReceived is an exit, not a fill.
+  assert.equal(impliedEntryPriceUsd({ kind: 'SELL', solReceived: 1, tokenDelta: -1 }, { solUsd: 75 }), null);
+
+  // WITHOUT A SOL RATE THE PATH IS SKIPPED, not guessed. A fabricated rate
+  // would put a wrong entry in the book, which every later mark compares to.
+  assert.equal(impliedEntryPriceUsd(buy, { solUsd: null }), null);
+  assert.equal(impliedEntryPriceUsd(buy, { solUsd: 0 }), null);
+
+  // solSpent carries the network fee and ~0.002 SOL of rent for a new token
+  // account. On a 0.9 SOL buy that is 0.2% — noise. On a 0.02 SOL buy it is
+  // 10%, so small spends fall back to the pair lookup.
+  assert.equal(impliedEntryPriceUsd({ kind: 'BUY', solSpent: 0.02, tokenDelta: 1000 }, { solUsd: 75, minSpendSol: 0.05 }), null);
+  assert.ok(impliedEntryPriceUsd({ kind: 'BUY', solSpent: 0.9, tokenDelta: 1000 }, { solUsd: 75, minSpendSol: 0.05 }) > 0);
+
+  // Structurally impossible inputs are refused rather than producing Infinity.
+  assert.equal(impliedEntryPriceUsd({ kind: 'BUY', solSpent: 1, tokenDelta: 0 }, { solUsd: 75 }), null);
+  assert.equal(impliedEntryPriceUsd({ kind: 'BUY', solSpent: 1, tokenDelta: -5 }, { solUsd: 75 }), null);
+  assert.equal(impliedEntryPriceUsd(null, { solUsd: 75 }), null);
+});
+
+test('a mirrored entry prices itself without a pair lookup', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({
+    budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0,
+    useImpliedEntry: true, copyImpactPct: 0,
+  });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  let askedFor = null;
+  const r = await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now,
+    solUsd: 100,
+    priceFetcher: async (mints) => { askedFor = mints; return new Map(); },
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S1',
+      trades: [{ kind: 'BUY', mint: 'M', solSpent: 1, tokenDelta: 1000, blockTime: now, signature: 'S1' }],
+    }),
+  });
+
+  // THE POINT: the pair feed was not asked about this mint at all, so the entry
+  // did not wait on a network round trip.
+  assert.deepEqual(askedFor, [], 'no lookup for a swap-priced candidate');
+  assert.equal(r.opened.length, 1);
+  // 1 SOL / 1000 tokens x $100 = $0.10.
+  assert.ok(Math.abs(book.positions.M.entryPriceUsd - 0.1) < 1e-12);
+});
+
+test('the copy-impact premium is applied on top of the whale fill', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const now = 1_000_000_000;
+  const trade = { kind: 'BUY', mint: 'M', solSpent: 1, tokenDelta: 1000, blockTime: now, signature: 'S1' };
+  const args = (cfg) => ({
+    book: createBook({ budgetSol: 10, target: { address: 'W' } }),
+    observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now, solUsd: 100,
+    priceFetcher: async () => new Map(),
+    tradeFetcher: async () => ({ ok: true, newestSignature: 'S1', trades: [trade] }),
+  });
+
+  // MEASURED at ~9% against this target: the fill sits below the price shortly
+  // after, because their own buy moves it and everything watching follows.
+  // Booking at their fill would make the book optimistic by that margin on
+  // every mirrored trade.
+  const withImpact = args(paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 9 }));
+  await runPaperTick(withImpact);
+  assert.ok(Math.abs(withImpact.book.positions.M.entryPriceUsd - 0.109) < 1e-12, '$0.10 fill + 9%');
+
+  // Zero shows the optimistic version, which is what booking at their fill
+  // would have silently produced.
+  const noImpact = args(paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0 }));
+  await runPaperTick(noImpact);
+  assert.ok(Math.abs(noImpact.book.positions.M.entryPriceUsd - 0.1) < 1e-12);
+
+  // Slippage still stacks on top of the impact — they model different things:
+  // one is the spread we cross, the other is arriving late.
+  const both = args(paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 10, feeSol: 0, copyImpactPct: 9 }));
+  await runPaperTick(both);
+  assert.ok(Math.abs(both.book.positions.M.entryPriceUsd - 0.109 * 1.1) < 1e-12);
+});
+
+test('open positions are still marked from the pair feed', async () => {
+  const { createBook, runPaperTick, openPaperPosition, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+  openPaperPosition(book, { mint: 'HELD', priceUsd: 1, cfg, now: now - 1000 });
+
+  let askedFor = null;
+  await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now, solUsd: 100,
+    priceFetcher: async (mints) => { askedFor = mints; return new Map([['HELD', 2]]); },
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S1',
+      trades: [{ kind: 'BUY', mint: 'NEW', solSpent: 1, tokenDelta: 1000, blockTime: now, signature: 'S1' }],
+    }),
+  });
+
+  // A held position has to be marked and no swap tells us today's price, so it
+  // is still looked up — only the NEW entry skips the feed.
+  assert.deepEqual(askedFor, ['HELD']);
+  assert.equal(book.positions.HELD.markPriceUsd, 2);
+  assert.ok(book.positions.NEW);
+});
+
+test('a spend too small to imply a price falls back to the pair feed', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({
+    budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0,
+    copyImpactPct: 0, impliedMinSpendSol: 0.05,
+  });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  let askedFor = null;
+  await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now, solUsd: 100,
+    priceFetcher: async (mints) => { askedFor = mints; return new Map([['DUST', 5]]); },
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S1',
+      trades: [{ kind: 'BUY', mint: 'DUST', solSpent: 0.01, tokenDelta: 1000, blockTime: now, signature: 'S1' }],
+    }),
+  });
+
+  assert.deepEqual(askedFor, ['DUST'], 'fee and rent would distort a spend this small');
+  assert.equal(book.positions.DUST.entryPriceUsd, 5);
+});
