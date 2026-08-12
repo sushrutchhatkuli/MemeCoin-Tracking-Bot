@@ -7,11 +7,20 @@
  *   node paper_copytrade.mjs --scorecard   print the scorecard, change nothing
  *   node paper_copytrade.mjs --target      show the active target and why
  *   node paper_copytrade.mjs --reset       start a fresh book at the configured budget
- *   node paper_copytrade.mjs --watch 30    fixed in-place dashboard, redrawn every 30s
+ *   node paper_copytrade.mjs --watch 5     fixed in-place dashboard, redrawn every 5s
  *   node paper_copytrade.mjs --demo        open one live test position right now
  *
  *   --budget <usd> / --starting-balance <usd>   fund a NEW book in dollars,
  *                                               e.g. --reset --budget 50
+ *   --pct-whale <percent>                       size each mirrored entry at
+ *                                               this % of what the whale spent,
+ *                                               e.g. --pct-whale 10
+ *
+ * A short --watch interval re-prices and re-renders quickly, but it CANNOT make
+ * the mirror faster than the ledger it reads: see the latency note below. At 5s
+ * the ledger is reloaded only when the scanner has rewritten it, and the SOL
+ * spot price is refreshed at most every 30s; token prices are fetched every
+ * tick because those are what actually move.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * THIS SPENDS NOTHING AND SIGNS NOTHING.
@@ -102,6 +111,13 @@ export const PAPER_DEFAULTS = {
   // Only mirror buys observed this recently. An old buy in the ledger is
   // history, not a signal to enter now.
   maxBuyAgeMinutes: 30,
+  // PROPORTIONAL SIZING. When set, a mirrored position is this percentage of
+  // what the whale actually spent, instead of the flat perTradeSol. Null keeps
+  // the flat size. See mirrorPositionSize for what the percentage costs.
+  pctWhale: null,
+  // Floor for a proportional position. 0 means "no floor", which is faithful to
+  // a bare --pct-whale and is why the CLI warns instead of silently clamping.
+  minTradeSol: 0,
 };
 
 /* ------------------------------------------------------------------ *
@@ -164,6 +180,11 @@ export function paperConfig(overrides = {}) {
   cfg.maxOpenPositions = Math.max(0, Math.floor(Number(cfg.maxOpenPositions) || 0));
   cfg.slippagePct = Math.max(0, Number(cfg.slippagePct) || 0);
   cfg.feeSol = Math.max(0, Number(cfg.feeSol) || 0);
+  cfg.minTradeSol = Math.max(0, Number(cfg.minTradeSol) || 0);
+  // Null and 0 both mean "flat sizing". A 0% proportional size would open
+  // nothing forever, which is a config mistake rather than a strategy.
+  cfg.pctWhale =
+    Number.isFinite(Number(cfg.pctWhale)) && Number(cfg.pctWhale) > 0 ? Number(cfg.pctWhale) : null;
   cfg.takeProfit = (Array.isArray(cfg.takeProfit) ? cfg.takeProfit : [])
     .map((r) => ({
       gainPct: Number(r?.gainPct),
@@ -175,13 +196,71 @@ export function paperConfig(overrides = {}) {
 }
 
 /**
+ * How much SOL to put into one mirrored entry. PURE.
+ *
+ * Flat by default (perTradeSol). With `pctWhale` set, the position is that
+ * percentage of what the whale ACTUALLY SPENT — proportional copying, so a
+ * conviction buy from the target produces a larger paper position than a
+ * nibble, which a flat size cannot express.
+ *
+ * ── THE PERCENTAGE IS SMALLER THAN IT SOUNDS, AND FEES ARE THE REASON ──────
+ * MEASURED across the 68,301 buys in the ledger (90.8% of which carry a usable
+ * spend figure):
+ *   p10 spend 0.002 SOL   ->  10% = 0.0002 SOL
+ *   median    0.117 SOL   ->  10% = 0.0117 SOL
+ *   p90       1.501 SOL   ->  10% = 0.1501 SOL
+ * Round-trip fees at the default feeSol are 0.0012 SOL. So at 10% of a MEDIAN
+ * whale buy, fees are ~10% of the position, and below roughly the 25th
+ * percentile they exceed the position entirely — the book would post losses
+ * that are pure fee drag and read as the strategy failing.
+ *
+ * `minTradeSol` exists for that and defaults to 0, i.e. OFF: clamping silently
+ * would misreport what a bare `--pct-whale 10` does. The CLI warns instead, so
+ * the choice is visible rather than made on the operator's behalf.
+ *
+ * An UNKNOWN whale spend falls back to the flat size rather than skipping the
+ * trade. 9.2% of ledger buys have no spend attributed — several buyers in one
+ * transaction, or SOL that could not be split from balances — and dropping
+ * those would silently make the mirror sample a biased subset of the whale's
+ * activity rather than a smaller version of it.
+ */
+export function mirrorPositionSize(cfg, { whaleSpendSol = null, balanceSol = 0 } = {}) {
+  const spendable = balanceSol - cfg.feeSol;
+  if (!(spendable > 0)) return { ok: false, reason: 'insufficient virtual balance' };
+
+  const proportional = cfg.pctWhale !== null && cfg.pctWhale !== undefined;
+  const knownSpend = Number.isFinite(whaleSpendSol) && whaleSpendSol > 0;
+
+  let target;
+  let basis;
+  if (proportional && knownSpend) {
+    target = whaleSpendSol * (cfg.pctWhale / 100);
+    basis = `${cfg.pctWhale}% of the whale's ${whaleSpendSol.toFixed(3)} SOL`;
+  } else {
+    target = cfg.perTradeSol;
+    basis = proportional ? 'flat (whale spend not attributed)' : 'flat';
+  }
+
+  if (cfg.minTradeSol > 0 && target < cfg.minTradeSol) {
+    return { ok: false, reason: `size ${target.toFixed(4)} SOL is below minTradeSol ${cfg.minTradeSol}`, basis };
+  }
+
+  // Capped by what is actually free, so a whale buying 30 SOL cannot overdraw a
+  // book holding one.
+  const sizeSol = Math.min(target, spendable);
+  if (!(sizeSol > 0)) return { ok: false, reason: 'insufficient virtual balance', basis };
+
+  return { ok: true, sizeSol, basis, capped: sizeSol < target };
+}
+
+/**
  * Record a paper entry. PURE — mutates and returns the book, no clock, no IO.
  *
  * Returns a reason instead of throwing when the trade is declined, because
  * "no balance" and "already holding" are ordinary outcomes of a tick and the
  * caller reports them rather than failing.
  */
-export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, now = Date.now(), source = null, demo = false }) {
+export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, now = Date.now(), source = null, demo = false, whaleSpendSol = null }) {
   if (!mint) return { ok: false, reason: 'no mint' };
   if (!Number.isFinite(priceUsd) || priceUsd <= 0) return { ok: false, reason: 'no usable price' };
   if (book.positions[mint]) return { ok: false, reason: 'already holding' };
@@ -189,8 +268,9 @@ export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, no
   const open = Object.keys(book.positions).length;
   if (open >= cfg.maxOpenPositions) return { ok: false, reason: `at max open positions (${cfg.maxOpenPositions})` };
 
-  const size = Math.min(cfg.perTradeSol, book.balanceSol - cfg.feeSol);
-  if (!(size > 0)) return { ok: false, reason: 'insufficient virtual balance' };
+  const sized = mirrorPositionSize(cfg, { whaleSpendSol, balanceSol: book.balanceSol });
+  if (!sized.ok) return { ok: false, reason: sized.reason };
+  const size = sized.sizeSol;
 
   // Slippage raises the effective entry price. Modelled on the PRICE rather
   // than skimmed off the size, so the position's whole P&L curve carries it —
@@ -223,7 +303,7 @@ export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, no
     ...(demo ? { demo: true } : {}),
     lastPricedAt: now,
   };
-  return { ok: true, position: book.positions[mint], sizeSol: size };
+  return { ok: true, position: book.positions[mint], sizeSol: size, basis: sized.basis, capped: sized.capped };
 }
 
 /**
@@ -563,7 +643,15 @@ export function pendingMirrorBuys(observations, { target, book, cfg, now = Date.
     if (!b?.token || typeof b.ts !== 'number' || b.ts < cutoff) continue;
     if (seen.has(b.token)) continue;
     seen.add(b.token);
-    out.push({ mint: b.token, symbol: b.symbol ?? null, observedAt: b.ts });
+    out.push({
+      mint: b.token,
+      symbol: b.symbol ?? null,
+      observedAt: b.ts,
+      // What the whale actually put in, for proportional sizing. Null on the
+      // ~9% of ledger rows where spend could not be attributed; mirrorPositionSize
+      // falls back to the flat size rather than skipping those.
+      whaleSpendSol: Number.isFinite(b.solSpent) && b.solSpent > 0 ? b.solSpent : null,
+    });
   }
   return out;
 }
@@ -701,9 +789,17 @@ export async function runPaperTick({
       cfg,
       now,
       source: book.target?.address ?? null,
+      whaleSpendSol: c.whaleSpendSol ?? null,
     });
-    if (res.ok) report.opened.push({ mint: c.mint, symbol: c.symbol, sizeSol: res.sizeSol });
-    else report.declined.push({ mint: c.mint, reason: res.reason });
+    if (res.ok) {
+      report.opened.push({
+        mint: c.mint,
+        symbol: c.symbol,
+        sizeSol: res.sizeSol,
+        basis: res.basis ?? null,
+        whaleSpendSol: c.whaleSpendSol ?? null,
+      });
+    } else report.declined.push({ mint: c.mint, reason: res.reason });
   }
 
   return report;
@@ -868,6 +964,41 @@ export async function main(argv = []) {
   }
   const budgetUsd = budgetFlag.value ?? startFlag.value ?? null;
 
+  // Proportional sizing. Applied to cfg so every downstream path — including a
+  // --demo entry — sizes the same way.
+  const pctFlag = numericFlag(argv, '--pct-whale');
+  if (pctFlag.error) {
+    console.error(`Error: ${pctFlag.error}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (pctFlag.value !== null) {
+    cfg.pctWhale = pctFlag.value;
+    // WARNED, NOT CLAMPED. The measured consequence is specific enough to state
+    // outright, and stating it is better than silently raising the size to
+    // something the operator did not ask for.
+    const feeRound = cfg.feeSol * 2;
+    const medianSize = 0.117 * (pctFlag.value / 100);
+    console.log(
+      `Proportional sizing: ${pctFlag.value}% of each whale buy` +
+        (cfg.minTradeSol > 0 ? `, floor ${cfg.minTradeSol} SOL.` : '.')
+    );
+    // Warn once round-trip fees exceed 5% of a median-sized position. At the
+    // measured median whale buy of 0.117 SOL, --pct-whale 10 gives 0.0117 SOL
+    // against 0.0012 SOL of fees — 10.3%, which materially distorts a
+    // scorecard and is precisely the case worth naming.
+    if (medianSize > 0 && feeRound / medianSize > 0.05) {
+      console.log(
+        `  ⚠ the median observed whale buy is 0.117 SOL, so ${pctFlag.value}% is ~${medianSize.toFixed(4)} SOL, ` +
+          `against ${feeRound.toFixed(4)} SOL of round-trip fees — roughly ` +
+          `${((feeRound / medianSize) * 100).toFixed(0)}% of the position.`
+      );
+      console.log('    Much of the resulting PnL will be fee drag rather than the strategy.');
+      console.log('    Raise --pct-whale, or set paperCopytrade.minTradeSol to skip the dust.');
+    }
+    console.log('');
+  }
+
   // Fetched once up front: every USD figure on the dashboard derives from it,
   // and a book opened with a USD budget cannot be sized without it.
   const solUsd = await fetchSolUsd();
@@ -892,8 +1023,10 @@ export async function main(argv = []) {
         ? `Fresh paper book at ${usd(budgetUsd, { sign: false })} (${fresh.budgetSol.toFixed(3)} SOL @ ${usd(solUsd, { sign: false })}/SOL).`
         : `Fresh paper book at ${fresh.budgetSol.toFixed(3)} virtual SOL.`
     );
-    console.log(renderScorecard(paperScorecard(fresh, cfg), { solUsd }));
-    return;
+    if (!argv.includes('--watch')) {
+      console.log(renderScorecard(paperScorecard(fresh, cfg), { solUsd }));
+      return;
+    }
   }
 
   let book = await loadBook();
@@ -971,17 +1104,56 @@ export async function main(argv = []) {
 
   const recent = [];
 
+  // ── WHAT A 5-SECOND CADENCE COSTS, AND WHAT IS DONE ABOUT IT ─────────────
+  // A naive tick re-reads the observation ledger and re-fetches the SOL price
+  // every pass. At 60s that is unremarkable; at 5s it is 12 reads a minute of a
+  // ~16 MB JSON file and 24 DexScreener calls a minute, most of them returning
+  // exactly what the previous one did.
+  //
+  // The ledger is therefore reloaded only when the FILE HAS CHANGED — the
+  // scanner writes it, so its mtime is the honest signal, and between writes a
+  // re-read cannot produce a different answer. The SOL price is refreshed on a
+  // floor of its own because spot does not meaningfully move in five seconds,
+  // while token prices do and are still fetched every tick.
+  const obsPath = join(HERE, '.state', 'wallet_observations.json');
+  let obsCache = { mtimeMs: null, value: null };
+  let spotCache = { at: 0, value: solUsd };
+  const SPOT_REFRESH_MS = 30_000;
+
+  const loadObservationsCached = async () => {
+    try {
+      const { stat } = await import('node:fs/promises');
+      const { mtimeMs } = await stat(obsPath);
+      if (obsCache.value && obsCache.mtimeMs === mtimeMs) return obsCache.value;
+      const value = await loadObservations(obsPath);
+      obsCache = { mtimeMs, value };
+      return value;
+    } catch {
+      // stat failed — fall back to a plain read rather than mirroring nothing.
+      return loadObservations(obsPath);
+    }
+  };
+
   const tick = async () => {
-    const observations = await loadObservations(join(HERE, '.state', 'wallet_observations.json'));
+    const observations = intervalSec ? await loadObservationsCached() : await loadObservations(obsPath);
     const report = await runPaperTick({ book, observations, watchlist, cfg });
     await saveBook(book);
 
-    // Re-priced every tick so the dashboard tracks SOL, not just the tokens.
-    const spot = (await fetchSolUsd()) ?? solUsd;
+    let spot = spotCache.value;
+    if (Date.now() - spotCache.at >= SPOT_REFRESH_MS) {
+      spot = (await fetchSolUsd()) ?? spotCache.value ?? solUsd;
+      spotCache = { at: Date.now(), value: spot };
+    }
 
     const stamp = new Date().toISOString().slice(11, 19);
     for (const o of report.opened) {
-      recent.push(`[${stamp}] BUY  ${o.symbol ?? o.mint.slice(0, 8)} — ${o.sizeSol.toFixed(3)} SOL`);
+      // The basis is shown because with --pct-whale the size is the interesting
+      // half: "0.012 SOL" alone does not say whether that was 10% of a nibble
+      // or a cap biting on a conviction buy.
+      recent.push(
+        `[${stamp}] BUY  ${o.symbol ?? o.mint.slice(0, 8)} — ${o.sizeSol.toFixed(4)} SOL` +
+          (o.basis && cfg.pctWhale ? `  (${o.basis})` : '')
+      );
     }
     for (const e of report.exits) {
       recent.push(

@@ -6921,3 +6921,149 @@ test('the positions table renders USD values and flags demo rows', async () => {
   // dollar figure.
   assert.match(renderPositions(book, null), /SOL/);
 });
+
+/* ------------------------------------------------------------------ *
+ * Proportional whale sizing
+ * ------------------------------------------------------------------ */
+
+test('mirrorPositionSize takes a percentage of what the whale spent', async () => {
+  const { mirrorPositionSize, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ perTradeSol: 1, pctWhale: 10, feeSol: 0 });
+
+  // 10% of a 2 SOL conviction buy.
+  const big = mirrorPositionSize(cfg, { whaleSpendSol: 2, balanceSol: 10 });
+  assert.equal(big.ok, true);
+  assert.ok(Math.abs(big.sizeSol - 0.2) < 1e-9);
+  assert.match(big.basis, /10% of the whale's 2\.000 SOL/);
+
+  // 10% of a nibble is a nibble — proportional means proportional in both
+  // directions, which is the point a flat size cannot express.
+  const small = mirrorPositionSize(cfg, { whaleSpendSol: 0.117, balanceSol: 10 });
+  assert.ok(Math.abs(small.sizeSol - 0.0117) < 1e-9);
+
+  // Percentages other than 10.
+  const quarter = mirrorPositionSize(paperConfig({ pctWhale: 25, feeSol: 0 }), { whaleSpendSol: 4, balanceSol: 10 });
+  assert.ok(Math.abs(quarter.sizeSol - 1) < 1e-9);
+});
+
+test('proportional size is capped by free balance, never overdrawn', async () => {
+  const { mirrorPositionSize, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ pctWhale: 10, feeSol: 0.001 });
+
+  // 10% of a 30 SOL whale buy is 3 SOL, but the book holds 0.5.
+  const capped = mirrorPositionSize(cfg, { whaleSpendSol: 30, balanceSol: 0.5 });
+  assert.equal(capped.ok, true);
+  assert.ok(Math.abs(capped.sizeSol - (0.5 - 0.001)) < 1e-9, 'capped at free balance less the fee');
+  assert.equal(capped.capped, true);
+
+  // A book with nothing left cannot open at any percentage.
+  assert.equal(mirrorPositionSize(cfg, { whaleSpendSol: 30, balanceSol: 0 }).ok, false);
+  assert.equal(mirrorPositionSize(cfg, { whaleSpendSol: 30, balanceSol: 0.0005 }).ok, false);
+});
+
+test('an unattributed whale spend falls back to the flat size, not a skip', async () => {
+  const { mirrorPositionSize, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ perTradeSol: 1, pctWhale: 10, feeSol: 0 });
+
+  // 9.2% of ledger buys carry no spend — several buyers in one transaction, or
+  // SOL that could not be split from balances. Skipping those would make the
+  // mirror a biased subset of the whale's activity rather than a smaller
+  // version of it.
+  for (const unknown of [null, undefined, 0, -1, NaN]) {
+    const r = mirrorPositionSize(cfg, { whaleSpendSol: unknown, balanceSol: 10 });
+    assert.equal(r.ok, true, `must still trade for spend=${String(unknown)}`);
+    assert.equal(r.sizeSol, 1, 'falls back to perTradeSol');
+    assert.match(r.basis, /not attributed/);
+  }
+
+  // Without pctWhale it is flat sizing and says so plainly.
+  const flat = mirrorPositionSize(paperConfig({ perTradeSol: 1, feeSol: 0 }), { whaleSpendSol: 5, balanceSol: 10 });
+  assert.equal(flat.sizeSol, 1);
+  assert.equal(flat.basis, 'flat');
+});
+
+test('minTradeSol skips dust but defaults to off', async () => {
+  const { mirrorPositionSize, paperConfig } = await import('../paper_copytrade.mjs');
+
+  // MEASURED: p10 whale spend is 0.002 SOL, so 10% is 0.0002 SOL against
+  // 0.0012 SOL of round-trip fees — the position is dwarfed by its own costs.
+  const off = paperConfig({ pctWhale: 10, feeSol: 0.0006 });
+  assert.equal(off.minTradeSol, 0, 'off by default, so a bare --pct-whale is faithful');
+  assert.equal(mirrorPositionSize(off, { whaleSpendSol: 0.002, balanceSol: 10 }).ok, true);
+
+  const on = paperConfig({ pctWhale: 10, feeSol: 0.0006, minTradeSol: 0.01 });
+  const dust = mirrorPositionSize(on, { whaleSpendSol: 0.002, balanceSol: 10 });
+  assert.equal(dust.ok, false);
+  assert.match(dust.reason, /below minTradeSol/);
+  // A real-sized buy still passes the floor.
+  assert.equal(mirrorPositionSize(on, { whaleSpendSol: 1.5, balanceSol: 10 }).ok, true);
+});
+
+test('paperConfig treats a zero or junk pctWhale as flat sizing', async () => {
+  const { paperConfig } = await import('../paper_copytrade.mjs');
+  // A 0% proportional size would open nothing forever — that is a config
+  // mistake, not a strategy, so it degrades to flat rather than silently
+  // disabling the mirror.
+  for (const bad of [0, -5, 'abc', null, undefined, NaN]) {
+    assert.equal(paperConfig({ pctWhale: bad }).pctWhale, null, `pctWhale=${String(bad)}`);
+  }
+  assert.equal(paperConfig({ pctWhale: 10 }).pctWhale, 10);
+  assert.equal(paperConfig({ pctWhale: '10' }).pctWhale, 10);
+  assert.equal(paperConfig({ minTradeSol: -1 }).minTradeSol, 0);
+});
+
+test('the whale spend is carried from the ledger into the mirror', async () => {
+  const { pendingMirrorBuys, createBook, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ maxBuyAgeMinutes: 30 });
+  const now = 1_000_000_000;
+  const observations = {
+    wallets: {
+      T: {
+        buys: [
+          { token: 'BIG', symbol: 'B', ts: now - 60_000, solSpent: 2.5 },
+          { token: 'UNK', symbol: 'U', ts: now - 60_000, solSpent: null },
+        ],
+      },
+    },
+  };
+  const out = pendingMirrorBuys(observations, { target: { address: 'T' }, book: createBook({ budgetSol: 10 }), cfg, now });
+  assert.equal(out.find((c) => c.mint === 'BIG').whaleSpendSol, 2.5);
+  assert.equal(out.find((c) => c.mint === 'UNK').whaleSpendSol, null);
+});
+
+test('a tick sizes each mirrored entry proportionally', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, pctWhale: 10, slippagePct: 0, feeSol: 0, maxOpenPositions: 5 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'T' } });
+
+  const observations = {
+    wallets: {
+      T: {
+        buys: [
+          { token: 'BIG', symbol: 'B', ts: now - 60_000, solSpent: 4 },
+          { token: 'SMALL', symbol: 'S', ts: now - 60_000, solSpent: 0.2 },
+          { token: 'UNK', symbol: 'U', ts: now - 60_000, solSpent: null },
+        ],
+      },
+    },
+  };
+  const report = await runPaperTick({
+    book,
+    observations,
+    watchlist: { wallets: [{ address: 'T' }] },
+    cfg,
+    now,
+    priceFetcher: async () => new Map([['BIG', 1], ['SMALL', 1], ['UNK', 1]]),
+  });
+
+  const size = (m) => report.opened.find((o) => o.mint === m).sizeSol;
+  assert.ok(Math.abs(size('BIG') - 0.4) < 1e-9, '10% of 4 SOL');
+  assert.ok(Math.abs(size('SMALL') - 0.02) < 1e-9, '10% of 0.2 SOL');
+  assert.ok(Math.abs(size('UNK') - 1) < 1e-9, 'flat fallback');
+
+  // A conviction buy really does get a bigger paper position than a nibble —
+  // the whole point of proportional sizing over a flat one.
+  assert.ok(size('BIG') > size('SMALL') * 10 - 1e-9);
+  assert.ok(Math.abs(book.balanceSol - (10 - 0.4 - 0.02 - 1)) < 1e-9);
+});
