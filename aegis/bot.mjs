@@ -135,6 +135,61 @@ export function buildDeps({ here = HERE } = {}) {
      * per call for the same reason every other loader here is.
      */
     loadConfig,
+
+    /* ---- whale-switch approval ------------------------------------ *
+     *
+     * The proposal store is a small file of pending switches, not part of the
+     * paper book: a proposal is a question that was asked, and it needs to
+     * survive a bot restart so a button pressed ten minutes later still
+     * resolves. Keeping it out of the book also means a corrupt proposal file
+     * can never damage the trading record.
+     */
+    loadProposals: () => readJson(join(here, '.state', 'whale_switch_pending.json'), {}),
+
+    saveProposals: async (proposals) => {
+      const { writeFile, mkdir } = await import('node:fs/promises');
+      await mkdir(join(here, '.state'), { recursive: true });
+      // Resolved proposals are kept for a day so a double-tap answers
+      // "already approved" instead of "expired", which are different facts.
+      const cutoff = Date.now() - 86_400_000;
+      const live = Object.fromEntries(
+        Object.entries(proposals).filter(([, p]) => (p?.resolvedAt ?? p?.createdAt ?? 0) >= cutoff)
+      );
+      await writeFile(
+        join(here, '.state', 'whale_switch_pending.json'),
+        JSON.stringify(live, null, 2),
+        'utf8'
+      );
+    },
+
+    /**
+     * Re-point the paper book. Returns false on failure so the Telegram reply
+     * can say "approved but not applied" rather than claiming a switch that
+     * did not happen.
+     *
+     * Only the TARGET is touched. Open positions keep their own entry prices
+     * and exit rules, because they were opened under the old target and
+     * rewriting their provenance would corrupt the very record the book exists
+     * to keep.
+     */
+    setPaperTarget: async (challenger) => {
+      try {
+        const { loadBook, saveBook, createBook, paperConfig } = await import('./paper_copytrade.mjs');
+        const config = await loadConfig();
+        const cfg = paperConfig(config.paperCopytrade ?? {});
+        const book = (await loadBook()) ?? createBook({ budgetSol: cfg.budgetSol });
+        book.target = {
+          address: challenger.address,
+          label: challenger.label ?? null,
+          since: Date.now(),
+          approved: true,
+        };
+        await saveBook(book);
+        return true;
+      } catch {
+        return false;
+      }
+    },
   };
 }
 

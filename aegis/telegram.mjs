@@ -1504,6 +1504,31 @@ export async function runCommandBot({ credentials, deps, log = console.log, sign
       const body = await res.json().catch(() => ({}));
       for (const update of body.result ?? []) {
         offset = update.update_id + 1;
+
+        // BUTTON PRESSES ARE AUTHORISED THE SAME WAY MESSAGES ARE, and this is
+        // not a formality: a callback_query re-points the paper book, so an
+        // unchecked one lets anyone who can reach the bot decide which wallet
+        // it follows. The chat id on a callback lives at a different path from
+        // the one on a message, which is exactly how such a check gets missed.
+        if (update.callback_query) {
+          const cb = update.callback_query;
+          if (String(cb.message?.chat?.id) !== authorised) continue;
+          let outcome;
+          try {
+            outcome = await handleSwitchCallback({ data: cb.data, deps });
+          } catch (err) {
+            outcome = { ok: false, answer: 'Failed', text: esc(`Switch failed: ${err.message}`.slice(0, 300)) };
+          }
+          await answerCallbackQuery({
+            botToken: credentials.botToken,
+            callbackQueryId: cb.id,
+            text: outcome.answer ?? '',
+          });
+          if (outcome.text) await sendTelegram({ ...credentials, text: outcome.text });
+          log(`   ↳ button ${outcome.action ?? 'ignored'}`);
+          continue;
+        }
+
         const msg = update.message ?? update.channel_post;
         if (!msg?.text) continue;
 
@@ -1537,10 +1562,222 @@ export async function runCommandBot({ credentials, deps, log = console.log, sign
 }
 
 /* ------------------------------------------------------------------ *
+ * Whale-switch approval
+ * ------------------------------------------------------------------ *
+ *
+ * The paper copy-trade book follows ONE wallet. When a challenger out-performs
+ * it, the switch is proposed rather than taken, because re-pointing silently
+ * would make the book's history meaningless — a scorecard that changed which
+ * strategy it was measuring halfway through measures neither.
+ *
+ * ── WHY THE PROPOSAL IS STORED AND THE BUTTON CARRIES ONLY AN ID ───────────
+ * callback_data is capped at 64 BYTES by the Bot API. A Solana address is up to
+ * 44 characters, so "approve + address" fits only just, and adding anything
+ * else — a challenger and an incumbent, say — does not fit at all. More
+ * importantly, callback_data is round-tripped through the client, so an address
+ * read back out of it is attacker-supplied data being used to choose which
+ * wallet to follow. The id indexes a proposal this process wrote, so the only
+ * thing a crafted callback can do is name a proposal that does not exist.
+ */
+
+export const SWITCH_PREFIX = 'sw';
+
+/**
+ * Does the challenger beat the incumbent? PURE.
+ *
+ * ALL THREE must improve — monthly realised P&L, win rate and trade count. It
+ * is an AND rather than a score for the same reason applyEliteRules is: a
+ * wallet with a spectacular win rate over four trades is a small sample, and
+ * one with a big P&L and a 20% win rate got lucky once. Requiring all three
+ * makes a proposal rare, which is the point — the operator is being asked to
+ * make a decision, and a prompt that fires constantly is one that gets approved
+ * without being read.
+ *
+ * Unmeasured is a failure, as everywhere else here: a challenger whose window
+ * produced no graded trades has not out-performed anything.
+ */
+export function beatsActiveWhale(challenger, incumbent, cfg = {}) {
+  const minPnlLeadPct = cfg.minPnlLeadPct ?? 10;
+  const minWinRateLeadPct = cfg.minWinRateLeadPct ?? 0;
+  const minTradeLead = cfg.minTradeLead ?? 0;
+  const minTrades = cfg.minTrades ?? 10;
+
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const cPnl = num(challenger?.monthlyPnlUsd);
+  const cWr = num(challenger?.winRatePct);
+  const cTrades = num(challenger?.trades);
+  if (cPnl === null || cWr === null || cTrades === null) {
+    return { beats: false, reasons: ['challenger has unmeasured metrics'] };
+  }
+  if (cTrades < minTrades) {
+    return { beats: false, reasons: [`challenger has ${cTrades} trades, floor is ${minTrades}`] };
+  }
+  // No incumbent is not a "win" — it is a first target, and the caller picks it
+  // without an approval prompt.
+  if (!incumbent?.address) return { beats: false, reasons: ['no incumbent to beat'] };
+
+  const iPnl = num(incumbent.monthlyPnlUsd) ?? 0;
+  const iWr = num(incumbent.winRatePct) ?? 0;
+  const iTrades = num(incumbent.trades) ?? 0;
+
+  const reasons = [];
+  // A LEAD, not a tie-break. Two wallets within a few percent of each other are
+  // indistinguishable given how these figures are derived, and a bare `>` would
+  // propose a switch every time noise reordered them.
+  const pnlBar = iPnl >= 0 ? iPnl * (1 + minPnlLeadPct / 100) : iPnl * (1 - minPnlLeadPct / 100);
+  if (!(cPnl > pnlBar)) reasons.push(`P&L $${Math.round(cPnl)} does not lead $${Math.round(iPnl)} by ${minPnlLeadPct}%`);
+  if (!(cWr > iWr + minWinRateLeadPct)) reasons.push(`win rate ${cWr.toFixed(0)}% does not beat ${iWr.toFixed(0)}%`);
+  if (!(cTrades > iTrades + minTradeLead)) reasons.push(`trade count ${cTrades} does not beat ${iTrades}`);
+
+  return { beats: reasons.length === 0, reasons };
+}
+
+/** Short, collision-resistant proposal id. */
+export function proposalId(challengerAddress, now = Date.now()) {
+  const base = `${challengerAddress}:${now}`;
+  let h = 0;
+  for (let i = 0; i < base.length; i++) h = (Math.imul(31, h) + base.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36).padStart(7, '0').slice(0, 7);
+}
+
+/** Inline keyboard for a switch proposal. PURE. */
+export function switchKeyboard(id) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ APPROVE SWITCH', callback_data: `${SWITCH_PREFIX}:a:${id}` },
+        { text: '🛑 KEEP CURRENT #1', callback_data: `${SWITCH_PREFIX}:k:${id}` },
+      ],
+    ],
+  };
+}
+
+/**
+ * Parse a callback payload. PURE.
+ *
+ * Returns null for anything unrecognised rather than guessing. This is the one
+ * place client-supplied bytes choose a code path, so the parse is strict: a
+ * fixed prefix, one of exactly two actions, and an id of the expected shape.
+ */
+export function parseCallbackData(data) {
+  if (typeof data !== 'string') return null;
+  const m = data.match(/^sw:(a|k):([a-z0-9]{1,12})$/);
+  if (!m) return null;
+  return { action: m[1] === 'a' ? 'APPROVE' : 'KEEP', id: m[2] };
+}
+
+/** The proposal message. PURE. */
+export function buildWhaleSwitchMessage({ challenger, incumbent, comparison = null }) {
+  const money = (n) =>
+    typeof n === 'number' && Number.isFinite(n)
+      ? `${n < 0 ? '-' : '+'}$${Math.abs(n) >= 1000 ? `${Math.round(Math.abs(n) / 1000)}k` : Math.round(Math.abs(n))}`
+      : '?';
+  const pct = (n) => (typeof n === 'number' && Number.isFinite(n) ? `${n.toFixed(0)}%` : '?');
+
+  const lines = [
+    '<b>👑 MASTER WHALE CHALLENGE</b>',
+    '',
+    'A challenger out-performs the wallet the paper book is currently copying,',
+    'on all three of monthly P&amp;L, win rate and trade count.',
+    '',
+    `<b>CHALLENGER</b>  <code>${esc(challenger.address)}</code>`,
+    `   30d P&amp;L ${money(challenger.monthlyPnlUsd)} · WR ${pct(challenger.winRatePct)} · ${challenger.trades ?? '?'} trades`,
+    '',
+    `<b>CURRENT #1</b>  <code>${esc(incumbent.address)}</code>`,
+    `   30d P&amp;L ${money(incumbent.monthlyPnlUsd)} · WR ${pct(incumbent.winRatePct)} · ${incumbent.trades ?? '?'} trades`,
+    '',
+    '<i>Approving re-points the PAPER book only. No funds move, nothing is',
+    'signed, and the existing paper positions stay open and keep their own',
+    'exit rules — only new mirrored entries follow the new target.</i>',
+    '',
+    '<i>These are Aegis-observed figures over a 30-day window, not a lifetime',
+    'record, and outperformance over one window is not a prediction.</i>',
+  ];
+  if (comparison?.reasons?.length) {
+    lines.push('', `<i>${esc(comparison.reasons.join('; '))}</i>`);
+  }
+  return lines.join('\n');
+}
+
+/** The reply after a button is pressed. PURE. */
+export function buildSwitchOutcomeMessage({ action, proposal, applied = true }) {
+  if (action === 'APPROVE') {
+    return applied
+      ? [
+          '<b>✅ SWITCH APPROVED</b>',
+          '',
+          `Paper copy-trade target is now <code>${esc(proposal.challenger.address)}</code>.`,
+          'Existing paper positions keep their own exit rules; new mirrored entries',
+          'follow the new target.',
+        ].join('\n')
+      : '<b>⚠️ SWITCH APPROVED BUT NOT APPLIED</b>\nThe paper book could not be written — target unchanged.';
+  }
+  return [
+    '<b>🛑 KEEPING CURRENT #1</b>',
+    '',
+    `Paper copy-trade target stays <code>${esc(proposal.incumbent.address)}</code>.`,
+  ].join('\n');
+}
+
+/**
+ * Apply a button press.
+ *
+ * The proposal store is passed in rather than read here, so the whole decision
+ * is testable without touching disk, and so bot.mjs owns the paths exactly as
+ * it owns every other loader.
+ */
+export async function handleSwitchCallback({ data, deps = {} }) {
+  const parsed = parseCallbackData(data);
+  if (!parsed) return { ok: false, answer: 'Unrecognised button', text: null };
+
+  const proposals = (await deps.loadProposals?.()) ?? {};
+  const proposal = proposals[parsed.id];
+  if (!proposal) {
+    // Expired or already answered. Said plainly, because the alternative is a
+    // button that appears to do nothing.
+    return { ok: false, answer: 'That proposal has expired', text: '<i>That whale-switch proposal is no longer pending.</i>' };
+  }
+  if (proposal.resolved) {
+    return { ok: false, answer: `Already ${proposal.resolved}`, text: null };
+  }
+
+  let applied = true;
+  if (parsed.action === 'APPROVE') {
+    applied = (await deps.setPaperTarget?.(proposal.challenger)) !== false;
+  }
+
+  proposal.resolved = parsed.action;
+  proposal.resolvedAt = Date.now();
+  await deps.saveProposals?.(proposals);
+
+  return {
+    ok: true,
+    action: parsed.action,
+    answer: parsed.action === 'APPROVE' ? 'Switched' : 'Kept current #1',
+    text: buildSwitchOutcomeMessage({ action: parsed.action, proposal, applied }),
+  };
+}
+
+/** Acknowledge a button press so the client stops showing a spinner. */
+export async function answerCallbackQuery({ botToken, callbackQueryId, text = '' }) {
+  if (!botToken || !callbackQueryId) return { ok: false };
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text: text.slice(0, 200) }),
+    });
+    return { ok: res.ok };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * Send
  * ------------------------------------------------------------------ */
 
-export async function sendTelegram({ botToken, chatId, text }) {
+export async function sendTelegram({ botToken, chatId, text, replyMarkup = null }) {
   if (!botToken || !chatId) {
     return { ok: false, error: 'TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set' };
   }
@@ -1553,6 +1790,10 @@ export async function sendTelegram({ botToken, chatId, text }) {
         text,
         parse_mode: 'HTML',
         disable_web_page_preview: true,
+        // Omitted entirely when absent rather than sent as null — Bot API
+        // rejects a null reply_markup, which would turn every ordinary alert
+        // into a 400 the moment this parameter was added.
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
       }),
     });
     const body = await res.json().catch(() => ({}));

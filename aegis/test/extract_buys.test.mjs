@@ -6021,3 +6021,397 @@ test('a clean token with whales still reaches BUY SIGNAL', () => {
   assert.equal(result.breakdown.smartMoney, 15, 'bonus applies when safety passes');
   assert.equal(result.verdict, 'BUY SIGNAL');
 });
+
+/* ------------------------------------------------------------------ *
+ * Paper copy-trade engine
+ * ------------------------------------------------------------------ */
+
+const PC = () => import('../paper_copytrade.mjs');
+
+test('paper config rejects values that would mint SOL', async () => {
+  const { paperConfig } = await PC();
+  const cfg = paperConfig({ budgetSol: -5, perTradeSol: -1, maxOpenPositions: -3, slippagePct: -2 });
+  assert.equal(cfg.budgetSol, 0);
+  assert.equal(cfg.perTradeSol, 0);
+  assert.equal(cfg.maxOpenPositions, 0);
+  assert.equal(cfg.slippagePct, 0);
+
+  // A sellFraction above 1 would sell more than the position holds.
+  const ladder = paperConfig({ takeProfit: [{ gainPct: 100, sellFraction: 5 }] });
+  assert.equal(ladder.takeProfit[0].sellFraction, 1);
+
+  // Rungs are sorted so a mis-ordered config still fires low-to-high.
+  const unsorted = paperConfig({
+    takeProfit: [{ gainPct: 200, sellFraction: 0.5 }, { gainPct: 100, sellFraction: 0.5 }],
+  });
+  assert.deepEqual(unsorted.takeProfit.map((r) => r.gainPct), [100, 200]);
+});
+
+test('a paper entry debits virtual balance and prices in slippage', async () => {
+  const { createBook, openPaperPosition, paperConfig } = await PC();
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 2, feeSol: 0.001 });
+  const book = createBook({ budgetSol: 10 });
+
+  const res = openPaperPosition(book, { mint: 'M1', symbol: 'AAA', priceUsd: 100, cfg, now: 1000 });
+  assert.equal(res.ok, true);
+  // Slippage raises the effective ENTRY, so the whole P&L curve carries it.
+  assert.equal(book.positions.M1.entryPriceUsd, 102);
+  assert.ok(Math.abs(book.balanceSol - (10 - 1 - 0.001)) < 1e-9);
+
+  // Never twice into the same mint, and never past the position cap.
+  assert.equal(openPaperPosition(book, { mint: 'M1', priceUsd: 100, cfg }).reason, 'already holding');
+  const capped = paperConfig({ maxOpenPositions: 1 });
+  assert.match(openPaperPosition(book, { mint: 'M2', priceUsd: 1, cfg: capped }).reason, /max open positions/);
+
+  // An unpriceable token is declined rather than entered at zero.
+  assert.equal(openPaperPosition(book, { mint: 'M3', priceUsd: undefined, cfg }).ok, false);
+  assert.equal(openPaperPosition(book, { mint: 'M4', priceUsd: 0, cfg }).ok, false);
+
+  // A book with no balance left cannot open.
+  const broke = createBook({ budgetSol: 0 });
+  assert.equal(openPaperPosition(broke, { mint: 'M5', priceUsd: 1, cfg }).ok, false);
+});
+
+test('take-profit ladder sells fractions and leaves the rest running', async () => {
+  const { createBook, openPaperPosition, evaluatePaperExits, applyPaperExit, paperConfig } = await PC();
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const book = createBook({ budgetSol: 10 });
+  openPaperPosition(book, { mint: 'M', priceUsd: 100, cfg, now: 0 });
+
+  // Below the first rung: nothing fires.
+  assert.deepEqual(evaluatePaperExits(book.positions.M, 150, cfg).map((e) => e.trigger), []);
+
+  // +100% fires TP1 only.
+  const at2x = evaluatePaperExits(book.positions.M, 200, cfg);
+  assert.deepEqual(at2x.map((e) => e.trigger), ['TP1']);
+  applyPaperExit(book, 'M', { priceUsd: 200, ...at2x[0], cfg, now: 1 });
+
+  // Half the stake sold at 2x returns 1.0 SOL on a 0.5 basis.
+  assert.ok(Math.abs(book.balanceSol - (9 + 1.0)) < 1e-9);
+  assert.ok(Math.abs(book.positions.M.stakeSol - 0.5) < 1e-9);
+  // The position is STILL OPEN — the rung removes capital, it does not close.
+  assert.ok(book.positions.M);
+  // And it does not re-fire at the same price.
+  assert.deepEqual(evaluatePaperExits(book.positions.M, 200, cfg).map((e) => e.trigger), []);
+
+  // +200% fires TP2.
+  const at3x = evaluatePaperExits(book.positions.M, 300, cfg);
+  assert.deepEqual(at3x.map((e) => e.trigger), ['TP2']);
+});
+
+test('trailing stop measures from peak and only arms in profit', async () => {
+  const { createBook, openPaperPosition, evaluatePaperExits, markPosition, paperConfig } = await PC();
+  const cfg = paperConfig({ perTradeSol: 1, slippagePct: 0, feeSol: 0, trailingStopPct: 30, hardStopPct: 40 });
+  const book = createBook({ budgetSol: 10 });
+  openPaperPosition(book, { mint: 'M', priceUsd: 100, cfg, now: 0 });
+  const p = book.positions.M;
+
+  // NEVER ARMED FROM ENTRY. A 25% dip straight after entry is not a 25% drop
+  // from a peak that never happened — armed from entry this would close every
+  // position that wobbled.
+  assert.equal(evaluatePaperExits(p, 75, cfg).some((e) => e.trigger === 'TRAILING_STOP'), false);
+
+  // Run to 300, then retrace 30% to 210 — that is the stop.
+  markPosition(p, 300, 1);
+  assert.equal(evaluatePaperExits(p, 250, cfg).some((e) => e.trigger === 'TRAILING_STOP'), false);
+  assert.equal(evaluatePaperExits(p, 210, cfg).some((e) => e.trigger === 'TRAILING_STOP'), true);
+
+  // The hard stop still catches a token that never rallied at all.
+  const book2 = createBook({ budgetSol: 10 });
+  openPaperPosition(book2, { mint: 'N', priceUsd: 100, cfg, now: 0 });
+  assert.equal(evaluatePaperExits(book2.positions.N, 55, cfg).some((e) => e.trigger === 'HARD_STOP'), true);
+});
+
+test('a full exit closes the position and books the PnL', async () => {
+  const { createBook, openPaperPosition, applyPaperExit, paperScorecard, paperConfig } = await PC();
+  const cfg = paperConfig({ perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const book = createBook({ budgetSol: 10 });
+
+  openPaperPosition(book, { mint: 'WIN', priceUsd: 100, cfg, now: 0 });
+  applyPaperExit(book, 'WIN', { priceUsd: 300, trigger: 'TRAILING_STOP', sellFraction: 1, cfg, now: 1 });
+  openPaperPosition(book, { mint: 'LOSS', priceUsd: 100, cfg, now: 2 });
+  applyPaperExit(book, 'LOSS', { priceUsd: 50, trigger: 'HARD_STOP', sellFraction: 1, cfg, now: 3 });
+
+  assert.equal(Object.keys(book.positions).length, 0);
+  const card = paperScorecard(book, cfg);
+  assert.equal(card.closedPositions, 2);
+  assert.equal(card.wins, 1);
+  assert.equal(card.losses, 1);
+  assert.equal(card.winRatePct, 50);
+  // +2.0 on the winner, -0.5 on the loser.
+  assert.ok(Math.abs(card.realisedPnlSol - 1.5) < 1e-9);
+  assert.ok(Math.abs(card.totalPnlSol - 1.5) < 1e-9);
+});
+
+test('win rate counts closed positions only, and is null before any close', async () => {
+  const { createBook, openPaperPosition, markPosition, paperScorecard, paperConfig } = await PC();
+  const cfg = paperConfig({ perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const book = createBook({ budgetSol: 10 });
+
+  // Nothing closed: null, NOT 0%. "No result yet" and "lost every trade" are
+  // different claims and only one is bad news.
+  assert.equal(paperScorecard(book, cfg).winRatePct, null);
+
+  openPaperPosition(book, { mint: 'M', priceUsd: 100, cfg, now: 0 });
+  markPosition(book.positions.M, 500, 1);
+  const card = paperScorecard(book, cfg);
+  // A 5x on paper must NOT count as a win while it is still open.
+  assert.equal(card.winRatePct, null);
+  assert.equal(card.activePositions, 1);
+  // But equity does reflect the mark, so the total is honest.
+  assert.ok(card.equitySol > 10);
+  assert.ok(card.totalPnlSol > 0);
+});
+
+test('paper target follows watchlist #1 but an approved pin wins', async () => {
+  const { resolveTarget, createBook } = await PC();
+  const watchlist = { wallets: [{ address: 'AAA', label: '#1' }, { address: 'BBB', label: '#2' }] };
+
+  assert.equal(resolveTarget(watchlist, null).target.address, 'AAA');
+
+  // AN OPERATOR-APPROVED TARGET SURVIVES A RE-RANK. Without this the watchlist
+  // is regenerated every two hours and would silently override the approval.
+  const pinned = createBook({ budgetSol: 10, target: { address: 'BBB' } });
+  const r = resolveTarget(watchlist, pinned);
+  assert.equal(r.target.address, 'BBB');
+  assert.equal(r.pinned, true);
+
+  // Unless the pinned wallet drops off the watchlist entirely.
+  const gone = createBook({ budgetSol: 10, target: { address: 'ZZZ' } });
+  const rp = resolveTarget(watchlist, gone);
+  assert.equal(rp.target.address, 'AAA');
+  assert.equal(rp.repointed, true);
+
+  assert.equal(resolveTarget({ wallets: [] }, null).target, null);
+});
+
+test('only recent, unseen buys by the target are mirrored', async () => {
+  const { pendingMirrorBuys, createBook, paperConfig } = await PC();
+  const cfg = paperConfig({ maxBuyAgeMinutes: 30 });
+  const now = 1_000_000_000;
+  const observations = {
+    wallets: {
+      TARGET: {
+        buys: [
+          { token: 'FRESH', symbol: 'F', ts: now - 60_000 },
+          { token: 'OLD', symbol: 'O', ts: now - 10 * 3_600_000 },
+          { token: 'HELD', symbol: 'H', ts: now - 60_000 },
+          { token: 'DONE', symbol: 'D', ts: now - 60_000 },
+        ],
+      },
+      OTHER: { buys: [{ token: 'NOPE', ts: now - 60_000 }] },
+    },
+  };
+  const book = createBook({ budgetSol: 10 });
+  book.positions.HELD = { mint: 'HELD' };
+  book.closed.push({ mint: 'DONE' });
+
+  const out = pendingMirrorBuys(observations, { target: { address: 'TARGET' }, book, cfg, now });
+  assert.deepEqual(out.map((b) => b.mint), ['FRESH']);
+
+  // A wallet with no observations mirrors nothing rather than throwing.
+  assert.deepEqual(pendingMirrorBuys(observations, { target: { address: 'MISSING' }, book, cfg, now }), []);
+  assert.deepEqual(pendingMirrorBuys(observations, { target: null, book, cfg, now }), []);
+});
+
+test('a paper tick marks, exits and enters against injected prices', async () => {
+  const { createBook, runPaperTick, paperConfig, openPaperPosition } = await PC();
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, trailingStopPct: 30 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'TARGET' } });
+  openPaperPosition(book, { mint: 'RUNNER', priceUsd: 100, cfg, now: now - 1000 });
+  book.positions.RUNNER.peakPriceUsd = 400;
+
+  const observations = { wallets: { TARGET: { buys: [{ token: 'NEW', symbol: 'N', ts: now - 60_000 }] } } };
+  const watchlist = { wallets: [{ address: 'TARGET', label: 'whale' }] };
+  const prices = new Map([['RUNNER', 250], ['NEW', 5]]);
+
+  const report = await runPaperTick({
+    book, observations, watchlist, cfg, now,
+    priceFetcher: async () => prices,
+  });
+
+  // RUNNER is 37.5% off its 400 peak -> trailing stop.
+  assert.ok(report.exits.some((e) => e.mint === 'RUNNER' && e.trigger === 'TRAILING_STOP'));
+  assert.equal(book.positions.RUNNER, undefined);
+  // NEW is mirrored in the same tick, using balance the exit just freed.
+  assert.ok(report.opened.some((o) => o.mint === 'NEW'));
+  assert.ok(book.positions.NEW);
+});
+
+/* ------------------------------------------------------------------ *
+ * Whale-switch approval
+ * ------------------------------------------------------------------ */
+
+test('a challenger must beat the incumbent on all three metrics', async () => {
+  const { beatsActiveWhale } = await import('../telegram.mjs');
+  const inc = { address: 'INC', monthlyPnlUsd: 1000, winRatePct: 50, trades: 100 };
+  const cfg = { minPnlLeadPct: 10, minTrades: 10 };
+
+  // Clears all three with the required 10% P&L lead.
+  assert.equal(beatsActiveWhale({ address: 'C', monthlyPnlUsd: 5000, winRatePct: 60, trades: 200 }, inc, cfg).beats, true);
+
+  // Each single failure blocks it — it is an AND.
+  assert.equal(beatsActiveWhale({ address: 'C', monthlyPnlUsd: 5000, winRatePct: 40, trades: 200 }, inc, cfg).beats, false);
+  assert.equal(beatsActiveWhale({ address: 'C', monthlyPnlUsd: 500, winRatePct: 60, trades: 200 }, inc, cfg).beats, false);
+  assert.equal(beatsActiveWhale({ address: 'C', monthlyPnlUsd: 5000, winRatePct: 60, trades: 50 }, inc, cfg).beats, false);
+
+  // A LEAD, not a tie-break: $1,050 is ahead of $1,000 but not by 10%, so noise
+  // reordering two similar wallets must not raise a prompt.
+  assert.equal(beatsActiveWhale({ address: 'C', monthlyPnlUsd: 1050, winRatePct: 60, trades: 200 }, inc, cfg).beats, false);
+
+  // Unmeasured is a failure, as everywhere else here.
+  assert.equal(beatsActiveWhale({ address: 'C', monthlyPnlUsd: null, winRatePct: 60, trades: 200 }, inc, cfg).beats, false);
+  // Thin samples cannot challenge however good they look.
+  assert.equal(beatsActiveWhale({ address: 'C', monthlyPnlUsd: 9e9, winRatePct: 100, trades: 3 }, inc, cfg).beats, false);
+  // No incumbent is a first target, not a victory.
+  assert.equal(beatsActiveWhale({ address: 'C', monthlyPnlUsd: 5000, winRatePct: 60, trades: 200 }, null, cfg).beats, false);
+});
+
+test('callback data is parsed strictly and round-trips the keyboard', async () => {
+  const { parseCallbackData, switchKeyboard, proposalId } = await import('../telegram.mjs');
+
+  const id = proposalId('SomeWalletAddress', 1234);
+  const kb = switchKeyboard(id);
+  const [approve, keep] = kb.inline_keyboard[0];
+  assert.match(approve.text, /APPROVE SWITCH/);
+  assert.match(keep.text, /KEEP CURRENT/);
+
+  // Telegram caps callback_data at 64 BYTES — an address would not leave room
+  // for anything else, which is why an id is used.
+  assert.ok(Buffer.byteLength(approve.callback_data) <= 64);
+  assert.deepEqual(parseCallbackData(approve.callback_data), { action: 'APPROVE', id });
+  assert.deepEqual(parseCallbackData(keep.callback_data), { action: 'KEEP', id });
+
+  // Anything unrecognised is refused rather than guessed at: this is the one
+  // place client-supplied bytes choose a code path.
+  for (const bad of ['', 'sw:x:abc', 'sw:a:', 'nope', 'sw:a:' + 'x'.repeat(40), null, undefined, 42, 'sw:a:ABC!']) {
+    assert.equal(parseCallbackData(bad), null, `must reject ${String(bad)}`);
+  }
+});
+
+test('APPROVE re-points the paper target, KEEP does not', async () => {
+  const { handleSwitchCallback, proposalId } = await import('../telegram.mjs');
+
+  const id = proposalId('CHAL', 1);
+  const makeDeps = () => {
+    const store = {
+      [id]: { challenger: { address: 'CHAL' }, incumbent: { address: 'INC' }, createdAt: 1 },
+    };
+    const calls = [];
+    return {
+      store,
+      calls,
+      deps: {
+        loadProposals: async () => store,
+        saveProposals: async () => {},
+        setPaperTarget: async (w) => { calls.push(w.address); return true; },
+      },
+    };
+  };
+
+  const approve = makeDeps();
+  const okRes = await handleSwitchCallback({ data: `sw:a:${id}`, deps: approve.deps });
+  assert.equal(okRes.action, 'APPROVE');
+  assert.deepEqual(approve.calls, ['CHAL']);
+  assert.match(okRes.text, /SWITCH APPROVED/);
+  assert.match(okRes.text, /CHAL/);
+
+  const keep = makeDeps();
+  const keepRes = await handleSwitchCallback({ data: `sw:k:${id}`, deps: keep.deps });
+  assert.equal(keepRes.action, 'KEEP');
+  // KEEP must not touch the book at all.
+  assert.deepEqual(keep.calls, []);
+  assert.match(keepRes.text, /KEEPING CURRENT/);
+  assert.match(keepRes.text, /INC/);
+
+  // A proposal answers once. A second press reports the prior answer rather
+  // than switching again.
+  const twice = makeDeps();
+  await handleSwitchCallback({ data: `sw:a:${id}`, deps: twice.deps });
+  const again = await handleSwitchCallback({ data: `sw:a:${id}`, deps: twice.deps });
+  assert.equal(again.ok, false);
+  assert.match(again.answer, /Already APPROVE/);
+  assert.deepEqual(twice.calls, ['CHAL'], 'the second press must not re-apply');
+
+  // An unknown id is reported, not silently ignored.
+  const missing = await handleSwitchCallback({ data: 'sw:a:zzzzzz', deps: makeDeps().deps });
+  assert.equal(missing.ok, false);
+  assert.match(missing.answer, /expired/);
+
+  // A failed write is reported as approved-but-not-applied rather than claiming
+  // a switch that did not happen.
+  const failing = makeDeps();
+  failing.deps.setPaperTarget = async () => false;
+  const unapplied = await handleSwitchCallback({ data: `sw:a:${id}`, deps: failing.deps });
+  assert.match(unapplied.text, /NOT APPLIED/);
+});
+
+test('the switch proposal message states what approval does and does not do', async () => {
+  const { buildWhaleSwitchMessage } = await import('../telegram.mjs');
+  const msg = buildWhaleSwitchMessage({
+    challenger: { address: 'CHAL', monthlyPnlUsd: 5000, winRatePct: 61, trades: 200 },
+    incumbent: { address: 'INC', monthlyPnlUsd: 1000, winRatePct: 50, trades: 100 },
+  });
+  assert.match(msg, /MASTER WHALE CHALLENGE/);
+  assert.match(msg, /CHAL/);
+  assert.match(msg, /INC/);
+  assert.match(msg, /\+\$5k/);
+  // The message must say it is paper and that nothing is signed — this button
+  // is the one place a user could reasonably think money moves.
+  assert.match(msg, /PAPER book only/);
+  assert.match(msg, /No funds move/);
+  // And that outperformance over one window is not a prediction.
+  assert.match(msg, /not a prediction/);
+});
+
+test('fetchPrices reads the batch Map and matches mints case-insensitively', async () => {
+  const { fetchPrices } = await import('../paper_copytrade.mjs');
+
+  // fetchPairsBatch returns a MAP keyed by LOWERCASED base-token address.
+  // Iterating it as an array, or looking up in original case, returns nothing
+  // and reads downstream as 'no usable price' — indistinguishable from a dead
+  // token. Both mistakes were live and declined 22 of 22 real buys.
+  const batch = new Map([
+    ['abc1defmixedcase', { baseToken: { address: 'ABC1defMixedCase' }, priceUsd: '0.00042', liquidity: { usd: 5000 } }],
+    ['zero', { baseToken: { address: 'ZERO' }, priceUsd: '0' }],
+  ]);
+
+  const prices = await fetchPrices(['ABC1defMixedCase', 'ZERO', 'MISSING'], { batchFetcher: async () => batch });
+  // Keyed by the ORIGINAL mint string the caller passed in.
+  assert.equal(prices.get('ABC1defMixedCase'), 0.00042);
+  // A zero or absent price is omitted, never recorded as a real price.
+  assert.equal(prices.has('ZERO'), false);
+  assert.equal(prices.has('MISSING'), false);
+
+  // A thrown fetch degrades to no prices rather than taking the tick down.
+  const failed = await fetchPrices(['X'], { batchFetcher: async () => { throw new Error('net'); } });
+  assert.equal(failed.size, 0);
+  // A helper that returns the wrong shape must not crash the tick either.
+  const wrongShape = await fetchPrices(['X'], { batchFetcher: async () => [] });
+  assert.equal(wrongShape.size, 0);
+  assert.equal((await fetchPrices([])).size, 0);
+});
+
+test('a fresh position is marked at mid, so slippage shows immediately', async () => {
+  const { createBook, openPaperPosition, paperScorecard, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 1.5, feeSol: 0 });
+  const book = createBook({ budgetSol: 10 });
+  openPaperPosition(book, { mint: 'M', priceUsd: 100, cfg, now: 0 });
+
+  const p = book.positions.M;
+  // Tolerance, not equality: 100 * 1.015 is 101.49999999999999 in binary float.
+  assert.ok(Math.abs(p.entryPriceUsd - 101.5) < 1e-9, 'fill crosses the spread');
+  assert.equal(p.markPriceUsd, 100, 'but it is worth mid, not what was paid for it');
+
+  // Equity must reflect the cost already incurred rather than booking it later
+  // as if the market had moved. Six 1-SOL entries at 1.5% overstated equity by
+  // 0.09 SOL before this.
+  const card = paperScorecard(book, cfg);
+  assert.ok(card.equitySol < 10, 'equity carries the spread immediately');
+  assert.ok(Math.abs(card.equitySol - (9 + 100 / (100 * 1.015))) < 1e-9);
+
+  // The trailing stop must not count the entry mark as a peak worth trailing.
+  const { evaluatePaperExits } = await import('../paper_copytrade.mjs');
+  assert.equal(evaluatePaperExits(p, 100, cfg).some((e) => e.trigger === 'TRAILING_STOP'), false);
+});
