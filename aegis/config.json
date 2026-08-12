@@ -1170,7 +1170,19 @@
     "minPnlLeadPct": 10,
     "minWinRateLeadPct": 0,
     "minTradeLead": 0,
-    "minTrades": 10
+    "minTrades": 10,
+    "_rejectCooldownNote": [
+      "How long a declined challenger stays declined. Without it, pressing KEEP",
+      "is undone by the next sync two hours later and the button means nothing.",
+      "",
+      "The sync also refuses to raise a second prompt for a challenger that is",
+      "already awaiting an answer, and refuses to compare a 30-day OBSERVED",
+      "figure against an imported LIFETIME one — a leaderboard row showing $1.5M",
+      "career profit would otherwise beat every observed wallet on every sync",
+      "forever, which is the same 'prompt until ignored' failure the leads exist",
+      "to prevent, arriving by a different route."
+    ],
+    "rejectCooldownHours": 24
   },
   "eliteWhales": {
     "_note": [

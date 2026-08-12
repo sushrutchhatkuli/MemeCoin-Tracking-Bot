@@ -1674,24 +1674,35 @@ export function buildWhaleSwitchMessage({ challenger, incumbent, comparison = nu
       : '?';
   const pct = (n) => (typeof n === 'number' && Number.isFinite(n) ? `${n.toFixed(0)}%` : '?');
 
+  // THE LABEL FOLLOWS THE BASIS. On the import path these figures are a
+  // provider's LIFETIME record, not a 30-day observed window, and calling them
+  // "30d P&L" would misdescribe them by orders of magnitude — the same
+  // observed-vs-lifetime confusion the watchlist header and the elite-rule
+  // notes already exist to prevent. The basis is carried on the metrics, so the
+  // message reads it rather than assuming.
+  const lifetime = challenger.basis === 'provider-lifetime';
+  const periodLabel = lifetime ? 'lifetime P&amp;L' : '30d P&amp;L';
+  const tradesLabel = lifetime ? 'trades (provider count)' : 'graded trades';
+
   const lines = [
     '<b>👑 MASTER WHALE CHALLENGE</b>',
     '',
     'A challenger out-performs the wallet the paper book is currently copying,',
-    'on all three of monthly P&amp;L, win rate and trade count.',
+    `on all three of ${lifetime ? 'lifetime' : 'monthly'} P&amp;L, win rate and trade count.`,
     '',
     `<b>CHALLENGER</b>  <code>${esc(challenger.address)}</code>`,
-    `   30d P&amp;L ${money(challenger.monthlyPnlUsd)} · WR ${pct(challenger.winRatePct)} · ${challenger.trades ?? '?'} trades`,
+    `   ${periodLabel} ${money(challenger.monthlyPnlUsd)} · WR ${pct(challenger.winRatePct)} · ${challenger.trades ?? '?'} ${tradesLabel}`,
     '',
     `<b>CURRENT #1</b>  <code>${esc(incumbent.address)}</code>`,
-    `   30d P&amp;L ${money(incumbent.monthlyPnlUsd)} · WR ${pct(incumbent.winRatePct)} · ${incumbent.trades ?? '?'} trades`,
+    `   ${periodLabel} ${money(incumbent.monthlyPnlUsd)} · WR ${pct(incumbent.winRatePct)} · ${incumbent.trades ?? '?'} ${tradesLabel}`,
     '',
     '<i>Approving re-points the PAPER book only. No funds move, nothing is',
     'signed, and the existing paper positions stay open and keep their own',
     'exit rules — only new mirrored entries follow the new target.</i>',
     '',
-    '<i>These are Aegis-observed figures over a 30-day window, not a lifetime',
-    'record, and outperformance over one window is not a prediction.</i>',
+    lifetime
+      ? '<i>These figures come from an IMPORTED file and were not verified on chain.\nOutperformance on a leaderboard is not a prediction.</i>'
+      : '<i>These are Aegis-observed figures over a 30-day window, not a lifetime\nrecord, and outperformance over one window is not a prediction.</i>',
   ];
   if (comparison?.reasons?.length) {
     lines.push('', `<i>${esc(comparison.reasons.join('; '))}</i>`);

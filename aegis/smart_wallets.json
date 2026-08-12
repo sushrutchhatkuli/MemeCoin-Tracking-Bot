@@ -4,7 +4,7 @@
     "the next sync. Add hand-picked wallets to a separate file instead.",
     "",
     "Source: import:leaderboard.csv",
-    "Generated: 2026-08-12T07:41:09.732Z",
+    "Generated: 2026-08-12T08:26:50.126Z",
     "Rules applied: win rate >= 40% over >= 3 graded buys,",
     "net profit >= $100,",
     "on-chain activity >= 100 signatures.",
@@ -41,7 +41,7 @@
     "figures describe the most recent swaps rather than the whole career."
   ],
   "generated": {
-    "at": "2026-08-12T07:41:09.733Z",
+    "at": "2026-08-12T08:26:50.127Z",
     "source": "import:leaderboard.csv",
     "profitRuleSkipped": false,
     "count": 4

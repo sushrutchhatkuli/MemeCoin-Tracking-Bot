@@ -42,9 +42,16 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join, extname } from 'node:path';
 
-import { loadObservations, walletStats } from './wallet_observations.mjs';
+import { loadObservations, walletStats, walletScorecard } from './wallet_observations.mjs';
 import { validateWatchlistEntry, SYSTEM_ACCOUNTS, screenSystemAccount } from './smart_money.mjs';
-import { loadEnv } from './telegram.mjs';
+import {
+  loadEnv,
+  beatsActiveWhale,
+  buildWhaleSwitchMessage,
+  switchKeyboard,
+  proposalId,
+  sendTelegram,
+} from './telegram.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -681,7 +688,12 @@ async function candidatesFromObservations(config) {
       basis: 'observed buys graded by post-mortem (not lifetime realized P&L)',
     });
   }
-  return { candidates, totalSeen: wallets.length, solUsd, maturity };
+  // `store` is returned so the switch proposal can score wallets from the SAME
+  // ledger this pass ranked on, without a second read. wallet_observations.json
+  // is ~16 MB; re-reading it to compare two wallets would cost more than the
+  // comparison is worth and could disagree with this pass if the scanner wrote
+  // between the two reads.
+  return { candidates, totalSeen: wallets.length, solUsd, maturity, store };
 }
 
 /**
@@ -1878,6 +1890,181 @@ async function candidatesFromImport(path) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Whale-switch proposal
+ * ------------------------------------------------------------------ *
+ *
+ * When this sync's #1 out-performs the wallet the paper book is currently
+ * copying, propose a switch in Telegram with APPROVE / KEEP buttons. It is a
+ * proposal and never an action: the book keeps following its target until a
+ * human presses a button.
+ *
+ * ── THE COMPARISON MUST BE LIKE FOR LIKE, AND THIS IS THE WHOLE TRAP ───────
+ * A challenger's 30-day OBSERVED P&L and an incumbent's imported LIFETIME P&L
+ * are different quantities in the same units. Compared directly, a leaderboard
+ * row showing $1.5M career profit beats any observed wallet on every sync
+ * forever, and the prompt fires until it is ignored — which is the failure mode
+ * the lead thresholds exist to prevent, arriving by a different route.
+ *
+ * So both sides are scored on ONE basis and a mixed pair is refused rather than
+ * compared. In practice: observed-vs-observed uses the 30-day scorecard;
+ * provider-vs-provider uses the file's own columns; one of each is skipped with
+ * a reason.
+ */
+
+/**
+ * Comparable metrics for one wallet. PURE.
+ *
+ * `basis` is returned so the caller can refuse a mixed comparison instead of
+ * silently producing a meaningless one.
+ */
+export function whaleSwitchMetrics(candidate, { observations = null, solUsd = 0, windowDays = 30, now = Date.now() } = {}) {
+  if (!candidate?.address) return null;
+
+  // An imported row carries the provider's own figures and has no observation
+  // history to score. Its numbers are lifetime, not 30-day, and the basis says
+  // so rather than letting them pass as a monthly figure.
+  if (candidate.providerMetrics === true) {
+    return {
+      address: candidate.address,
+      label: candidate.label ?? null,
+      monthlyPnlUsd: typeof candidate.netProfitUsd === 'number' ? candidate.netProfitUsd : null,
+      winRatePct: typeof candidate.winRatePct === 'number' ? candidate.winRatePct : null,
+      trades: typeof candidate.lifetimeTrades === 'number' ? candidate.lifetimeTrades : null,
+      basis: 'provider-lifetime',
+    };
+  }
+
+  const entry = observations?.wallets?.[candidate.address];
+  if (!entry) return { address: candidate.address, label: candidate.label ?? null, monthlyPnlUsd: null, winRatePct: null, trades: null, basis: 'observed-30d' };
+
+  const card = walletScorecard(entry, { solUsd, windowDays, now });
+  return {
+    address: candidate.address,
+    label: candidate.label ?? null,
+    monthlyPnlUsd: card.estimatedProfitUsd,
+    winRatePct: card.winRatePct,
+    trades: card.gradedBuys,
+    basis: 'observed-30d',
+  };
+}
+
+/**
+ * Decide whether to propose, and send it. Returns a report; NEVER throws.
+ *
+ * A sync must not fail because Telegram is unreachable or a state file is
+ * unwritable — the watchlist is the product of this pass and the proposal is a
+ * courtesy on top of it.
+ *
+ * Dependencies are injected so the whole decision can be tested without a
+ * network, a bot token or a paper book on disk.
+ */
+export async function checkAndProposeWhaleSwitch({
+  qualified = [],
+  observations = null,
+  solUsd = 0,
+  config = {},
+  credentials = {},
+  now = Date.now(),
+  deps = {},
+} = {}) {
+  const cfg = config.whaleSwitch ?? {};
+  if (cfg.enabled === false) return { proposed: false, reason: 'whaleSwitch disabled' };
+
+  const challengerRow = qualified[0];
+  if (!challengerRow?.address) return { proposed: false, reason: 'nothing qualified this sync' };
+
+  // The incumbent is whatever the PAPER BOOK is following, not whatever ranked
+  // first last time. Those differ the moment a switch is declined: the operator
+  // said keep, and re-proposing against the rejected wallet's replacement would
+  // ignore that decision.
+  const book = (await deps.loadBook?.()) ?? null;
+  const incumbentAddress = book?.target?.address ?? null;
+  if (!incumbentAddress) return { proposed: false, reason: 'paper book has no target yet — nothing to challenge' };
+  if (incumbentAddress === challengerRow.address) return { proposed: false, reason: 'the paper target is already #1' };
+
+  const challenger = whaleSwitchMetrics(challengerRow, { observations, solUsd, now });
+  // The incumbent may no longer be in `qualified` at all — that is precisely the
+  // interesting case — so it is looked up rather than assumed present.
+  //
+  // ITS BASIS IS NEVER FABRICATED TO MATCH THE CHALLENGER'S. An earlier version
+  // copied providerMetrics across when the incumbent was absent, so a provider
+  // challenger was compared against an incumbent that was same-basis by
+  // construction and all-null in value. beatsActiveWhale defaults an absent
+  // incumbent figure to 0, so that comparison passed unconditionally and the
+  // prompt would have fired on every sync forever — the exact failure the
+  // mixed-basis check exists to prevent, produced by the check's own fallback.
+  const incumbentRow = qualified.find((c) => c.address === incumbentAddress) ?? { address: incumbentAddress };
+  const incumbent = whaleSwitchMetrics(incumbentRow, { observations, solUsd, now });
+
+  if (challenger?.basis !== incumbent?.basis) {
+    return {
+      proposed: false,
+      reason: `refusing a mixed comparison: challenger is ${challenger?.basis}, incumbent is ${incumbent?.basis}`,
+    };
+  }
+
+  // An incumbent nobody can measure has not been shown to be beaten. Guarded
+  // here rather than relying on beatsActiveWhale, which treats a missing
+  // incumbent figure as 0 — a reasonable default for a comparison, and the
+  // wrong one for deciding whether a comparison is possible at all.
+  if (incumbent.monthlyPnlUsd === null || incumbent.winRatePct === null || incumbent.trades === null) {
+    return {
+      proposed: false,
+      reason: `incumbent ${incumbentAddress.slice(0, 8)}… is unmeasured on the ${incumbent.basis} basis — cannot show it was beaten`,
+      challenger,
+      incumbent,
+    };
+  }
+
+  const comparison = beatsActiveWhale(challenger, incumbent, cfg);
+  if (!comparison.beats) {
+    return { proposed: false, reason: comparison.reasons.join('; '), challenger, incumbent };
+  }
+
+  // ONE OPEN PROPOSAL PER CHALLENGER. The sync runs every two hours and the
+  // comparison is stable, so without this the same wallet raises a fresh prompt
+  // with fresh buttons every pass, and the earlier ones become stale buttons
+  // that answer "expired" when pressed.
+  const proposals = (await deps.loadProposals?.()) ?? {};
+  const openForSame = Object.values(proposals).find(
+    (p) => !p?.resolved && p?.challenger?.address === challengerRow.address
+  );
+  if (openForSame) return { proposed: false, reason: 'a proposal for this challenger is already awaiting an answer' };
+
+  // A DECLINE STICKS. Without a cooldown, pressing KEEP is undone by the next
+  // sync two hours later, which makes the button pointless.
+  const cooldownH = cfg.rejectCooldownHours ?? 24;
+  const recentlyKept = Object.values(proposals).find(
+    (p) =>
+      p?.resolved === 'KEEP' &&
+      p?.challenger?.address === challengerRow.address &&
+      now - (p.resolvedAt ?? 0) < cooldownH * 3_600_000
+  );
+  if (recentlyKept) return { proposed: false, reason: `challenger was declined within the last ${cooldownH}h` };
+
+  const id = proposalId(challengerRow.address, now);
+  proposals[id] = { id, challenger, incumbent, createdAt: now, comparison };
+
+  const text = buildWhaleSwitchMessage({ challenger, incumbent });
+  const sent = (await deps.sendTelegram?.({
+    ...credentials,
+    text,
+    replyMarkup: switchKeyboard(id),
+  })) ?? { ok: false, error: 'no sender' };
+
+  if (!sent.ok) {
+    // NOT persisted when the send failed. A stored proposal whose buttons never
+    // reached a phone is unanswerable, and it would block the retry next sync
+    // via the one-open-proposal rule above.
+    return { proposed: false, reason: `telegram send failed: ${sent.error ?? 'unknown'}`, challenger, incumbent };
+  }
+
+  proposals[id].messageId = sent.messageId ?? null;
+  await deps.saveProposals?.(proposals);
+  return { proposed: true, id, challenger, incumbent };
+}
+
+/* ------------------------------------------------------------------ *
  * Auto-import
  * ------------------------------------------------------------------ */
 
@@ -2010,6 +2197,10 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
   // scope because the import path never sets it and PnL derivation is skipped
   // there anyway (imported leaderboards carry real P&L).
   let solUsd = 0;
+  // Retained for the switch proposal, which scores wallets over a 30-day window
+  // from the same ledger this pass ranked on. Null on the import path, where
+  // there is no observation history and the proposal uses provider columns.
+  let observationStore = null;
 
   if (importPath) {
     candidates = await candidatesFromImport(resolve(importPath));
@@ -2022,6 +2213,7 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     totalSeen = obs.totalSeen;
     maturity = obs.maturity;
     solUsd = obs.solUsd ?? 0;
+    observationStore = obs.store ?? null;
     source = 'aegis-observed';
     console.log(
       `Observed ledger: ${totalSeen} wallet(s) seen buying scanned tokens` +
@@ -2562,7 +2754,65 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     console.log('\n[DRY RUN] nothing written');
   }
 
-  return { qualified, evaluated, written: !dryRun };
+  // ---- whale-switch proposal ---------------------------------------
+  //
+  // AFTER the write and never on a dry run. The proposal asks about the list
+  // that now exists; raising it against a ranking that was computed and
+  // discarded would ask the operator to approve something they cannot see.
+  //
+  // Wrapped, because a sync must not fail on a Telegram error. The watchlist is
+  // this pass's product; the prompt is a courtesy on top of it.
+  let switchReport = null;
+  if (!dryRun) {
+    try {
+      switchReport = await checkAndProposeWhaleSwitch({
+        qualified,
+        observations: observationStore,
+        solUsd,
+        config,
+        credentials: { botToken: env.botToken, chatId: env.chatId },
+        now: Date.now(),
+        deps: {
+          loadBook: async () => {
+            const { loadBook } = await import('./paper_copytrade.mjs');
+            return loadBook();
+          },
+          loadProposals: async () => {
+            try {
+              return JSON.parse(await readFile(join(HERE, '.state', 'whale_switch_pending.json'), 'utf8'));
+            } catch {
+              return {};
+            }
+          },
+          saveProposals: async (proposals) => {
+            await mkdir(join(HERE, '.state'), { recursive: true });
+            await writeFile(
+              join(HERE, '.state', 'whale_switch_pending.json'),
+              JSON.stringify(proposals, null, 2),
+              'utf8'
+            );
+          },
+          sendTelegram,
+        },
+      });
+
+      if (switchReport.proposed) {
+        console.log(
+          `   ↳ whale-switch proposed to Telegram — ${switchReport.challenger.address.slice(0, 12)}… ` +
+            `challenges ${switchReport.incumbent.address.slice(0, 12)}… (awaiting APPROVE / KEEP)`
+        );
+      } else if (switchReport.reason) {
+        // Reported, not swallowed. "No prompt appeared" is otherwise
+        // indistinguishable from a broken trigger, and the reason is usually
+        // the interesting part.
+        console.log(`   ↳ no whale-switch proposal — ${switchReport.reason}`);
+      }
+    } catch (err) {
+      console.log(`   ↳ whale-switch check failed (sync unaffected): ${err.message}`);
+    }
+  }
+
+  return { qualified, evaluated, written: !dryRun, switchReport };
 }
 
 // CLI

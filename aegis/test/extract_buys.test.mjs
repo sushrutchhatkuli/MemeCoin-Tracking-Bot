@@ -6415,3 +6415,283 @@ test('a fresh position is marked at mid, so slippage shows immediately', async (
   const { evaluatePaperExits } = await import('../paper_copytrade.mjs');
   assert.equal(evaluatePaperExits(p, 100, cfg).some((e) => e.trigger === 'TRAILING_STOP'), false);
 });
+
+/* ------------------------------------------------------------------ *
+ * Whale-switch proposal trigger
+ * ------------------------------------------------------------------ */
+
+const ATW = () => import('../auto_top_whales.mjs');
+
+test('switch metrics are scored on one basis and label which', async () => {
+  const { whaleSwitchMetrics } = await ATW();
+  const now = 1_000_000_000;
+
+  // An imported row reports the provider's LIFETIME columns and says so.
+  const provider = whaleSwitchMetrics(
+    { address: 'P', providerMetrics: true, netProfitUsd: 1_500_000, winRatePct: 61.84, lifetimeTrades: 12237 },
+    { now }
+  );
+  assert.equal(provider.basis, 'provider-lifetime');
+  assert.equal(provider.monthlyPnlUsd, 1_500_000);
+  assert.equal(provider.trades, 12237);
+
+  // An observed wallet is scored over a 30-day window from the ledger.
+  const observations = {
+    wallets: {
+      O: {
+        buys: [
+          { ts: now - 86_400_000, outcome: 'WIN', solSpent: 1, changePct: 100 },
+          { ts: now - 86_400_000, outcome: 'FAIL', solSpent: 1, changePct: -50 },
+          // Outside the window — must not be counted.
+          { ts: now - 60 * 86_400_000, outcome: 'WIN', solSpent: 100, changePct: 900 },
+        ],
+      },
+    },
+  };
+  const observed = whaleSwitchMetrics({ address: 'O' }, { observations, solUsd: 100, now });
+  assert.equal(observed.basis, 'observed-30d');
+  assert.equal(observed.trades, 2, 'only graded buys inside the window');
+  assert.equal(observed.winRatePct, 50);
+
+  // A wallet with no history is reported as unmeasured, not as zero.
+  const unknown = whaleSwitchMetrics({ address: 'NOPE' }, { observations, now });
+  assert.equal(unknown.monthlyPnlUsd, null);
+  assert.equal(unknown.trades, null);
+
+  assert.equal(whaleSwitchMetrics(null), null);
+});
+
+test('a mixed-basis comparison is refused, not fudged', async () => {
+  const { checkAndProposeWhaleSwitch } = await ATW();
+  const sent = [];
+  const deps = {
+    loadBook: async () => ({ target: { address: 'INC' } }),
+    loadProposals: async () => ({}),
+    saveProposals: async () => {},
+    sendTelegram: async (m) => { sent.push(m); return { ok: true, messageId: 1 }; },
+  };
+
+  // Challenger is an imported LIFETIME row; incumbent has only observed
+  // history. Compared directly a $1.5M career figure beats every observed
+  // wallet on every sync forever.
+  const res = await checkAndProposeWhaleSwitch({
+    qualified: [{ address: 'CHAL', providerMetrics: true, netProfitUsd: 1_500_000, winRatePct: 62, lifetimeTrades: 12237 }],
+    observations: { wallets: { INC: { buys: [] } } },
+    config: {},
+    deps,
+  });
+  assert.equal(res.proposed, false);
+  assert.match(res.reason, /mixed comparison/);
+  assert.equal(sent.length, 0, 'nothing may be sent on a refused comparison');
+});
+
+test('a genuine challenger produces one proposal with buttons', async () => {
+  const { checkAndProposeWhaleSwitch } = await ATW();
+  const { parseCallbackData } = await import('../telegram.mjs');
+  const now = 1_000_000_000;
+
+  const store = {};
+  const sent = [];
+  const deps = {
+    loadBook: async () => ({ target: { address: 'INC' } }),
+    loadProposals: async () => store,
+    saveProposals: async (p) => { Object.assign(store, p); },
+    sendTelegram: async (m) => { sent.push(m); return { ok: true, messageId: 77 }; },
+  };
+  const qualified = [
+    { address: 'CHAL', providerMetrics: true, netProfitUsd: 50_000, winRatePct: 70, lifetimeTrades: 900 },
+    { address: 'INC', providerMetrics: true, netProfitUsd: 1_000, winRatePct: 50, lifetimeTrades: 100 },
+  ];
+
+  const res = await checkAndProposeWhaleSwitch({ qualified, config: {}, now, deps });
+  assert.equal(res.proposed, true);
+  assert.equal(sent.length, 1);
+
+  // The message carries a working keyboard whose id resolves to the stored
+  // proposal — the two halves of the flow must agree.
+  const kb = sent[0].replyMarkup;
+  const parsed = parseCallbackData(kb.inline_keyboard[0][0].callback_data);
+  assert.equal(parsed.action, 'APPROVE');
+  assert.ok(store[parsed.id], 'the proposal the button names must exist');
+  assert.equal(store[parsed.id].challenger.address, 'CHAL');
+  assert.equal(store[parsed.id].incumbent.address, 'INC');
+});
+
+test('the trigger refuses to nag: no target, already #1, duplicate, declined', async () => {
+  const { checkAndProposeWhaleSwitch } = await ATW();
+  const now = 1_000_000_000;
+  const chal = { address: 'CHAL', providerMetrics: true, netProfitUsd: 50_000, winRatePct: 70, lifetimeTrades: 900 };
+  const inc = { address: 'INC', providerMetrics: true, netProfitUsd: 1_000, winRatePct: 50, lifetimeTrades: 100 };
+  const base = (over = {}) => ({
+    loadBook: async () => ({ target: { address: 'INC' } }),
+    loadProposals: async () => ({}),
+    saveProposals: async () => {},
+    sendTelegram: async () => ({ ok: true, messageId: 1 }),
+    ...over,
+  });
+
+  // Disabled in config.
+  assert.match(
+    (await checkAndProposeWhaleSwitch({ qualified: [chal], config: { whaleSwitch: { enabled: false } }, deps: base() })).reason,
+    /disabled/
+  );
+
+  // Nothing qualified at all.
+  assert.match((await checkAndProposeWhaleSwitch({ qualified: [], config: {}, deps: base() })).reason, /nothing qualified/);
+
+  // No paper target yet — there is nothing to challenge, and the book picks
+  // #1 on its own without asking.
+  assert.match(
+    (await checkAndProposeWhaleSwitch({ qualified: [chal], config: {}, deps: base({ loadBook: async () => null }) })).reason,
+    /no target yet/
+  );
+
+  // The paper book is already following #1.
+  assert.match(
+    (await checkAndProposeWhaleSwitch({
+      qualified: [inc, chal], config: {}, deps: base({ loadBook: async () => ({ target: { address: 'INC' } }) }),
+    })).reason,
+    /already #1/
+  );
+
+  // ONE OPEN PROPOSAL PER CHALLENGER. The sync runs every 2h and the comparison
+  // is stable, so without this the same wallet raises a fresh prompt every pass
+  // and the older buttons go stale.
+  assert.match(
+    (await checkAndProposeWhaleSwitch({
+      qualified: [chal, inc], config: {}, now,
+      deps: base({ loadProposals: async () => ({ x: { challenger: { address: 'CHAL' }, createdAt: now } }) }),
+    })).reason,
+    /already awaiting an answer/
+  );
+
+  // A DECLINE STICKS. Otherwise pressing KEEP is undone two hours later.
+  assert.match(
+    (await checkAndProposeWhaleSwitch({
+      qualified: [chal, inc], config: { whaleSwitch: { rejectCooldownHours: 24 } }, now,
+      deps: base({
+        loadProposals: async () => ({
+          x: { challenger: { address: 'CHAL' }, resolved: 'KEEP', resolvedAt: now - 3_600_000 },
+        }),
+      }),
+    })).reason,
+    /declined within the last 24h/
+  );
+
+  // ...but it expires.
+  const afterCooldown = await checkAndProposeWhaleSwitch({
+    qualified: [chal, inc], config: { whaleSwitch: { rejectCooldownHours: 24 } }, now,
+    deps: base({
+      loadProposals: async () => ({
+        x: { challenger: { address: 'CHAL' }, resolved: 'KEEP', resolvedAt: now - 48 * 3_600_000 },
+      }),
+    }),
+  });
+  assert.equal(afterCooldown.proposed, true);
+});
+
+test('a failed Telegram send is not persisted as a pending proposal', async () => {
+  const { checkAndProposeWhaleSwitch } = await ATW();
+  const saved = [];
+  const res = await checkAndProposeWhaleSwitch({
+    qualified: [
+      { address: 'CHAL', providerMetrics: true, netProfitUsd: 50_000, winRatePct: 70, lifetimeTrades: 900 },
+      { address: 'INC', providerMetrics: true, netProfitUsd: 1_000, winRatePct: 50, lifetimeTrades: 100 },
+    ],
+    config: {},
+    deps: {
+      loadBook: async () => ({ target: { address: 'INC' } }),
+      loadProposals: async () => ({}),
+      saveProposals: async (p) => saved.push(p),
+      sendTelegram: async () => ({ ok: false, error: 'chat not found' }),
+    },
+  });
+
+  assert.equal(res.proposed, false);
+  assert.match(res.reason, /telegram send failed/);
+  // A proposal whose buttons never reached a phone is unanswerable, and storing
+  // it would block the retry next sync via the one-open-proposal rule.
+  assert.deepEqual(saved, []);
+});
+
+test('a challenger that does not clear the bar raises nothing', async () => {
+  const { checkAndProposeWhaleSwitch } = await ATW();
+  const sent = [];
+  const res = await checkAndProposeWhaleSwitch({
+    qualified: [
+      // Higher P&L but a WORSE win rate — the rules are an AND.
+      { address: 'CHAL', providerMetrics: true, netProfitUsd: 90_000, winRatePct: 30, lifetimeTrades: 900 },
+      { address: 'INC', providerMetrics: true, netProfitUsd: 1_000, winRatePct: 50, lifetimeTrades: 100 },
+    ],
+    config: {},
+    deps: {
+      loadBook: async () => ({ target: { address: 'INC' } }),
+      loadProposals: async () => ({}),
+      saveProposals: async () => {},
+      sendTelegram: async (m) => { sent.push(m); return { ok: true }; },
+    },
+  });
+  assert.equal(res.proposed, false);
+  assert.match(res.reason, /win rate/);
+  assert.equal(sent.length, 0);
+});
+
+test('an unmeasured incumbent cannot be shown to be beaten', async () => {
+  const { checkAndProposeWhaleSwitch } = await import('../auto_top_whales.mjs');
+  const sent = [];
+  // Both sides are observed-basis, so the basis check passes — but the
+  // incumbent has no graded history at all. beatsActiveWhale would default its
+  // figures to 0 and pass unconditionally, which is a reasonable default for a
+  // comparison and the wrong one for deciding a comparison is possible.
+  const res = await checkAndProposeWhaleSwitch({
+    qualified: [{ address: 'CHAL' }, { address: 'INC' }],
+    observations: {
+      wallets: {
+        CHAL: { buys: [{ ts: Date.now(), outcome: 'WIN', solSpent: 1, changePct: 100 }] },
+        INC: { buys: [] },
+      },
+    },
+    solUsd: 100,
+    config: {},
+    deps: {
+      loadBook: async () => ({ target: { address: 'INC' } }),
+      loadProposals: async () => ({}),
+      saveProposals: async () => {},
+      sendTelegram: async (m) => { sent.push(m); return { ok: true }; },
+    },
+  });
+  assert.equal(res.proposed, false);
+  assert.match(res.reason, /unmeasured/);
+  assert.equal(sent.length, 0);
+});
+
+test('the proposal message labels lifetime figures as lifetime', async () => {
+  const { buildWhaleSwitchMessage } = await import('../telegram.mjs');
+
+  // Imported rows are a provider LIFETIME record. Labelling them '30d P&L'
+  // misdescribes them by orders of magnitude — a .5M career figure is not a
+  // monthly one, and this is the same observed-vs-lifetime confusion the
+  // watchlist header already warns about.
+  const lifetime = buildWhaleSwitchMessage({
+    challenger: { address: 'C', monthlyPnlUsd: 1500000, winRatePct: 62, trades: 12237, basis: 'provider-lifetime' },
+    incumbent: { address: 'I', monthlyPnlUsd: 25000, winRatePct: 46, trades: 179, basis: 'provider-lifetime' },
+  });
+  assert.match(lifetime, /lifetime P&amp;L/);
+  assert.ok(!/30d P&amp;L/.test(lifetime), 'must not claim a 30-day window');
+  assert.match(lifetime, /IMPORTED file and were not verified on chain/);
+
+  // Observed rows keep the 30-day labelling.
+  const observed = buildWhaleSwitchMessage({
+    challenger: { address: 'C', monthlyPnlUsd: 500, winRatePct: 62, trades: 20, basis: 'observed-30d' },
+    incumbent: { address: 'I', monthlyPnlUsd: 100, winRatePct: 46, trades: 12, basis: 'observed-30d' },
+  });
+  assert.match(observed, /30d P&amp;L/);
+  assert.match(observed, /30-day window/);
+
+  // Both must always say it is paper and that nothing is signed.
+  for (const m of [lifetime, observed]) {
+    assert.match(m, /PAPER book only/);
+    assert.match(m, /No funds move/);
+    assert.match(m, /not a prediction/);
+  }
+});
