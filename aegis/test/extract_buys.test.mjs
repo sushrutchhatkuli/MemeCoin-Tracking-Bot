@@ -7812,3 +7812,215 @@ test('the whale buying more of a held mint adds instead of being skipped', async
   // rows in `closed`.
   assert.equal(book.closed.length, 0);
 });
+
+/* ------------------------------------------------------------------ *
+ * WebSocket wallet listener
+ * ------------------------------------------------------------------ */
+
+// A WebSocket stand-in that lets a test drive open/message/close by hand.
+function fakeSocketClass() {
+  const made = [];
+  class FakeWS {
+    constructor(url) {
+      this.url = url;
+      this.sent = [];
+      made.push(this);
+    }
+    send(payload) { this.sent.push(JSON.parse(payload)); }
+    close() { this.onclose?.(); }
+    open() { this.onopen?.(); }
+    notify(value, slot = 1) {
+      return this.onmessage?.({
+        data: JSON.stringify({ method: 'logsNotification', params: { result: { value, context: { slot } } } }),
+      });
+    }
+  }
+  return { FakeWS, made };
+}
+
+const wsSwapTx = (sig, wallet, { mint = 'MINT', sol = -1e9 } = {}) => ({
+  blockTime: 1_700,
+  transaction: { signatures: [sig], message: { accountKeys: [{ pubkey: wallet }] } },
+  meta: {
+    err: null,
+    preBalances: [10e9],
+    postBalances: [10e9 + sol],
+    preTokenBalances: [],
+    postTokenBalances: [{ mint, owner: wallet, uiTokenAmount: { uiAmount: 1 } }],
+  },
+});
+
+test('the socket subscribes to the wallet at processed and reads at confirmed', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+  const lookups = [];
+
+  const s = createWhaleSocket({
+    wallet: 'W',
+    rpcUrl: 'https://node.example/rpc',
+    WebSocketImpl: FakeWS,
+    rpcImpl: async (_u, _m, params) => { lookups.push(params[1]); return { ok: true, result: wsSwapTx(params[0], 'W') }; },
+  });
+
+  // https -> wss, which is how both Helius and the stock node expose it.
+  assert.equal(made[0].url, 'wss://node.example/rpc');
+
+  made[0].open();
+  assert.equal(s.isConnected(), true);
+
+  const sub = made[0].sent[0];
+  assert.equal(sub.method, 'logsSubscribe');
+  // `mentions` on the ADDRESS: filtering by program would miss every router
+  // this wallet uses that we did not enumerate.
+  assert.deepEqual(sub.params[0], { mentions: ['W'] });
+  // SUBSCRIBE at processed — subscribing at confirmed gives away most of the
+  // latency the socket just bought.
+  assert.equal(sub.params[1].commitment, 'processed');
+
+  await made[0].notify({ signature: 'SIG1', err: null, logs: [] });
+  // ...but READ at confirmed: a processed notification refers to a transaction
+  // a default read cannot see yet.
+  assert.equal(lookups[0].commitment, 'confirmed');
+
+  const drained = await s.drain();
+  assert.equal(drained.trades.length, 1);
+  assert.equal(drained.trades[0].kind, 'BUY');
+  assert.equal(drained.source, 'socket');
+  // Drained once, gone.
+  assert.deepEqual((await s.drain()).trades, []);
+  s.close();
+});
+
+test('the socket resolves eagerly, so drain does no network', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+  let calls = 0;
+
+  const s = createWhaleSocket({
+    wallet: 'W', rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    rpcImpl: async (_u, _m, params) => { calls++; return { ok: true, result: wsSwapTx(params[0], 'W') }; },
+  });
+  made[0].open();
+
+  await made[0].notify({ signature: 'A', err: null });
+  await made[0].notify({ signature: 'B', err: null });
+  assert.equal(calls, 2, 'resolved on arrival, not on demand');
+
+  const before = calls;
+  const out = await s.drain();
+  assert.equal(calls, before, 'drain is a hand-off, not a fetch');
+  // Oldest first, so a buy and a later sell of one mint apply in order.
+  assert.deepEqual(out.trades.map((t) => t.signature), ['A', 'B']);
+  s.close();
+});
+
+test('the socket ignores failures, duplicates and unresolvable signatures', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+
+  const s = createWhaleSocket({
+    wallet: 'W', rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    cfg: { lookupRetries: 0, lookupRetryDelayMs: 0 },
+    rpcImpl: async (_u, _m, params) =>
+      params[0] === 'GHOST' ? { ok: false, error: 'not found' } : { ok: true, result: wsSwapTx(params[0], 'W') },
+  });
+  made[0].open();
+
+  // A failed transaction moved nothing — two of ten sampled signatures on the
+  // live target were failures.
+  await made[0].notify({ signature: 'FAILED', err: { InstructionError: [] } });
+  // The same signature twice must resolve once.
+  await made[0].notify({ signature: 'DUP', err: null });
+  await made[0].notify({ signature: 'DUP', err: null });
+  // A signature that never resolves is counted, not buffered.
+  await made[0].notify({ signature: 'GHOST', err: null });
+  // Malformed notifications must not throw into the socket.
+  await made[0].notify({ err: null });
+
+  const out = await s.drain();
+  assert.deepEqual(out.trades.map((t) => t.signature), ['DUP']);
+  const st = s.status();
+  assert.equal(st.stats.duplicates, 1);
+  assert.equal(st.stats.failed, 1);
+  s.close();
+});
+
+test('the socket reports itself down rather than looking like a quiet whale', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+
+  const s = createWhaleSocket({
+    wallet: 'W', rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    cfg: { reconnectBackoffMs: 50_000 },
+    rpcImpl: async () => ({ ok: true, result: null }),
+  });
+  made[0].open();
+  assert.equal(s.isConnected(), true);
+
+  made[0].close();
+  assert.equal(s.isConnected(), false);
+  const out = await s.drain();
+  // ok:false is what makes the caller fall back to polling instead of treating
+  // an outage as "no trades".
+  assert.equal(out.ok, false);
+  assert.match(out.error, /not connected/);
+  s.close();
+});
+
+test('a socket with nothing to connect to degrades instead of throwing', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+
+  for (const args of [
+    { wallet: null, rpcUrl: 'https://n/r' },
+    { wallet: 'W', rpcUrl: null },
+    { wallet: 'W', rpcUrl: 'https://n/r', WebSocketImpl: undefined },
+  ]) {
+    const s = createWhaleSocket({ ...args, WebSocketImpl: args.WebSocketImpl });
+    assert.equal(s.isConnected(), false);
+    const out = await s.drain();
+    assert.equal(out.ok, false);
+    assert.deepEqual(out.trades, []);
+    s.close();
+  }
+});
+
+test('a trade delivered twice is mirrored once', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, pctWhale: 10, slippagePct: 0, feeSol: 0, scaleIn: true });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  const trade = { kind: 'BUY', mint: 'M', solSpent: 2, blockTime: now, signature: 'SIG1' };
+  const args = {
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg,
+    priceFetcher: async () => new Map([['M', 1]]),
+  };
+
+  await runPaperTick({ ...args, now, tradeFetcher: async () => ({ ok: true, newestSignature: 'SIG1', trades: [trade] }) });
+  assert.ok(Math.abs(book.positions.M.stakeSol - 0.2) < 1e-9);
+
+  // The socket fires on `processed` while the poll walks back from a cursor
+  // that has not advanced. BEFORE scale-in a duplicate was harmless — it hit
+  // "already holding". It now ADDS, so the same trade would be mirrored twice
+  // and the blended entry would be wrong from then on.
+  const again = await runPaperTick({
+    ...args, now: now + 1,
+    tradeFetcher: async () => ({ ok: true, newestSignature: 'SIG1', trades: [trade] }),
+  });
+  assert.equal(again.opened.length, 0, 'the duplicate must not scale in');
+  assert.ok(Math.abs(book.positions.M.stakeSol - 0.2) < 1e-9, 'stake unchanged');
+
+  // A genuinely new signature still applies.
+  const fresh = await runPaperTick({
+    ...args, now: now + 2,
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'SIG2',
+      trades: [{ ...trade, signature: 'SIG2', solSpent: 3 }],
+    }),
+  });
+  assert.equal(fresh.opened.length, 1);
+  assert.ok(Math.abs(book.positions.M.stakeSol - 0.5) < 1e-9);
+
+  // The dedupe set is bounded so a busy wallet cannot grow the book forever.
+  assert.ok(book.seenSignatures.length <= 400);
+});

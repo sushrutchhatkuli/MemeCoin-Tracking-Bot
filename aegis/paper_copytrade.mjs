@@ -78,6 +78,7 @@ import { dirname, join, resolve } from 'node:path';
 
 import { fetchPairsBatch } from './sources.mjs';
 import { loadObservations } from './wallet_observations.mjs';
+import { websocketUrlFor } from './discovery_daemon.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const BOOK_PATH = join(HERE, '.state', 'paper_copytrade.json');
@@ -815,6 +816,13 @@ export function pendingMirrorBuys(observations, { target, book, cfg, now = Date.
 export const PUBLIC_SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
 
 /**
+ * How many recent signatures the book remembers for dedupe. Comfortably more
+ * than a burst plus a poll window, and small enough that the book stays a file
+ * you can read.
+ */
+export const SEEN_SIGNATURE_LIMIT = 400;
+
+/**
  * Which node the chain mirror polls. PURE.
  *
  * Order: an explicit --rpc, then SOLANA_RPC_URL, then a url set in config, then
@@ -1032,6 +1040,199 @@ export async function fetchWhaleTrades({
 }
 
 /* ------------------------------------------------------------------ *
+ * WebSocket wallet listener
+ * ------------------------------------------------------------------ *
+ *
+ * A persistent logsSubscribe on the TARGET'S ADDRESS, so a trade is known the
+ * moment it is processed rather than whenever the next poll happens to run.
+ *
+ * ── WHY THIS IS THE BIG WIN, IN THIS BOOK'S OWN NUMBERS ────────────────────
+ * The poll path's floor is the tick interval plus confirmation plus a
+ * getTransaction plus the per-lookup delay, and it degrades exactly when it
+ * matters: a burst hits maxTxLookupsPerTick and drains 12 per tick. Observed
+ * live on this target — the dashboard read `updated 20:11:40` with its newest
+ * activity at `20:10:50`, fifty seconds behind, while GMGN showed trades 3s
+ * old.
+ *
+ * The socket removes the interval entirely. discovery_daemon.mjs has run this
+ * same pattern against pump.fun since 2026-08-10 and its measured figure is
+ * 570ms from notification to a fetchable transaction. That is the realistic
+ * floor here too, and it is not zero: a Solana slot is ~400ms and a follower
+ * cannot see a transaction before it lands.
+ *
+ * ── SUBSCRIBE AT `processed`, READ AT `confirmed` ──────────────────────────
+ * The single most important detail, and discovery_daemon learned it the hard
+ * way: a notification at `processed` refers to a transaction that a default
+ * read CANNOT SEE YET. Subscribing at `confirmed` would give away most of the
+ * latency the socket just bought; fetching at `processed` returns null. So the
+ * subscription is `processed` and the lookup is `confirmed` with a short retry,
+ * which is why lookupRetries exists rather than being defensive padding.
+ *
+ * ── IT RESOLVES EAGERLY, NOT ON THE TICK ───────────────────────────────────
+ * Transactions are fetched and parsed the instant the notification arrives, and
+ * the finished trades sit in a buffer. drain() is therefore a synchronous
+ * hand-off with no network in it, so a --watch 1 tick spends no time waiting on
+ * RPC. This is what turns the interval into a rendering cadence rather than a
+ * detection one.
+ *
+ * drain() returns the same shape fetchWhaleTrades does, so it drops straight
+ * into runPaperTick's tradeFetcher and every existing test still applies.
+ */
+export function createWhaleSocket({
+  wallet,
+  rpcUrl,
+  cfg = {},
+  log = () => {},
+  WebSocketImpl = globalThis.WebSocket,
+  rpcImpl = solanaRpc,
+} = {}) {
+  const wsUrl = websocketUrlFor(rpcUrl);
+  const state = {
+    wallet,
+    connected: false,
+    buffer: [],
+    newestSignature: null,
+    stats: { notifications: 0, resolved: 0, failed: 0, reconnects: 0, duplicates: 0 },
+    lastError: null,
+    closed: false,
+  };
+  const seen = new Set();
+
+  if (!wallet || !wsUrl || typeof WebSocketImpl !== 'function') {
+    state.lastError = !wallet ? 'no target wallet' : !wsUrl ? 'no websocket url' : 'no WebSocket implementation';
+    return {
+      wallet,
+      isConnected: () => false,
+      status: () => ({ ...state }),
+      drain: async () => ({ ok: false, error: state.lastError, trades: [], newestSignature: null }),
+      close: () => {},
+    };
+  }
+
+  const resolve = async (signature) => {
+    for (let attempt = 0; attempt <= (cfg.lookupRetries ?? 4); attempt++) {
+      const tx = await rpcImpl(rpcUrl, 'getTransaction', [
+        signature,
+        { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' },
+      ]);
+      if (tx.ok && tx.result) return parseWalletSwap(tx.result, { wallet });
+      await new Promise((r) => setTimeout(r, cfg.lookupRetryDelayMs ?? 300));
+    }
+    return null;
+  };
+
+  let ws = null;
+  let backoff = cfg.reconnectBackoffMs ?? 1_000;
+
+  const connect = () => {
+    if (state.closed) return;
+    try {
+      ws = new WebSocketImpl(wsUrl);
+    } catch (err) {
+      state.lastError = err.message;
+      scheduleReconnect();
+      return;
+    }
+
+    ws.onopen = () => {
+      state.connected = true;
+      state.lastError = null;
+      backoff = cfg.reconnectBackoffMs ?? 1_000;
+      ws.send(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'logsSubscribe',
+          // `mentions` matches any transaction the address appears in, which is
+          // what a wallet's own trades are. Filtering by program instead would
+          // miss every router this wallet uses that we did not enumerate.
+          params: [{ mentions: [wallet] }, { commitment: cfg.socketCommitment ?? 'processed' }],
+        })
+      );
+      log(`   socket connected — logsSubscribe on ${wallet.slice(0, 8)}… (${cfg.socketCommitment ?? 'processed'})`);
+    };
+
+    ws.onmessage = async (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+      if (msg.method !== 'logsNotification') return;
+
+      const value = msg.params?.result?.value;
+      const signature = value?.signature;
+      if (!signature) return;
+      state.stats.notifications++;
+      // A failed transaction moved nothing, and two of ten sampled signatures
+      // on this wallet were failures.
+      if (value.err) return;
+      if (seen.has(signature)) { state.stats.duplicates++; return; }
+      seen.add(signature);
+      if (seen.size > SEEN_SIGNATURE_LIMIT * 2) {
+        for (const s of [...seen].slice(0, seen.size - SEEN_SIGNATURE_LIMIT)) seen.delete(s);
+      }
+
+      // Resolved HERE, not at drain time, so the tick never waits on RPC.
+      const trade = await resolve(signature);
+      if (trade) {
+        state.buffer.push(trade);
+        state.newestSignature = signature;
+        state.stats.resolved++;
+        log(`   socket ${trade.kind} ${trade.mint.slice(0, 8)}…`);
+      } else {
+        state.stats.failed++;
+      }
+    };
+
+    ws.onerror = (err) => {
+      state.lastError = err?.message ?? 'socket error';
+    };
+    ws.onclose = () => {
+      state.connected = false;
+      scheduleReconnect();
+    };
+  };
+
+  const scheduleReconnect = () => {
+    if (state.closed) return;
+    state.stats.reconnects++;
+    const wait = backoff;
+    backoff = Math.min(backoff * 2, cfg.maxReconnectBackoffMs ?? 30_000);
+    setTimeout(connect, wait).unref?.();
+  };
+
+  connect();
+
+  return {
+    wallet,
+    isConnected: () => state.connected,
+    status: () => ({ ...state, buffered: state.buffer.length }),
+    /**
+     * Hand over everything resolved since the last call. Oldest first, so a buy
+     * and a later sell of one mint apply in order — the same requirement the
+     * poll path has.
+     */
+    drain: async () => {
+      const trades = state.buffer.splice(0, state.buffer.length);
+      return {
+        ok: state.connected || trades.length > 0,
+        error: state.connected ? null : (state.lastError ?? 'socket not connected'),
+        trades,
+        // The poll cursor is deliberately NOT advanced from here. If the socket
+        // drops, the poll fallback must re-read the window the socket was
+        // covering rather than skipping it.
+        newestSignature: null,
+        scanned: trades.length,
+        pending: 0,
+        source: 'socket',
+      };
+    },
+    close: () => {
+      state.closed = true;
+      try { ws?.close(); } catch { /* already closing */ }
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * IO shell
  * ------------------------------------------------------------------ */
 
@@ -1186,10 +1387,32 @@ export async function runPaperTick({
       // failed to read, or a transient RPC error would silently drop every
       // trade the whale made during it.
       if (live.newestSignature) book.lastSignature = live.newestSignature;
+
+      // ── SIGNATURE DEDUPE, AND IT IS LOAD-BEARING NOW ────────────────────
+      // The socket and the poll fallback can both deliver the same trade: the
+      // socket fires on `processed` while the poll walks back from a cursor
+      // that has not advanced yet. Before scale-in a duplicate BUY was
+      // harmless — it hit "already holding" and was declined. It now ADDS to
+      // the position, so the same trade would be mirrored twice and the
+      // blended entry would be wrong from then on.
+      //
+      // Kept on the book so it survives a restart, and bounded because a busy
+      // wallet would otherwise grow it without limit.
+      const seen = new Set(book.seenSignatures ?? []);
+      const fresh = [];
       for (const t of live.trades) {
+        if (t.signature) {
+          if (seen.has(t.signature)) continue;
+          seen.add(t.signature);
+          fresh.push(t.signature);
+        }
         if (t.kind === 'BUY') liveBuys.push(t);
         else if (t.kind === 'SELL') liveSells.push(t);
       }
+      if (fresh.length) {
+        book.seenSignatures = [...(book.seenSignatures ?? []), ...fresh].slice(-SEEN_SIGNATURE_LIMIT);
+      }
+      report.chain.duplicates = (live.trades?.length ?? 0) - liveBuys.length - liveSells.length;
     }
   }
 
@@ -1736,6 +1959,40 @@ export async function main(argv = []) {
 
   const recent = [];
 
+  // ---- websocket wallet listener -----------------------------------
+  //
+  // Created lazily, from the target the book has actually resolved, and torn
+  // down and rebuilt if that target changes — another wallet's notifications
+  // are not this one's.
+  //
+  // The POLL REMAINS as the fallback path rather than being deleted. A socket
+  // that has dropped and is backing off produces no trades, which is
+  // indistinguishable from a quiet whale; falling back to fetchWhaleTrades
+  // means an outage costs latency instead of coverage. Both feed the same
+  // signature dedupe in runPaperTick, so an overlap cannot double-apply.
+  let socket = null;
+  const socketEnabled = cfg.rpcMirror?.enabled && cfg.rpcMirror?.socket !== false && Boolean(intervalSec);
+
+  const ensureSocket = () => {
+    if (!socketEnabled) return null;
+    const wallet = book.target?.address;
+    if (!wallet) return null;
+    if (socket && socket.wallet === wallet) return socket;
+    socket?.close();
+    socket = createWhaleSocket({ wallet, rpcUrl: cfg.rpcMirror.url, cfg: cfg.rpcMirror, log: console.log });
+    return socket;
+  };
+
+  const chainFetcher = async (args) => {
+    const s = ensureSocket();
+    // Only once the socket is actually live. Before that — the first second of
+    // a run, or mid-reconnect — the poll keeps the book current.
+    if (s?.isConnected()) return s.drain();
+    const polled = await fetchWhaleTrades(args);
+    if (polled.ok) polled.source = 'poll';
+    return polled;
+  };
+
   // ── WHAT A 5-SECOND CADENCE COSTS, AND WHAT IS DONE ABOUT IT ─────────────
   // A naive tick re-reads the observation ledger and re-fetches the SOL price
   // every pass. At 60s that is unremarkable; at 5s it is 12 reads a minute of a
@@ -1768,7 +2025,7 @@ export async function main(argv = []) {
 
   const tick = async () => {
     const observations = intervalSec ? await loadObservationsCached() : await loadObservations(obsPath);
-    const report = await runPaperTick({ book, observations, watchlist, cfg });
+    const report = await runPaperTick({ book, observations, watchlist, cfg, tradeFetcher: chainFetcher });
     await saveBook(book);
 
     let spot = spotCache.value;
@@ -1823,10 +2080,22 @@ export async function main(argv = []) {
       // public node and became a lie the moment it pointed at Helius — a
       // dashboard asserting a bill of zero while metering an account.
       const billed = /helius/i.test(host);
+      // The FEED matters more than the host now: a run silently falling back to
+      // polling looks identical to one on the socket except for tens of seconds
+      // of lag, which is the whole reason the socket exists.
+      const s = socket?.status();
+      const feed = socket?.isConnected() ? 'SOCKET (push)' : socketEnabled ? 'poll (socket down)' : 'poll';
       console.log(
         `\n  CHAIN  ${c?.ok ? 'live' : `UNREACHABLE — ${c?.error ?? 'unknown'}`}` +
           ` · ${host} · ${billed ? 'BILLED to Helius' : '0 Helius credits'}` +
-          (c?.ok ? ` · ${c.scanned} new tx scanned${c.pending ? `, ${c.pending} queued` : ''}` : '')
+          (c?.ok ? ` · ${c.scanned} new tx${c.pending ? `, ${c.pending} queued` : ''}` : '')
+      );
+      console.log(
+        `  FEED   ${feed}` +
+          (s ? ` · ${s.stats.notifications} notified, ${s.stats.resolved} resolved` : '') +
+          (s?.stats.failed ? `, ${s.stats.failed} unresolved` : '') +
+          (s?.stats.reconnects ? ` · ${s.stats.reconnects} reconnect(s)` : '') +
+          (!socket?.isConnected() && s?.lastError ? ` · ${s.lastError}` : '')
       );
     }
     if (cfg.pureMirror) {
