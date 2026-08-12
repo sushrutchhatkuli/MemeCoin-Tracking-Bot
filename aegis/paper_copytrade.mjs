@@ -124,6 +124,10 @@ export const PAPER_DEFAULTS = {
   // Floor for a proportional position. 0 means "no floor", which is faithful to
   // a bare --pct-whale and is why the CLI warns instead of silently clamping.
   minTradeSol: 0,
+  // SCALE IN. When the target buys MORE of something already held, add to the
+  // position instead of declining the trade. A copy that ignores the second buy
+  // mirrors a conviction the target expressed only once.
+  scaleIn: true,
   // PURE MIRROR. The book takes no exit decision of its own — no take-profit
   // ladder, no trailing stop, no hard stop. It buys when the target buys and
   // sells when the target sells, and that is all. See evaluatePaperExits.
@@ -213,6 +217,7 @@ export function paperConfig(overrides = {}) {
   cfg.pctWhale =
     Number.isFinite(Number(cfg.pctWhale)) && Number(cfg.pctWhale) > 0 ? Number(cfg.pctWhale) : null;
   cfg.pureMirror = cfg.pureMirror === true;
+  cfg.scaleIn = cfg.scaleIn !== false;
   cfg.rpcMirror = { ...PAPER_DEFAULTS.rpcMirror, ...(cfg.rpcMirror ?? {}) };
   // Pure mirror without the chain feed would be a book that can never sell:
   // the ledger records buys only, so the sole exit path would be gone. Forced
@@ -295,6 +300,69 @@ export function mirrorPositionSize(cfg, { whaleSpendSol = null, balanceSol = 0 }
 }
 
 /**
+ * Add to a position the target bought more of. PURE.
+ *
+ * ── THE BLENDED ENTRY IS A HARMONIC MEAN, NOT AN AVERAGE OF PRICES ─────────
+ * Every valuation in this book is `stakeSol x (mark / entry)`, so after a
+ * scale-in the single (stake, entry) pair has to reproduce what two separate
+ * lots would be worth:
+ *
+ *   (s1 + s2) x m/E  ==  s1 x m/e1 + s2 x m/e2
+ *   =>  E = (s1 + s2) / (s1/e1 + s2/e2)
+ *
+ * A plain mean of e1 and e2 — or a stake-weighted mean of them — does NOT
+ * satisfy that, and the error compounds into every mark, every rung and the
+ * closed-trade P&L afterwards. Worked example: 1 SOL at $100 plus 1 SOL at
+ * $200 blends to $133.33, not $150; at a $200 mark the position is worth
+ * exactly 3.0 SOL, which is 2.0 from the first lot plus 1.0 from the second.
+ *
+ * FIRED TAKE-PROFIT RUNGS ARE NOT RE-ARMED. Adding to a position lowers the
+ * blended entry and so raises the apparent gain, which would re-trigger a rung
+ * that already sold — the position would be sold down repeatedly on a single
+ * run-up. A rung fires once per position, and a scale-in is the same position.
+ *
+ * The peak is kept for the same reason it exists: it is the highest price seen
+ * while the position was open, and buying more does not unsee it.
+ */
+export function scaleInPaperPosition(book, { mint, priceUsd, cfg, now = Date.now(), whaleSpendSol = null }) {
+  const p = book.positions[mint];
+  if (!p) return { ok: false, reason: 'no such position' };
+  if (!Number.isFinite(priceUsd) || priceUsd <= 0) return { ok: false, reason: 'no usable price' };
+
+  const sized = mirrorPositionSize(cfg, { whaleSpendSol, balanceSol: book.balanceSol });
+  if (!sized.ok) return { ok: false, reason: sized.reason };
+  const addSol = sized.sizeSol;
+
+  const fillPriceUsd = priceUsd * (1 + cfg.slippagePct / 100);
+  const s1 = p.stakeSol;
+  const e1 = p.entryPriceUsd;
+
+  // A position already sold down to nothing has no basis to blend against;
+  // treat the add as the whole position rather than dividing by zero.
+  const blended =
+    s1 > 0 && e1 > 0 ? (s1 + addSol) / (s1 / e1 + addSol / fillPriceUsd) : fillPriceUsd;
+
+  book.balanceSol -= addSol + cfg.feeSol;
+  p.stakeSol = s1 + addSol;
+  p.initialStakeSol = (p.initialStakeSol ?? s1) + addSol;
+  p.entryPriceUsd = blended;
+  p.markPriceUsd = priceUsd;
+  p.peakPriceUsd = Math.max(p.peakPriceUsd ?? priceUsd, priceUsd);
+  p.lastPricedAt = now;
+  p.scaleIns = (p.scaleIns ?? 0) + 1;
+
+  return {
+    ok: true,
+    position: p,
+    sizeSol: addSol,
+    scaledIn: true,
+    basis: sized.basis,
+    capped: sized.capped,
+    blendedEntryUsd: blended,
+  };
+}
+
+/**
  * Record a paper entry. PURE — mutates and returns the book, no clock, no IO.
  *
  * Returns a reason instead of throwing when the trade is declined, because
@@ -304,7 +372,10 @@ export function mirrorPositionSize(cfg, { whaleSpendSol = null, balanceSol = 0 }
 export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, now = Date.now(), source = null, demo = false, whaleSpendSol = null }) {
   if (!mint) return { ok: false, reason: 'no mint' };
   if (!Number.isFinite(priceUsd) || priceUsd <= 0) return { ok: false, reason: 'no usable price' };
-  if (book.positions[mint]) return { ok: false, reason: 'already holding' };
+  if (book.positions[mint]) {
+    if (!cfg.scaleIn) return { ok: false, reason: 'already holding' };
+    return scaleInPaperPosition(book, { mint, priceUsd, cfg, now, whaleSpendSol });
+  }
 
   const open = Object.keys(book.positions).length;
   if (open >= cfg.maxOpenPositions) return { ok: false, reason: `at max open positions (${cfg.maxOpenPositions})` };
@@ -742,6 +813,42 @@ export function pendingMirrorBuys(observations, { target, book, cfg, now = Date.
  */
 
 export const PUBLIC_SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
+
+/**
+ * Which node the chain mirror polls. PURE.
+ *
+ * Order: an explicit --rpc, then SOLANA_RPC_URL, then a url set in config, then
+ * the keyless public endpoint.
+ *
+ * ── SOLANA_RPC_URL IS READ FROM .env, NOT ONLY FROM process.env ────────────
+ * MEASURED on this machine: process.env.SOLANA_RPC_URL is UNSET while .env
+ * carries a 76-character Helius URL. A bare process.env read finds nothing,
+ * falls through to the public endpoint, and reports itself as working — the
+ * same trap GMGN_API_KEY had. loadEnv's pick() is already "process.env first,
+ * .env second", so the caller passes what it resolved.
+ *
+ * ── THIS SPENDS HELIUS CREDITS, WHICH THE PREVIOUS DEFAULT DID NOT ─────────
+ * The chain mirror shipped against the public endpoint precisely so it cost
+ * nothing. Pointing it at Helius reverses that, and the polling is continuous:
+ * one getSignaturesForAddress per tick plus one getTransaction per new
+ * signature. At --watch 5 that is ~720 signature calls an hour before any
+ * transaction lookups, against an account this repo has already recorded
+ * hitting "max usage reached".
+ *
+ * WHAT IT BUYS, measured rather than assumed — three calls each, median of:
+ *   Helius   getSignaturesForAddress   41ms
+ *   public                             59ms
+ * So ~18ms per call. Real, but the mirror's latency is dominated by the poll
+ * interval, not the node: at --watch 5 the wait for the next tick is roughly a
+ * hundred times larger than the difference between these two. Use --rpc or
+ * rpcMirror.url to go back to the public node.
+ */
+export function resolveChainRpc({ explicitUrl = null, envUrl = null, configUrl = null } = {}) {
+  for (const candidate of [explicitUrl, envUrl, configUrl]) {
+    if (typeof candidate === 'string' && /^https?:\/\//.test(candidate)) return candidate;
+  }
+  return PUBLIC_SOLANA_RPC;
+}
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 
 /** Minimal JSON-RPC. No key, no provider-specific extensions. */
@@ -1093,7 +1200,15 @@ export async function runPaperTick({
     ? []
     : pendingMirrorBuys(observations, { target: book.target, book, cfg, now });
   const held = new Set(Object.keys(book.positions));
-  const everSeen = new Set([...held, ...(book.closed ?? []).map((c) => c.mint)]);
+  // With scaleIn on, a mint already HELD is no longer a reason to skip the buy
+  // — openPaperPosition routes it to scaleInPaperPosition. Closed mints stay
+  // excluded either way: re-entering something already round-tripped is a
+  // different feature (re-entry) and would need its own accounting, since one
+  // mint would then own several rows in `closed`.
+  const everSeen = new Set([
+    ...(cfg.scaleIn ? [] : held),
+    ...(book.closed ?? []).map((c) => c.mint),
+  ]);
   // maxBuyAgeMinutes applies to chain buys exactly as it does to ledger ones,
   // and it is load-bearing on the first tick: a cold start reads a whole page
   // of history, and without this the book would enter tokens the whale bought
@@ -1242,6 +1357,11 @@ export async function runPaperTick({
         sizeSol: res.sizeSol,
         basis: res.basis ?? null,
         whaleSpendSol: c.whaleSpendSol ?? null,
+        // So the activity log can say ADD rather than BUY. A scale-in and a new
+        // entry look identical in a list of sizes, and they are not the same
+        // event.
+        scaledIn: res.scaledIn === true,
+        blendedEntryUsd: res.blendedEntryUsd ?? null,
       });
     } else report.declined.push({ mint: c.mint, reason: res.reason });
   }
@@ -1471,9 +1591,18 @@ export async function main(argv = []) {
   // keyless node without editing config.
   if (argv.includes('--no-chain')) cfg.rpcMirror.enabled = false;
   const rpcIdx = argv.indexOf('--rpc');
-  if (rpcIdx !== -1 && /^https?:\/\//.test(String(argv[rpcIdx + 1] ?? ''))) {
-    cfg.rpcMirror.url = argv[rpcIdx + 1];
-  }
+  const explicitRpc = rpcIdx !== -1 ? argv[rpcIdx + 1] : null;
+
+  // SOLANA_RPC_URL lives in .env on this machine, not in process.env, so it is
+  // resolved through loadEnv's pick() rather than read directly — see
+  // resolveChainRpc.
+  const { loadEnv } = await import('./telegram.mjs');
+  const dotenv = await loadEnv(join(HERE, '.env')).catch(() => ({}));
+  cfg.rpcMirror.url = resolveChainRpc({
+    explicitUrl: explicitRpc,
+    envUrl: process.env.SOLANA_RPC_URL || dotenv.rpcOverride || null,
+    configUrl: config.paperCopytrade?.rpcMirror?.url ?? null,
+  });
 
   if (pctFlag.value !== null) {
     cfg.pctWhale = pctFlag.value;
@@ -1654,8 +1783,11 @@ export async function main(argv = []) {
       // half: "0.012 SOL" alone does not say whether that was 10% of a nibble
       // or a cap biting on a conviction buy.
       recent.push(
-        `[${stamp}] BUY  ${formatTicker(o.symbol, o.mint)} — ${o.sizeSol.toFixed(4)} SOL` +
-          (o.basis && cfg.pctWhale ? `  (${o.basis})` : '')
+        `[${stamp}] ${o.scaledIn ? 'ADD ' : 'BUY '} ${formatTicker(o.symbol, o.mint)} — ${o.sizeSol.toFixed(4)} SOL` +
+          (o.basis && cfg.pctWhale ? `  (${o.basis})` : '') +
+          (o.scaledIn && Number.isFinite(o.blendedEntryUsd)
+            ? `  entry now $${o.blendedEntryUsd.toPrecision(4)}`
+            : '')
       );
     }
     for (const e of report.exits) {
@@ -1685,9 +1817,15 @@ export async function main(argv = []) {
     // like too.
     if (cfg.rpcMirror?.enabled) {
       const c = report.chain;
+      const host = new URL(cfg.rpcMirror.url).host;
+      // The cost label follows the HOST. It read "0 Helius credits"
+      // unconditionally, which was true while the mirror defaulted to the
+      // public node and became a lie the moment it pointed at Helius — a
+      // dashboard asserting a bill of zero while metering an account.
+      const billed = /helius/i.test(host);
       console.log(
         `\n  CHAIN  ${c?.ok ? 'live' : `UNREACHABLE — ${c?.error ?? 'unknown'}`}` +
-          ` · ${new URL(cfg.rpcMirror.url).host} · 0 Helius credits` +
+          ` · ${host} · ${billed ? 'BILLED to Helius' : '0 Helius credits'}` +
           (c?.ok ? ` · ${c.scanned} new tx scanned${c.pending ? `, ${c.pending} queued` : ''}` : '')
       );
     }

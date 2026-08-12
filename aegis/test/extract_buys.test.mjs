@@ -6058,8 +6058,10 @@ test('a paper entry debits virtual balance and prices in slippage', async () => 
   assert.equal(book.positions.M1.entryPriceUsd, 102);
   assert.ok(Math.abs(book.balanceSol - (10 - 1 - 0.001)) < 1e-9);
 
-  // Never twice into the same mint, and never past the position cap.
-  assert.equal(openPaperPosition(book, { mint: 'M1', priceUsd: 100, cfg }).reason, 'already holding');
+  // A second buy of a held mint is DECLINED only with scaling off; with
+  // scaleIn (the default) it adds to the position instead — covered separately.
+  const noScale = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 2, feeSol: 0.001, scaleIn: false });
+  assert.equal(openPaperPosition(book, { mint: 'M1', priceUsd: 100, cfg: noScale }).reason, 'already holding');
   const capped = paperConfig({ maxOpenPositions: 1 });
   assert.match(openPaperPosition(book, { mint: 'M2', priceUsd: 1, cfg: capped }).reason, /max open positions/);
 
@@ -7661,4 +7663,152 @@ test('a chain-mirrored position learns its ticker from the mark', async () => {
     tradeFetcher: async () => ({ ok: true, newestSignature: 'S1', trades: [] }),
   });
   assert.equal(book.positions.MINT.symbol, 'Call');
+});
+
+/* ------------------------------------------------------------------ *
+ * Chain RPC selection
+ * ------------------------------------------------------------------ */
+
+test('the chain RPC prefers an explicit flag, then env, then config', async () => {
+  const { resolveChainRpc, PUBLIC_SOLANA_RPC } = await import('../paper_copytrade.mjs');
+
+  assert.equal(
+    resolveChainRpc({ explicitUrl: 'https://flag.node', envUrl: 'https://env.node', configUrl: 'https://cfg.node' }),
+    'https://flag.node'
+  );
+  assert.equal(resolveChainRpc({ envUrl: 'https://env.node', configUrl: 'https://cfg.node' }), 'https://env.node');
+  assert.equal(resolveChainRpc({ configUrl: 'https://cfg.node' }), 'https://cfg.node');
+
+  // Nothing configured falls back to the keyless public endpoint, so the
+  // mirror still runs on a machine with no SOLANA_RPC_URL at all.
+  assert.equal(resolveChainRpc({}), PUBLIC_SOLANA_RPC);
+  assert.equal(resolveChainRpc(), PUBLIC_SOLANA_RPC);
+
+  // A malformed value is skipped rather than used — a url that is not a url
+  // would make every poll fail while the config claimed a node was set.
+  assert.equal(resolveChainRpc({ explicitUrl: 'not-a-url', envUrl: 'https://env.node' }), 'https://env.node');
+  assert.equal(resolveChainRpc({ explicitUrl: '', envUrl: null, configUrl: undefined }), PUBLIC_SOLANA_RPC);
+  assert.equal(resolveChainRpc({ envUrl: 'ftp://nope' }), PUBLIC_SOLANA_RPC);
+});
+
+/* ------------------------------------------------------------------ *
+ * Position scaling on re-buys
+ * ------------------------------------------------------------------ */
+
+test('scaling in blends the entry so the position values correctly', async () => {
+  const { createBook, openPaperPosition, paperScorecard, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, scaleIn: true });
+  const book = createBook({ budgetSol: 10 });
+
+  openPaperPosition(book, { mint: 'M', priceUsd: 100, cfg, now: 0 });
+  const res = openPaperPosition(book, { mint: 'M', priceUsd: 200, cfg, now: 1 });
+  assert.equal(res.ok, true);
+  assert.equal(res.scaledIn, true);
+
+  const p = book.positions.M;
+  assert.equal(p.stakeSol, 2);
+  assert.equal(p.initialStakeSol, 2);
+  assert.equal(p.scaleIns, 1);
+
+  // HARMONIC, not arithmetic: 2 / (1/100 + 1/200) = 133.33, NOT 150. A plain
+  // average would misvalue the position on every mark from here on.
+  assert.ok(Math.abs(p.entryPriceUsd - 400 / 3) < 1e-9, 'blended entry is 133.33');
+  assert.notEqual(Math.round(p.entryPriceUsd), 150);
+
+  // The blend is correct exactly when the merged position is worth what two
+  // separate lots would be: 1 SOL bought at 100 plus 1 SOL bought at 200, both
+  // marked at 200, is 2.0 + 1.0 = 3.0 SOL.
+  p.markPriceUsd = 200;
+  const card = paperScorecard(book, cfg);
+  assert.ok(Math.abs(card.openValueSol - 3) < 1e-9);
+  assert.ok(Math.abs(card.equitySol - (8 + 3)) < 1e-9);
+});
+
+test('scaling in debits balance, respects the cap, and can be turned off', async () => {
+  const { createBook, openPaperPosition, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0.001, scaleIn: true });
+  const book = createBook({ budgetSol: 10 });
+
+  openPaperPosition(book, { mint: 'M', priceUsd: 100, cfg, now: 0 });
+  openPaperPosition(book, { mint: 'M', priceUsd: 100, cfg, now: 1 });
+  assert.ok(Math.abs(book.balanceSol - (10 - 2 - 0.002)) < 1e-9, 'both legs debited');
+
+  // A book with nothing left cannot add, and says so rather than adding zero.
+  const broke = createBook({ budgetSol: 1.0005 });
+  openPaperPosition(broke, { mint: 'M', priceUsd: 100, cfg, now: 0 });
+  const denied = openPaperPosition(broke, { mint: 'M', priceUsd: 100, cfg, now: 1 });
+  assert.equal(denied.ok, false);
+  assert.match(denied.reason, /insufficient virtual balance/);
+
+  // An unpriceable add is refused rather than blending against a bad number.
+  assert.equal(openPaperPosition(book, { mint: 'M', priceUsd: 0, cfg, now: 2 }).ok, false);
+
+  // Off: the old decline is preserved for anyone who wants one entry per mint.
+  const off = paperConfig({ budgetSol: 10, perTradeSol: 1, scaleIn: false });
+  const b2 = createBook({ budgetSol: 10 });
+  openPaperPosition(b2, { mint: 'M', priceUsd: 100, cfg: off, now: 0 });
+  assert.equal(openPaperPosition(b2, { mint: 'M', priceUsd: 100, cfg: off, now: 1 }).reason, 'already holding');
+});
+
+test('a scale-in does not re-arm a take-profit rung that already fired', async () => {
+  const { createBook, openPaperPosition, evaluatePaperExits, applyPaperExit, paperConfig } =
+    await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, scaleIn: true });
+  const book = createBook({ budgetSol: 10 });
+
+  openPaperPosition(book, { mint: 'M', priceUsd: 100, cfg, now: 0 });
+  const tp = evaluatePaperExits(book.positions.M, 200, cfg)[0];
+  applyPaperExit(book, 'M', { priceUsd: 200, ...tp, cfg, now: 1 });
+  assert.deepEqual(book.positions.M.firedRungs, ['TP1']);
+
+  // Adding lowers the blended entry and so RAISES the apparent gain. If the
+  // rung re-armed, the position would be sold down again and again on one
+  // run-up — a rung fires once per position, and a scale-in is the same
+  // position.
+  openPaperPosition(book, { mint: 'M', priceUsd: 120, cfg, now: 2 });
+  assert.deepEqual(book.positions.M.firedRungs, ['TP1'], 'rung stays fired');
+
+  // Blend after the add: 1.5 / (0.5/100 + 1/120) = 112.5. So +200% is $337.50,
+  // and $300 — which WOULD be +200% against the original $100 entry — is only
+  // +166%. The rung correctly does not fire, and TP1 never fires twice.
+  assert.ok(Math.abs(book.positions.M.entryPriceUsd - 112.5) < 1e-9);
+  assert.deepEqual(evaluatePaperExits(book.positions.M, 300, cfg).map((e) => e.trigger), []);
+  assert.deepEqual(evaluatePaperExits(book.positions.M, 400, cfg).map((e) => e.trigger), ['TP2']);
+});
+
+test('the whale buying more of a held mint adds instead of being skipped', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, pctWhale: 10, slippagePct: 0, feeSol: 0, scaleIn: true });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now,
+    priceFetcher: async () => new Map([['PUMPIT', { priceUsd: 1, symbol: 'PUMPIT' }]]),
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S1', trades: [{ kind: 'BUY', mint: 'PUMPIT', solSpent: 2, blockTime: now }],
+    }),
+  });
+  assert.ok(Math.abs(book.positions.PUMPIT.stakeSol - 0.2) < 1e-9);
+
+  // The target doubles down. Previously this was declined as "already holding",
+  // mirroring a conviction the target expressed twice as though it were once.
+  const again = await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now: now + 1,
+    priceFetcher: async () => new Map([['PUMPIT', { priceUsd: 1, symbol: 'PUMPIT' }]]),
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S2', trades: [{ kind: 'BUY', mint: 'PUMPIT', solSpent: 3, blockTime: now + 1 }],
+    }),
+  });
+
+  assert.equal(again.opened.length, 1);
+  assert.equal(again.opened[0].scaledIn, true, 'reported as an ADD, not a new BUY');
+  assert.ok(Math.abs(again.opened[0].sizeSol - 0.3) < 1e-9, '10% of the 3 SOL follow-up');
+  assert.ok(Math.abs(book.positions.PUMPIT.stakeSol - 0.5) < 1e-9);
+  assert.equal(book.positions.PUMPIT.scaleIns, 1);
+
+  // A mint already round-tripped is still not re-entered — that is re-entry,
+  // which would need its own accounting since one mint would then own several
+  // rows in `closed`.
+  assert.equal(book.closed.length, 0);
 });
