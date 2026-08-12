@@ -139,6 +139,11 @@ export const PAPER_DEFAULTS = {
   // position instead of declining the trade. A copy that ignores the second buy
   // mirrors a conviction the target expressed only once.
   scaleIn: true,
+  // RE-ENTER. Buy again after a position has been fully closed. Memecoin
+  // traders round-trip the same tickers repeatedly, so "one position per mint,
+  // ever" silently discards most of what a target does. Set false for a book
+  // that should hold at most one lifetime position per token.
+  reEnter: true,
   // PURE MIRROR. The book takes no exit decision of its own — no take-profit
   // ladder, no trailing stop, no hard stop. It buys when the target buys and
   // sells when the target sells, and that is all. See evaluatePaperExits.
@@ -234,6 +239,7 @@ export function paperConfig(overrides = {}) {
     Number.isFinite(Number(cfg.pctWhale)) && Number(cfg.pctWhale) > 0 ? Number(cfg.pctWhale) : null;
   cfg.pureMirror = cfg.pureMirror === true;
   cfg.scaleIn = cfg.scaleIn !== false;
+  cfg.reEnter = cfg.reEnter !== false;
   cfg.useImpliedEntry = cfg.useImpliedEntry !== false;
   cfg.copyImpactPct = Math.max(0, Number(cfg.copyImpactPct) || 0);
   cfg.impliedMinSpendSol = Math.max(0, Number(cfg.impliedMinSpendSol) || 0);
@@ -776,9 +782,11 @@ export function pendingMirrorBuys(observations, { target, book, cfg, now = Date.
   if (!entry?.buys?.length) return [];
 
   const cutoff = now - cfg.maxBuyAgeMinutes * 60_000;
+  // Same rule as the chain path: a held mint is skipped unless scaling in, and
+  // a closed one only when re-entry is off.
   const seen = new Set([
-    ...Object.keys(book.positions ?? {}),
-    ...(book.closed ?? []).map((c) => c.mint),
+    ...(cfg.scaleIn ? [] : Object.keys(book.positions ?? {})),
+    ...(cfg.reEnter ? [] : (book.closed ?? []).map((c) => c.mint)),
   ]);
 
   const out = [];
@@ -1431,7 +1439,7 @@ export async function runPaperTick({
 
   // ---- live on-chain trades, free public RPC -----------------------
   let liveBuys = [];
-  let liveSells = [];
+  let liveTrades = [];
   if (cfg.rpcMirror?.enabled && book.target?.address) {
     const live = await tradeFetcher({
       wallet: book.target.address,
@@ -1467,13 +1475,16 @@ export async function runPaperTick({
           seen.add(t.signature);
           fresh.push(t.signature);
         }
+        // ONE ORDERED LIST. Splitting into buys and sells here is what forced
+        // the two-pass application below, and with it the bug where a sell
+        // landed before the buy it followed.
+        if (t.kind === 'BUY' || t.kind === 'SELL') liveTrades.push(t);
         if (t.kind === 'BUY') liveBuys.push(t);
-        else if (t.kind === 'SELL') liveSells.push(t);
       }
       if (fresh.length) {
         book.seenSignatures = [...(book.seenSignatures ?? []), ...fresh].slice(-SEEN_SIGNATURE_LIMIT);
       }
-      report.chain.duplicates = (live.trades?.length ?? 0) - liveBuys.length - liveSells.length;
+      report.chain.duplicates = (live.trades?.length ?? 0) - liveTrades.length;
     }
   }
 
@@ -1484,14 +1495,27 @@ export async function runPaperTick({
     ? []
     : pendingMirrorBuys(observations, { target: book.target, book, cfg, now });
   const held = new Set(Object.keys(book.positions));
-  // With scaleIn on, a mint already HELD is no longer a reason to skip the buy
-  // — openPaperPosition routes it to scaleInPaperPosition. Closed mints stay
-  // excluded either way: re-entering something already round-tripped is a
-  // different feature (re-entry) and would need its own accounting, since one
-  // mint would then own several rows in `closed`.
+  // ── WHY THIS SET IS USUALLY EMPTY NOW ──────────────────────────────────
+  // With scaleIn on, a HELD mint is not a reason to skip a buy —
+  // openPaperPosition routes it to scaleInPaperPosition. With reEnter on, a
+  // CLOSED mint is not either.
+  //
+  // Excluding closed mints was a real bug against a target that cycles the same
+  // tokens, which is most of them. OBSERVED: the book took $SHITCOINER, the
+  // target sold, the book closed at -0% — and then ignored every subsequent
+  // $SHITCOINER buy the target made, permanently. The GMGN trade list for this
+  // wallet is largely the same handful of tickers bought and sold repeatedly,
+  // so "one position per mint, ever" quietly discards most of what it does.
+  //
+  // A mint may now own SEVERAL rows in `closed`, one per round trip, which is
+  // what they are — and the win rate counts each on its own merits rather than
+  // collapsing a wallet's repeat trades into a single verdict.
+  //
+  // Nothing here re-processes a trade: the signature dedupe does that, which is
+  // why this filter can be relaxed safely at all.
   const everSeen = new Set([
     ...(cfg.scaleIn ? [] : held),
-    ...(book.closed ?? []).map((c) => c.mint),
+    ...(cfg.reEnter ? [] : (book.closed ?? []).map((c) => c.mint)),
   ]);
   // maxBuyAgeMinutes applies to chain buys exactly as it does to ledger ones,
   // and it is load-bearing on the first tick: a cold start reads a whole page
@@ -1552,6 +1576,43 @@ export async function runPaperTick({
     prices.set(mint, q.priceUsd);
   }
 
+  // Indexed so the ordered pass below can find the candidate a BUY row refers
+  // to. Last write wins on a repeated mint, which is correct: two buys of one
+  // token in a batch become one entry plus one scale-in, and the scale-in is
+  // driven by the second row's own spend when it is reached.
+  const candidateByMint = new Map(candidates.map((c) => [c.mint, c]));
+
+  const openCandidate = (c) => {
+    // The swap's own price wins when it exists; the pair lookup is the
+    // fallback for a spend too small to imply one, or a ledger candidate.
+    const price = c.impliedPriceUsd ?? prices.get(c.mint);
+    const res = openPaperPosition(book, {
+      mint: c.mint,
+      // A chain buy arrives with no symbol; the quote that priced it has one.
+      symbol: c.symbol ?? quotes.get(c.mint)?.symbol ?? null,
+      priceUsd: price,
+      cfg,
+      now,
+      source: book.target?.address ?? null,
+      whaleSpendSol: c.whaleSpendSol ?? null,
+    });
+    if (res.ok) {
+      report.opened.push({
+        mint: c.mint,
+        symbol: res.position?.symbol ?? c.symbol ?? null,
+        sizeSol: res.sizeSol,
+        basis: res.basis ?? null,
+        whaleSpendSol: c.whaleSpendSol ?? null,
+        // So the activity log can say ADD rather than BUY. A scale-in and a new
+        // entry look identical in a list of sizes, and they are not the same
+        // event.
+        scaledIn: res.scaledIn === true,
+        blendedEntryUsd: res.blendedEntryUsd ?? null,
+      });
+    } else report.declined.push({ mint: c.mint, reason: res.reason });
+    return res;
+  };
+
   // Mark first, so an exit fires on this tick's price rather than last tick's.
   for (const mint of openMints) {
     const q = quotes.get(mint);
@@ -1565,25 +1626,34 @@ export async function runPaperTick({
     report.marked++;
   }
 
-  // ---- mirrored sells, BEFORE the paper's own exit rules -----------
+  // ---- the target's trades, IN THE ORDER THEY WERE MADE -------------
   //
-  // The target leaving a position is a stronger signal than any threshold this
-  // engine computes: it is the person being copied acting on the trade, while
-  // a trailing stop is an inference from price. So a whale exit is applied
-  // first, and the ladder and stops below then run on whatever remains.
+  // Buys and sells are applied interleaved rather than in two passes, and that
+  // matters as soon as a target cycles a token — which is most of them.
   //
-  // PROPORTIONAL, using the fraction of THEIR bag they actually sold — the
-  // pre-balance is in the same payload. Selling 40% closes 40% of the paper
-  // position, so a partial de-risk is mirrored as a partial de-risk rather
-  // than being rounded up into a full exit.
-  if (cfg.rpcMirror?.mirrorSells !== false) {
-    for (const sell of liveSells) {
-      const p = book.positions[sell.mint];
+  // THE BUG THIS REPLACES: all sells ran before all entries, so a batch holding
+  // BUY(M) then SELL(M) applied the sell while nothing was held, discarded it,
+  // and THEN opened M. The book ended up holding a position the target had
+  // already exited, and under pureMirror there is no stop to catch it. A single
+  // poll page on a cold start routinely contains exactly that sequence.
+  //
+  // Chronological order also makes a buy → sell → buy cycle land as one open
+  // position rather than two, and lets a sell free balance for a later buy in
+  // the same batch.
+  //
+  // A whale exit still precedes the paper's own ladder and stops, which run
+  // below on whatever remains: the target acting is a stronger signal than a
+  // threshold this engine inferred from price.
+  const sellsEnabled = cfg.rpcMirror?.mirrorSells !== false;
+  for (const t of liveTrades) {
+    if (t.kind === 'SELL') {
+      if (!sellsEnabled) continue;
+      const p = book.positions[t.mint];
       if (!p) continue;
-      const price = prices.get(sell.mint) ?? p.markPriceUsd;
+      const price = prices.get(t.mint) ?? p.markPriceUsd;
       if (!Number.isFinite(price) || price <= 0) continue;
-      const fraction = Number.isFinite(sell.sellFraction) ? sell.sellFraction : 1;
-      const res = applyPaperExit(book, sell.mint, {
+      const fraction = Number.isFinite(t.sellFraction) ? t.sellFraction : 1;
+      const res = applyPaperExit(book, t.mint, {
         priceUsd: price,
         trigger: 'WHALE_SELL',
         sellFraction: fraction,
@@ -1593,14 +1663,21 @@ export async function runPaperTick({
       });
       if (res.ok) {
         report.exits.push({
-          mint: sell.mint,
+          mint: t.mint,
           symbol: p.symbol,
           trigger: 'WHALE_SELL',
           label: `target sold ${(fraction * 100).toFixed(0)}%`,
           gainPct: p.entryPriceUsd > 0 ? (price / p.entryPriceUsd - 1) * 100 : null,
         });
       }
+      continue;
     }
+
+    const c = candidateByMint.get(t.mint);
+    // Filtered earlier as stale, already-seen, or otherwise not a candidate.
+    if (!c || c.consumed) continue;
+    c.consumed = true;
+    openCandidate(c);
   }
 
   // Exits before entries: freeing balance first lets a tick that closes a
@@ -1644,34 +1721,13 @@ export async function runPaperTick({
     }
   }
 
+  // Ledger candidates, and any chain buy whose trade row was filtered out
+  // before the ordered pass. Both are order-independent by nature: the ledger
+  // has no sells to interleave with.
   for (const c of candidates) {
-    // The swap's own price wins when it exists; the pair lookup is the
-    // fallback for a spend too small to imply one, or a ledger candidate.
-    const price = c.impliedPriceUsd ?? prices.get(c.mint);
-    const res = openPaperPosition(book, {
-      mint: c.mint,
-      // A chain buy arrives with no symbol; the quote that priced it has one.
-      symbol: c.symbol ?? quotes.get(c.mint)?.symbol ?? null,
-      priceUsd: price,
-      cfg,
-      now,
-      source: book.target?.address ?? null,
-      whaleSpendSol: c.whaleSpendSol ?? null,
-    });
-    if (res.ok) {
-      report.opened.push({
-        mint: c.mint,
-        symbol: res.position?.symbol ?? c.symbol ?? null,
-        sizeSol: res.sizeSol,
-        basis: res.basis ?? null,
-        whaleSpendSol: c.whaleSpendSol ?? null,
-        // So the activity log can say ADD rather than BUY. A scale-in and a new
-        // entry look identical in a list of sizes, and they are not the same
-        // event.
-        scaledIn: res.scaledIn === true,
-        blendedEntryUsd: res.blendedEntryUsd ?? null,
-      });
-    } else report.declined.push({ mint: c.mint, reason: res.reason });
+    if (c.consumed) continue;
+    c.consumed = true;
+    openCandidate(c);
   }
 
   return report;

@@ -6208,8 +6208,17 @@ test('only recent, unseen buys by the target are mirrored', async () => {
   book.positions.HELD = { mint: 'HELD' };
   book.closed.push({ mint: 'DONE' });
 
-  const out = pendingMirrorBuys(observations, { target: { address: 'TARGET' }, book, cfg, now });
+  // Age is always a reason to skip — OLD never mirrors on any setting.
+  // HELD and DONE now depend on scaleIn / reEnter, so the exclusion is tested
+  // with both off.
+  const strict = paperConfig({ maxBuyAgeMinutes: 30, scaleIn: false, reEnter: false });
+  const out = pendingMirrorBuys(observations, { target: { address: 'TARGET' }, book, cfg: strict, now });
   assert.deepEqual(out.map((b) => b.mint), ['FRESH']);
+
+  // With the defaults a held mint is a scale-in and a closed one is a
+  // re-entry, so only the stale buy is dropped.
+  const open = pendingMirrorBuys(observations, { target: { address: 'TARGET' }, book, cfg, now });
+  assert.deepEqual(open.map((b) => b.mint), ['FRESH', 'HELD', 'DONE']);
 
   // A wallet with no observations mirrors nothing rather than throwing.
   assert.deepEqual(pendingMirrorBuys(observations, { target: { address: 'MISSING' }, book, cfg, now }), []);
@@ -8289,4 +8298,133 @@ test('one page is drained in a single pass at the raised cap', async () => {
   // At the old cap the same page needed three ticks.
   const capped = await fetchWhaleTrades({ wallet: 'W', maxTxLookups: 12, rpcImpl, delayMs: 0 });
   assert.equal(capped.pending, 13);
+});
+
+/* ------------------------------------------------------------------ *
+ * Re-entry and trade ordering
+ * ------------------------------------------------------------------ */
+
+const reEntryArgs = (book, cfg, trades, now, price = 1) => ({
+  book,
+  observations: { wallets: {} },
+  watchlist: { wallets: [{ address: 'W' }] },
+  cfg,
+  now,
+  priceFetcher: async () => new Map([['M', price], ['N', price]]),
+  tradeFetcher: async () => ({ ok: true, newestSignature: trades.at(-1)?.signature ?? 'S', trades }),
+});
+
+test('the target re-buying a token we already closed opens it again', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  await runPaperTick(reEntryArgs(book, cfg, [{ kind: 'BUY', mint: 'M', solSpent: 1, blockTime: now, signature: 'B1' }], now));
+  assert.ok(book.positions.M);
+
+  await runPaperTick(reEntryArgs(book, cfg, [{ kind: 'SELL', mint: 'M', sellFraction: 1, blockTime: now, signature: 'S1' }], now + 1));
+  assert.equal(book.positions.M, undefined);
+  assert.equal(book.closed.length, 1);
+
+  // THE REPORTED BUG: every later buy of this mint was skipped forever, so a
+  // target that cycles the same tickers — which is most of them — had most of
+  // its activity silently discarded.
+  const again = await runPaperTick(
+    reEntryArgs(book, cfg, [{ kind: 'BUY', mint: 'M', solSpent: 1, blockTime: now + 2, signature: 'B2' }], now + 2)
+  );
+  assert.equal(again.opened.length, 1, 're-entry must open a new position');
+  assert.ok(book.positions.M);
+  // A NEW position, not a resurrection of the old one.
+  assert.equal(book.positions.M.scaleIns ?? 0, 0);
+
+  // Each round trip is its own row, so the win rate judges them separately
+  // rather than collapsing a wallet's repeat trades into one verdict.
+  await runPaperTick(reEntryArgs(book, cfg, [{ kind: 'SELL', mint: 'M', sellFraction: 1, blockTime: now + 3, signature: 'S2' }], now + 3, 2));
+  assert.equal(book.closed.length, 2);
+  assert.deepEqual(book.closed.map((c) => c.mint), ['M', 'M']);
+});
+
+test('re-entry can be turned off for one lifetime position per mint', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0, reEnter: false });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  await runPaperTick(reEntryArgs(book, cfg, [{ kind: 'BUY', mint: 'M', solSpent: 1, blockTime: now, signature: 'B1' }], now));
+  await runPaperTick(reEntryArgs(book, cfg, [{ kind: 'SELL', mint: 'M', sellFraction: 1, blockTime: now, signature: 'S1' }], now + 1));
+  const again = await runPaperTick(
+    reEntryArgs(book, cfg, [{ kind: 'BUY', mint: 'M', solSpent: 1, blockTime: now + 2, signature: 'B2' }], now + 2)
+  );
+  assert.equal(again.opened.length, 0);
+  assert.equal(book.positions.M, undefined);
+});
+
+test('trades apply in the order the target made them, not buys-then-sells', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  // BUY then SELL inside ONE batch — routine on a cold-start poll page.
+  // The old two-pass order applied the sell first, found nothing held,
+  // discarded it, and THEN opened the position. The book was left holding
+  // something the target had already exited, with no stop under pureMirror.
+  const r = await runPaperTick(
+    reEntryArgs(
+      book,
+      cfg,
+      [
+        { kind: 'BUY', mint: 'M', solSpent: 1, blockTime: now, signature: 'B1' },
+        { kind: 'SELL', mint: 'M', sellFraction: 1, blockTime: now + 1, signature: 'S1' },
+      ],
+      now
+    )
+  );
+
+  assert.equal(r.opened.length, 1);
+  assert.ok(r.exits.some((e) => e.trigger === 'WHALE_SELL'), 'the sell must find the position the buy just opened');
+  assert.equal(book.positions.M, undefined, 'must not hold what the target exited');
+  assert.equal(book.closed.length, 1);
+});
+
+test('a buy/sell/buy cycle in one batch ends holding exactly one position', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  const r = await runPaperTick(
+    reEntryArgs(
+      book,
+      cfg,
+      [
+        { kind: 'BUY', mint: 'M', solSpent: 1, blockTime: now, signature: 'B1' },
+        { kind: 'SELL', mint: 'M', sellFraction: 1, blockTime: now + 1, signature: 'S1' },
+        { kind: 'BUY', mint: 'M', solSpent: 1, blockTime: now + 2, signature: 'B2' },
+      ],
+      now
+    )
+  );
+
+  // Two entries and one exit, ending open — which is what the target did.
+  assert.equal(r.opened.length, 2);
+  assert.equal(r.exits.filter((e) => e.trigger === 'WHALE_SELL').length, 1);
+  assert.ok(book.positions.M, 'the final buy leaves a position open');
+  assert.equal(book.closed.length, 1);
+  // Not a scale-in: the position was closed in between, so this is a fresh one.
+  assert.equal(book.positions.M.scaleIns ?? 0, 0);
+});
+
+test('a sell for something never held is still ignored', async () => {
+  const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, copyImpactPct: 0 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+
+  const r = await runPaperTick(
+    reEntryArgs(book, cfg, [{ kind: 'SELL', mint: 'GHOST', sellFraction: 1, blockTime: now, signature: 'S1' }], now)
+  );
+  assert.equal(r.exits.length, 0);
+  assert.equal(book.closed.length, 0);
 });
