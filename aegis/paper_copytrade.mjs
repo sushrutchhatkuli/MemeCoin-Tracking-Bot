@@ -2212,19 +2212,33 @@ export async function main(argv = []) {
       // The basis is shown because with --pct-whale the size is the interesting
       // half: "0.012 SOL" alone does not say whether that was 10% of a nibble
       // or a cap biting on a conviction buy.
-      recent.push(
-        `[${stamp}] ${o.scaledIn ? 'ADD ' : 'BUY '} ${formatTicker(o.symbol, o.mint)} — ${o.sizeSol.toFixed(4)} SOL` +
+      // STORED STRUCTURED, RENDERED LATER. An entry that priced itself from the
+      // swap has no ticker yet — balance deltas carry no name and the pair
+      // lookup was deliberately skipped — so formatting the line here froze a
+      // raw mint into it forever, even after the position learned its symbol on
+      // the next mark. The dashboard redraws in full every tick, so the line
+      // can simply be re-rendered with whatever is known by then.
+      recent.push({
+        stamp,
+        kind: o.scaledIn ? 'ADD ' : 'BUY ',
+        mint: o.mint,
+        tail:
+          ` — ${o.sizeSol.toFixed(4)} SOL` +
           (o.basis && cfg.pctWhale ? `  (${o.basis})` : '') +
           (o.scaledIn && Number.isFinite(o.blendedEntryUsd)
             ? `  entry now $${o.blendedEntryUsd.toPrecision(4)}`
-            : '')
-      );
+            : ''),
+      });
     }
     for (const e of report.exits) {
-      recent.push(
-        `[${stamp}] SELL ${formatTicker(e.symbol, e.mint)} — ${e.label ?? e.trigger}` +
-          `${Number.isFinite(e.gainPct) ? ` (${e.gainPct >= 0 ? '+' : ''}${e.gainPct.toFixed(0)}%)` : ''}`
-      );
+      recent.push({
+        stamp,
+        kind: 'SELL',
+        mint: e.mint,
+        tail:
+          ` — ${e.label ?? e.trigger}` +
+          `${Number.isFinite(e.gainPct) ? ` (${e.gainPct >= 0 ? '+' : ''}${e.gainPct.toFixed(0)}%)` : ''}`,
+      });
     }
     // Bounded, because the dashboard is fixed-height by design — an unbounded
     // activity log would push the numbers off the screen, which is the exact
@@ -2239,7 +2253,20 @@ export async function main(argv = []) {
     console.log(renderPositions(book, spot));
     if (recent.length) {
       console.log('\n  RECENT ACTIVITY');
-      for (const line of recent) console.log(`  ${line}`);
+      // Resolved at render time from whatever the book knows NOW — an open
+      // position first, then the most recent closed row for that mint, so a
+      // line written before the ticker was known picks it up on the next
+      // redraw instead of keeping a mint forever.
+      const symbolFor = (mint) => {
+        if (book.positions[mint]?.symbol) return book.positions[mint].symbol;
+        for (let i = book.closed.length - 1; i >= 0; i--) {
+          if (book.closed[i].mint === mint && book.closed[i].symbol) return book.closed[i].symbol;
+        }
+        return null;
+      };
+      for (const r of recent) {
+        console.log(`  [${r.stamp}] ${r.kind} ${formatTicker(symbolFor(r.mint), r.mint)}${r.tail}`);
+      }
     }
     // The chain line is load-bearing on a dashboard that otherwise looks
     // identical whether the mirror is live or silently failing: an unreachable
@@ -2279,6 +2306,18 @@ export async function main(argv = []) {
           (s?.stats.reconnects ? ` · ${s.stats.reconnects} reconnect(s)` : '') +
           (!socket?.isConnected() && s?.lastError ? ` · ${s.lastError}` : '')
       );
+    }
+    // DECLINES ARE REPORTED, because their absence is what makes a full book
+    // look like a broken one. A target buy that the engine correctly refused —
+    // no balance, at the position cap — is indistinguishable from a trade that
+    // never arrived unless the reason is on screen. Audited against chain: 4 of
+    // 12 of the target's swaps went unmirrored, all of them because the book
+    // was at 6/6 positions with 0.000 SOL free, and none because the feed
+    // dropped anything.
+    if (report.declined?.length) {
+      const byReason = report.declined.reduce((a, d) => ((a[d.reason] = (a[d.reason] ?? 0) + 1), a), {});
+      const parts = Object.entries(byReason).map(([r, n]) => `${n}x ${r}`);
+      console.log(`  SKIPPED ${report.declined.length} target buy(s) — ${parts.join(' · ')}`);
     }
     if (cfg.pureMirror) {
       console.log('  MODE   pure mirror — no take-profit, no stop-loss; the target decides');
