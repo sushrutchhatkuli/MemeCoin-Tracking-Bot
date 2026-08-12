@@ -150,7 +150,12 @@ export const PAPER_DEFAULTS = {
     enabled: true,
     url: 'https://api.mainnet-beta.solana.com',
     signatureLimit: 25,
-    maxTxLookupsPerTick: 12,
+    // Matches signatureLimit so a cold start or a post-outage catch-up drains
+    // the whole page in ONE tick. It was 12 to bound cost on a path that ran
+    // every tick forever; the socket now carries steady state, so the poll only
+    // runs at startup and during a reconnect and there is nothing left for a
+    // low cap to protect against — it only slowed the one moment that matters.
+    maxTxLookupsPerTick: 25,
     delayMs: 120,
     // Mirror the target's exits as well as its entries. The paper stop and
     // take-profit ladder still run underneath, on whatever the whale exit
@@ -2063,14 +2068,46 @@ export async function main(argv = []) {
     return socket;
   };
 
+  // Signatures the poll knows about and has not read yet. Tracked across ticks
+  // because handing over to the socket while this is non-zero ORPHANS them:
+  // the subscription only covers what happens after it opens, so nothing would
+  // ever go back for the gap.
+  //
+  // OBSERVED before this existed: a cold start logged "12 new tx, 9 queued",
+  // the socket connected on the next tick, and those 9 were never read. Stale
+  // BUYS would have been filtered by maxBuyAgeMinutes anyway — but SELLS are
+  // not age-bounded, and a missed sell leaves the book holding a position the
+  // target has already exited.
+  let pollBacklog = Infinity; // unknown until the first poll answers
+
   const chainFetcher = async (args) => {
     const s = ensureSocket();
-    // Only once the socket is actually live. Before that — the first second of
-    // a run, or mid-reconnect — the poll keeps the book current.
-    if (s?.isConnected()) return s.drain();
-    const polled = await fetchWhaleTrades(args);
-    if (polled.ok) polled.source = 'poll';
-    return polled;
+    const socketLive = Boolean(s?.isConnected());
+
+    // Whatever the socket has resolved is always taken — it is free and already
+    // parsed, and dropping it while catching up would lose live trades.
+    const fromSocket = socketLive ? await s.drain() : null;
+
+    // Poll while the socket is down, and keep polling until the backlog it
+    // inherited is drained. Once caught up the socket carries it alone.
+    const needPoll = !socketLive || pollBacklog > 0;
+    const polled = needPoll ? await fetchWhaleTrades(args) : null;
+    if (polled?.ok) pollBacklog = polled.pending ?? 0;
+
+    if (!polled) return { ...fromSocket, source: 'socket' };
+    if (!fromSocket) return { ...polled, source: 'poll' };
+
+    // Both ran. Poll trades are older, so they lead; runPaperTick's signature
+    // dedupe absorbs any overlap between the two feeds.
+    return {
+      ok: polled.ok || fromSocket.ok,
+      error: polled.ok ? null : polled.error,
+      trades: [...(polled.trades ?? []), ...(fromSocket.trades ?? [])],
+      newestSignature: polled.newestSignature ?? null,
+      scanned: (polled.scanned ?? 0) + (fromSocket.scanned ?? 0),
+      pending: polled.pending ?? 0,
+      source: 'socket+poll',
+    };
   };
 
   // ── WHAT A 5-SECOND CADENCE COSTS, AND WHAT IS DONE ABOUT IT ─────────────
@@ -2164,7 +2201,16 @@ export async function main(argv = []) {
       // polling looks identical to one on the socket except for tens of seconds
       // of lag, which is the whole reason the socket exists.
       const s = socket?.status();
-      const feed = socket?.isConnected() ? 'SOCKET (push)' : socketEnabled ? 'poll (socket down)' : 'poll';
+      // Three states, not two: a socket that is live but still draining an
+      // inherited backlog is neither "push" nor "down", and reporting it as
+      // push would hide the catch-up the FEED line exists to make visible.
+      const feed = !socket?.isConnected()
+        ? socketEnabled
+          ? 'poll (socket down)'
+          : 'poll'
+        : c?.pending
+          ? `SOCKET (push) + poll catch-up, ${c.pending} left`
+          : 'SOCKET (push)';
       console.log(
         `\n  CHAIN  ${c?.ok ? 'live' : `UNREACHABLE — ${c?.error ?? 'unknown'}`}` +
           ` · ${host} · ${billed ? 'BILLED to Helius' : '0 Helius credits'}` +

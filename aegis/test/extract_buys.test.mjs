@@ -8162,3 +8162,131 @@ test('a spend too small to imply a price falls back to the pair feed', async () 
   assert.deepEqual(askedFor, ['DUST'], 'fee and rent would distort a spend this small');
   assert.equal(book.positions.DUST.entryPriceUsd, 5);
 });
+
+/* ------------------------------------------------------------------ *
+ * Poll backlog vs socket handover
+ * ------------------------------------------------------------------ */
+
+/**
+ * The handover rule, extracted so it can be tested without a live socket:
+ * take the socket whenever it is up, and keep polling until the backlog it
+ * inherited is drained.
+ */
+function makeChainFetcher({ socketLive, socketTrades = [], pollPages = [] }) {
+  let backlog = Infinity;
+  let pollCall = 0;
+  const polls = [];
+  return {
+    polls,
+    fetch: async () => {
+      const fromSocket = socketLive() ? { ok: true, trades: socketTrades.splice(0), scanned: 0, pending: 0 } : null;
+      const needPoll = !socketLive() || backlog > 0;
+      let polled = null;
+      if (needPoll) {
+        polled = pollPages[Math.min(pollCall, pollPages.length - 1)] ?? { ok: true, trades: [], pending: 0 };
+        pollCall++;
+        polls.push(true);
+        if (polled.ok) backlog = polled.pending ?? 0;
+      }
+      if (!polled) return { ...fromSocket, source: 'socket' };
+      if (!fromSocket) return { ...polled, source: 'poll' };
+      return {
+        ok: true,
+        trades: [...(polled.trades ?? []), ...(fromSocket.trades ?? [])],
+        pending: polled.pending ?? 0,
+        source: 'socket+poll',
+      };
+    },
+  };
+}
+
+test('a poll backlog is drained rather than orphaned by the socket', async () => {
+  // OBSERVED before the fix: a cold start logged "12 new tx, 9 queued", the
+  // socket connected on the next tick, and those 9 were never read. A stale
+  // BUY would have been filtered by maxBuyAgeMinutes — but SELLS are not
+  // age-bounded, so a missed one leaves the book holding a position the target
+  // has already exited.
+  let live = false;
+  const f = makeChainFetcher({
+    socketLive: () => live,
+    socketTrades: [],
+    pollPages: [
+      { ok: true, trades: [{ signature: 'A' }], pending: 9 }, // cold start, backlog
+      { ok: true, trades: [{ signature: 'B' }], pending: 3 }, // still catching up
+      { ok: true, trades: [{ signature: 'C' }], pending: 0 }, // caught up
+      { ok: true, trades: [{ signature: 'D' }], pending: 0 }, // must NOT be reached
+    ],
+  });
+
+  const t1 = await f.fetch();
+  assert.equal(t1.source, 'poll');
+  assert.equal(t1.pending, 9);
+
+  // Socket comes up while a backlog is still outstanding.
+  live = true;
+  const t2 = await f.fetch();
+  assert.equal(t2.source, 'socket+poll', 'must keep polling while behind');
+  assert.equal(t2.pending, 3);
+
+  const t3 = await f.fetch();
+  assert.equal(t3.source, 'socket+poll');
+  assert.equal(t3.pending, 0, 'caught up');
+
+  // Only now does the poll stop.
+  const t4 = await f.fetch();
+  assert.equal(t4.source, 'socket', 'socket alone once caught up');
+  assert.equal(f.polls.length, 3, 'exactly three polls, then none');
+});
+
+test('a socket outage resumes polling from where it left off', async () => {
+  let live = true;
+  const f = makeChainFetcher({
+    socketLive: () => live,
+    pollPages: [{ ok: true, trades: [], pending: 0 }, { ok: true, trades: [{ signature: 'X' }], pending: 0 }],
+  });
+
+  await f.fetch();               // first tick establishes the backlog is 0
+  const steady = await f.fetch();
+  assert.equal(steady.source, 'socket', 'no poll while caught up and live');
+
+  // The socket drops mid-run.
+  live = false;
+  const fallback = await f.fetch();
+  assert.equal(fallback.source, 'poll', 'an outage costs latency, not coverage');
+});
+
+test('the per-tick lookup cap no longer throttles the catch-up', async () => {
+  const { paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({});
+  // Matched to signatureLimit so a cold start drains the page in one tick.
+  // The old 12 bounded a path that ran every tick forever; the socket carries
+  // steady state now, so the cap only slowed the one moment that mattered.
+  assert.equal(cfg.rpcMirror.maxTxLookupsPerTick, cfg.rpcMirror.signatureLimit);
+  assert.equal(cfg.rpcMirror.maxTxLookupsPerTick, 25);
+
+  // Still overridable for anyone metering a paid node.
+  assert.equal(paperConfig({ rpcMirror: { maxTxLookupsPerTick: 5 } }).rpcMirror.maxTxLookupsPerTick, 5);
+});
+
+test('one page is drained in a single pass at the raised cap', async () => {
+  const { fetchWhaleTrades } = await import('../paper_copytrade.mjs');
+  const sigs = Array.from({ length: 25 }, (_, i) => ({ signature: `S${i}` }));
+  const body = (sig) => ({
+    blockTime: 1700,
+    transaction: { signatures: [sig], message: { accountKeys: [{ pubkey: 'W' }] } },
+    meta: {
+      err: null, preBalances: [10e9], postBalances: [9e9],
+      preTokenBalances: [], postTokenBalances: [{ mint: sig, owner: 'W', uiTokenAmount: { uiAmount: 1 } }],
+    },
+  });
+  const rpcImpl = async (_u, method, params) =>
+    method === 'getSignaturesForAddress' ? { ok: true, result: sigs } : { ok: true, result: body(params[0]) };
+
+  const out = await fetchWhaleTrades({ wallet: 'W', maxTxLookups: 25, rpcImpl, delayMs: 0 });
+  assert.equal(out.trades.length, 25);
+  assert.equal(out.pending, 0, 'nothing left queued after one pass');
+
+  // At the old cap the same page needed three ticks.
+  const capped = await fetchWhaleTrades({ wallet: 'W', maxTxLookups: 12, rpcImpl, delayMs: 0 });
+  assert.equal(capped.pending, 13);
+});
