@@ -2594,6 +2594,109 @@ test('cache entries are classified fresh, incremental or miss', async () => {
   assert.equal(classifyCacheEntry({ ...base, at: now + 60_000 }, { now }), 'miss');
 });
 
+test('ranking sorts on lifetime USD profit, then win rate', async () => {
+  const { applyEliteRules, rankingProfitUsd } = await import('../auto_top_whales.mjs');
+
+  // Every rule off except the sort, so ordering is what is under test.
+  const rules = {
+    minWinRatePct: 0, minGradedBuys: 0, minLifetimeTrades: 0, profitRule: 'skip',
+    minAllTimeWinRatePct: null, minAllTimeNetSol: null, topN: 10,
+  };
+  const w = (address, usd, wr, netSol) => ({
+    address, winRatePct: wr, gradedBuys: 5, lifetimeTrades: 500,
+    allTimeNetProfitUsd: usd,
+    onChain: { winRatePct: wr, trades: 60, netSol },
+  });
+
+  // Deliberately ordered so netSol disagrees with USD: 'rich' has the most
+  // dollars but the least SOL. Under the old sort it ranked last.
+  const { qualified } = applyEliteRules(
+    [w('poor', 100, 90, 90), w('mid', 500, 50, 50), w('rich', 5000, 10, 1)],
+    rules
+  );
+  assert.deepEqual(qualified.map((c) => c.address), ['rich', 'mid', 'poor']);
+
+  // Win rate breaks a USD tie.
+  const tied = applyEliteRules([w('lowWr', 500, 41, 9), w('highWr', 500, 88, 9)], rules);
+  assert.deepEqual(tied.qualified.map((c) => c.address), ['highWr', 'lowWr']);
+
+  // A wallet with no profit figure at all sorts BELOW a genuine loss: unknown
+  // must not be treated as break-even.
+  const unknown = applyEliteRules(
+    [{ address: 'none', winRatePct: 50, gradedBuys: 5, lifetimeTrades: 500, netProfitUsd: null },
+     w('loss', -900, 50, -9)],
+    rules
+  );
+  assert.deepEqual(unknown.qualified.map((c) => c.address), ['loss', 'none']);
+});
+
+test('the ranking profit figure prefers realized over estimated', async () => {
+  const { rankingProfitUsd } = await import('../auto_top_whales.mjs');
+
+  // The measured 2026-08-12 divergence on the top wallet: estimate said +$1k,
+  // realized said ~$2,380. The realized figure must win.
+  assert.equal(rankingProfitUsd({ allTimeNetProfitUsd: 2380, netProfitUsd: 1000 }), 2380);
+  // An imported row has no replay, so its provider P&L is the best figure.
+  assert.equal(rankingProfitUsd({ netProfitUsd: 42000, providerMetrics: true }), 42000);
+  // Zero is a real measurement and must survive; absent must not become 0.
+  assert.equal(rankingProfitUsd({ allTimeNetProfitUsd: 0 }), 0);
+  assert.equal(rankingProfitUsd({ netProfitUsd: null }), null);
+  assert.equal(rankingProfitUsd({}), null);
+  assert.equal(rankingProfitUsd({ allTimeNetProfitUsd: NaN, netProfitUsd: 7 }), 7);
+  assert.equal(rankingProfitUsd(undefined), null);
+});
+
+test('GMGN lifetime figures outrank the replay and the estimate', async () => {
+  const { rankingProfitUsd, rankingWinRate } = await import('../auto_top_whales.mjs');
+
+  // Priority order, all three present.
+  assert.equal(
+    rankingProfitUsd({ gmgnNetProfitUsd: 1_500_000, allTimeNetProfitUsd: 2380, netProfitUsd: 1000 }),
+    1_500_000
+  );
+  assert.equal(
+    rankingWinRate({ gmgnWinRatePct: 71, onChain: { winRatePct: 44 }, winRatePct: 100 }),
+    71
+  );
+
+  // Absent GMGN falls through untouched — this is today's real behaviour, since
+  // nothing in the repo populates these fields (gmgn.ai answers 403).
+  assert.equal(rankingProfitUsd({ allTimeNetProfitUsd: 2380, netProfitUsd: 1000 }), 2380);
+  assert.equal(rankingWinRate({ onChain: { winRatePct: 44 }, winRatePct: 100 }), 44);
+  assert.equal(rankingWinRate({ winRatePct: 100 }), 100);
+
+  // A zero from GMGN is a real measurement and must not fall through to a
+  // rosier number underneath it.
+  assert.equal(rankingProfitUsd({ gmgnNetProfitUsd: 0, allTimeNetProfitUsd: 5000 }), 0);
+  assert.equal(rankingWinRate({ gmgnWinRatePct: 0, onChain: { winRatePct: 90 } }), 0);
+
+  // A NaN — what a failed CSV cell parse yields — must be skipped, not returned.
+  // Returning it would make every comparison against it NaN and leave the sort
+  // order unspecified, which is far worse than ignoring the field.
+  assert.equal(rankingProfitUsd({ gmgnNetProfitUsd: NaN, allTimeNetProfitUsd: 2380 }), 2380);
+  assert.equal(rankingWinRate({ gmgnWinRatePct: NaN, onChain: { winRatePct: 44 } }), 44);
+
+  assert.equal(rankingWinRate({}), null);
+  assert.equal(rankingWinRate(undefined), null);
+});
+
+test('a GMGN-ranked wallet leads on career P&L, not on the bounded replay', async () => {
+  const { applyEliteRules } = await import('../auto_top_whales.mjs');
+  const rules = {
+    minWinRatePct: 0, minGradedBuys: 0, minLifetimeTrades: 0, profitRule: 'skip',
+    minAllTimeWinRatePct: null, minAllTimeNetSol: null, topN: 10,
+  };
+  // The replay says `career` is the SMALLER wallet; GMGN says it is far larger.
+  // The provider figure must win, since the replay is a bounded window.
+  const career = { address: 'CAREER', winRatePct: 50, gradedBuys: 5, lifetimeTrades: 500,
+    gmgnNetProfitUsd: 1_500_000, allTimeNetProfitUsd: 100, onChain: { winRatePct: 50, trades: 60, netSol: 1 } };
+  const local = { address: 'LOCAL', winRatePct: 50, gradedBuys: 5, lifetimeTrades: 500,
+    allTimeNetProfitUsd: 8000, onChain: { winRatePct: 50, trades: 60, netSol: 105 } };
+
+  const order = applyEliteRules([local, career], rules).qualified.map((c) => c.address);
+  assert.deepEqual(order, ['CAREER', 'LOCAL']);
+});
+
 test('the replay cap bounds network work, not cached measurement', async () => {
   const { partitionByCacheDisposition, ONCHAIN_CACHE_VERSION } = await import('../auto_top_whales.mjs');
   const now = Date.now();
@@ -2879,15 +2982,31 @@ test('an Alpha Hunter skips the win-rate rules but NOT the money rule', () => {
   );
 });
 
-test('Alpha Hunters lead the list, then everyone ranks by realized SOL', () => {
+test('Alpha Hunters lead the list, then everyone ranks by lifetime USD profit', () => {
   const hunter = { address: 'H', winRatePct: 10, gradedBuys: 0, lifetimeTrades: 2, megaWinCount: 2,
     onChain: { winRatePct: 12, trades: 3, netSol: 1 } };
-  const rich = { ...solid, address: 'RICH', onChain: { winRatePct: 50, trades: 40, netSol: 90 } };
-  const poor = { ...solid, address: 'POOR', onChain: { winRatePct: 99, trades: 40, netSol: 2 } };
+  // RICH has the most dollars and the WORST win rate, so the assertion cannot
+  // pass by accident on a win-rate sort.
+  const rich = { ...solid, address: 'RICH', allTimeNetProfitUsd: 9000,
+    onChain: { winRatePct: 50, trades: 40, netSol: 90 } };
+  const poor = { ...solid, address: 'POOR', allTimeNetProfitUsd: 150,
+    onChain: { winRatePct: 99, trades: 40, netSol: 2 } };
 
   const order = applyEliteRules([poor, rich, hunter], RULES5).qualified.map((c) => c.address);
   assert.equal(order[0], 'H', 'the hunter leads despite a 12% rate — it was exempted from that number');
-  assert.deepEqual(order.slice(1), ['RICH', 'POOR'], 'then by realized SOL, not by win rate');
+  assert.deepEqual(order.slice(1), ['RICH', 'POOR'], 'then by USD profit, not by win rate');
+});
+
+test('with no USD figure anywhere, ranking falls through to win rate', () => {
+  // Neither wallet carries a profit figure, so the primary key is a tie for
+  // both and the order must be decided further down rather than arbitrarily.
+  // This is the pre-2026-08-12 fixture shape, kept because profitRule 'skip'
+  // plus a missing SOL price still produces it.
+  const rich = { ...solid, address: 'RICH', onChain: { winRatePct: 50, trades: 40, netSol: 90 } };
+  const poor = { ...solid, address: 'POOR', onChain: { winRatePct: 99, trades: 40, netSol: 2 } };
+
+  const order = applyEliteRules([rich, poor], RULES5).qualified.map((c) => c.address);
+  assert.deepEqual(order, ['POOR', 'RICH'], 'win rate decides when no wallet has a USD figure');
 });
 
 test('/whales renders an Alpha Hunter as one, not as a win rate', async () => {

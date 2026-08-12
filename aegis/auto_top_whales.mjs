@@ -148,6 +148,118 @@ export function countMegaWins(entry, { minMultiplier = 50, maxMultiplier = 500 }
 }
 
 /**
+ * ── GMGN FIELDS ARE READ FIRST AND NOTHING WRITES THEM YET ──────────────────
+ *
+ * Both helpers below check a `gmgn*` field ahead of everything else. That order
+ * is correct — a provider's own lifetime P&L beats anything derivable here, and
+ * beats it by a wide margin, because Aegis can only replay a bounded window
+ * while GMGN reports a career.
+ *
+ * But NO CODE IN THIS REPO SETS EITHER FIELD, so today the check always falls
+ * through and the ranking is byte-identical to what it was without it. This is
+ * a seam, not a feature, and it is deliberately inert rather than pretending.
+ *
+ * WHY IT IS INERT, MEASURED 2026-08-12 rather than assumed:
+ *   https://gmgn.ai/api/v1/wallet_stat/sol/<addr>/7d              HTTP 403
+ *   https://gmgn.ai/defi/quotation/v1/smartmoney/sol/walletNew/…  HTTP 403
+ * Both answer with a Cloudflare challenge page, not JSON. network_discovery.mjs
+ * records the same finding and ships GMGN as a deep link for a human to click
+ * precisely because the numbers cannot be fetched. Defeating that challenge is
+ * not something this codebase should do.
+ *
+ * THE ROUTE THAT WORKS TODAY is the import path, which already parses GMGN's
+ * own column names — `realized_profit` is in the PROFIT alias list and
+ * normaliseWinRate handles GMGN's 0.62-style fractions:
+ *   node auto_top_whales.mjs --import <gmgn-export.csv>
+ * An imported row arrives with providerMetrics true, carrying the provider's
+ * lifetime figures in netProfitUsd and winRatePct.
+ *
+ * To make these fields live, populate candidate.gmgnNetProfitUsd and
+ * candidate.gmgnWinRatePct during enrichment. Anything writing them MUST use
+ * the same units as everything else here: whole US dollars, and win rate as a
+ * PERCENTAGE (62, not 0.62). A fraction written here would rank every GMGN
+ * wallet below every observed one and look like a data problem rather than a
+ * unit problem.
+ */
+
+/**
+ * The USD profit figure the ranking sorts on. PURE.
+ *
+ * Prefers GMGN's lifetime P&L, then allTimeNetProfitUsd — the wallet's OWN
+ * realized SOL from the on-chain replay, priced at the live rate — and falls
+ * back to netProfitUsd. Below the GMGN step this is the same precedence Rule 2
+ * applies, deliberately: ranking on a different number from the one that
+ * decided qualification is the defect the watchlist header already warns about.
+ *
+ * NOTE that Rule 2 does NOT read the GMGN field. So once these are populated a
+ * wallet could be RANKED on a career P&L while having been QUALIFIED on a
+ * bounded replay. That is the right way round — the stricter, self-measured
+ * figure decides admission and the richer one decides order — but it is a
+ * divergence worth knowing about rather than discovering.
+ *
+ * ── THE TWO FIELDS ARE NOT INTERCHANGEABLE, AND THE GAP IS LARGE ────────────
+ * On the OBSERVE path netProfitUsd is an ESTIMATE: observed spend x later price
+ * change across the handful of buys Aegis witnessed, assuming the wallet still
+ * holds. config.json's _profitRuleNote records that it "runs to single dollars".
+ * MEASURED 2026-08-12 on the top-ranked wallet: netProfitUsd read +$1k while
+ * the realized figure was 31.203 SOL = ~$2,380. Same wallet, one number more
+ * than twice the other, and neither is a lifetime career total.
+ *
+ * The fallback is nonetheless correct, because it only bites where the estimate
+ * is not an estimate: an IMPORTED row carries the provider's own lifetime P&L
+ * in netProfitUsd and has no on-chain replay at all. Falling back there ranks
+ * imports on the best figure they have.
+ *
+ * Returns null rather than 0 when neither exists. Unknown and break-even are
+ * different claims, and a 0 would sort a wallet above every genuine loss.
+ */
+export function rankingProfitUsd(candidate) {
+  // Finiteness-checked rather than a bare `??` chain. `??` only skips null and
+  // undefined, so a NaN — which is what a failed parse of a provider's CSV cell
+  // produces — would be taken as the answer and then poison every comparison it
+  // touches, since NaN-x is NaN and a sort comparator reading NaN silently
+  // leaves the order unspecified. Same reasoning in rankingWinRate.
+  for (const v of [
+    candidate?.gmgnNetProfitUsd,
+    candidate?.allTimeNetProfitUsd,
+    candidate?.netProfitUsd,
+  ]) {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return null;
+}
+
+/**
+ * The win rate the ranking sorts on, as a PERCENTAGE. PURE.
+ *
+ * GMGN's career figure first, then the true on-chain rate from the replay, then
+ * the observed rate. The last is the weakest of the three and the file's own
+ * header says so: it is computed over the handful of buys Aegis witnessed and
+ * biased upward because buyer replay only reads tokens with a live pool.
+ * MEASURED 2026-08-10: a wallet reading 100% observed over 3 graded buys was
+ * 27% on chain over 11 closed trades.
+ *
+ * Extracted from the sort comparator, where this coalesce previously sat
+ * inline. Pulling it out is what lets the GMGN step exist in one place instead
+ * of being repeated at every call site, and lets the precedence be tested
+ * without constructing a full candidate set.
+ *
+ * Returns null when nothing is known, so callers can distinguish "no rate" from
+ * "0%" — a wallet that lost every closed trade and a wallet never measured are
+ * not the same claim.
+ */
+export function rankingWinRate(candidate) {
+  for (const v of [
+    candidate?.gmgnWinRatePct,
+    candidate?.onChain?.winRatePct,
+    candidate?.winRatePct,
+  ]) {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return null;
+}
+
+/**
  * Apply all four rules. A candidate must pass every one — the rules are AND,
  * not a weighted blend, so a spectacular win rate cannot compensate for a thin
  * trade history (which is how small-sample flukes get mistaken for skill).
@@ -273,11 +385,20 @@ export function applyEliteRules(candidates, rules = ELITE_RULES) {
         // fast-track exists to ignore.
         Number(b.fastTracked ?? false) - Number(a.fastTracked ?? false) ||
         (b.megaWinCount ?? 0) - (a.megaWinCount ?? 0) ||
-        // Realized SOL is the primary sort for everyone else: it is the only
-        // figure here that says whether the wallet actually made money.
+        // LIFETIME USD PROFIT is the primary sort for everyone else.
+        (rankingProfitUsd(b) ?? -Infinity) - (rankingProfitUsd(a) ?? -Infinity) ||
+        // Then the true win rate: GMGN's career figure where one exists, the
+        // on-chain replay next, the observed rate last.
+        (rankingWinRate(b) ?? -Infinity) - (rankingWinRate(a) ?? -Infinity) ||
+        // Realized SOL. NOTE THAT THIS CAN ALMOST NEVER FIRE, and it is kept
+        // for the case where it can rather than as a working tie-break: on the
+        // observe path allTimeNetProfitUsd IS onChain.netSol multiplied by one
+        // per-sync SOL price, so ordering by it is arithmetically identical to
+        // ordering by netSol and the primary key has already decided. It only
+        // separates wallets whose USD figures came from DIFFERENT sources — an
+        // imported row judged on a provider's P&L beside an observed one — and
+        // there the imported row has no onChain at all.
         (b.onChain?.netSol ?? -Infinity) - (a.onChain?.netSol ?? -Infinity) ||
-        (b.onChain?.winRatePct ?? 0) - (a.onChain?.winRatePct ?? 0) ||
-        (b.winRatePct ?? 0) - (a.winRatePct ?? 0) ||
         (b.lifetimeTrades ?? 0) - (a.lifetimeTrades ?? 0)
     )
     .slice(0, rules.topN);
@@ -331,7 +452,14 @@ export function buildWatchlist(qualified, { source, rules }) {
       // one number while announcing another is the same trap the two win-rate
       // fields further down exist to warn about.
       `Selected top ${rules.topN}: Alpha Hunters first, then most mega-runners caught,`,
-      `then REALIZED net SOL, with on-chain and observed win rates as tie-breaks.`,
+      `then LIFETIME USD PROFIT, then true win rate, then realized net SOL.`,
+      '',
+      'THE RANKING PROFIT FIGURE IS `all_time_net_profit_usd`, not the',
+      '`net_profit_usd` beside it. The first is the wallet’s own realized SOL',
+      'from chain priced at the sync’s SOL rate; the second is ESTIMATED from',
+      'the few buys Aegis witnessed and can differ by more than 2x on the same',
+      'wallet. Both are written so the gap is inspectable rather than asserted,',
+      'and neither is a lifetime career total — see `all_time_complete`.',
       '',
       'TWO WIN RATES LIVE IN THIS FILE AND THEY MEAN DIFFERENT THINGS.',
       '`win_rate` is OBSERVED: computed over the handful of buys Aegis happened',
@@ -391,6 +519,14 @@ export function buildWatchlist(qualified, { source, rules }) {
               all_time_net_sol: Number(w.onChain.netSol.toFixed(3)),
               all_time_complete: w.onChain.complete === true,
             }
+          : {}),
+        // THE FIGURE THE LIST IS RANKED ON, written because it is now the
+        // primary sort key and was previously invisible in the file. Without it
+        // an entry showed only net_profit_usd — the observed ESTIMATE — so the
+        // file would order itself by a number it never printed, which is the
+        // same defect the sort-order line in the header above was fixed for.
+        ...(rankingProfitUsd(w) !== null
+          ? { all_time_net_profit_usd: money(rankingProfitUsd(w)) }
           : {}),
         // getSignaturesForAddress caps at 1000, so an exact 1000 means "at least
         // 1000" — and these are signatures, not trades. Naming it accurately
