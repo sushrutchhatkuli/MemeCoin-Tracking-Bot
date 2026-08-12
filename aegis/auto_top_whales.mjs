@@ -34,7 +34,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join, extname } from 'node:path';
 
@@ -71,6 +71,9 @@ export const ELITE_RULES = {
   alphaHunterMaxMultiplier: 500,
   // Bounds the on-chain replay, which is the expensive half of a sync.
   maxOnChainReplays: 40,
+  historyCacheTtlHours: 24,
+  maxCacheEntries: 500,
+  maxCacheAgeDays: 30,
 };
 
 /**
@@ -650,6 +653,95 @@ const LAMPORTS_PER_SOL = 1e9;
  * both sides of the ratio — counting open positions as losses would punish a
  * wallet for still holding, and as wins would be worse.
  */
+/**
+ * Per-mint SOL flow from a batch of parsed transactions. PURE.
+ *
+ * Split out of computeOnChainWinRate so the intermediate state can be CACHED
+ * and merged incrementally. The summary alone is not enough to extend: a later
+ * sell turns a previously-open position into a closed one, which changes both
+ * the numerator and the denominator of the win rate. Caching only
+ * "27% over 11 trades" makes that impossible to update without a full refetch,
+ * which is the whole cost this cache exists to avoid.
+ */
+export function accumulateMintTotals(transactions, { address, dustSol = 0.05 } = {}) {
+  const perMint = new Map();
+  let swapLegs = 0;
+  let dustSkipped = 0;
+  let ambiguous = 0;
+  let newestSignature = null;
+
+  for (const tx of transactions ?? []) {
+    if (!tx || tx.transactionError || tx.type !== 'SWAP') continue;
+    if (!newestSignature && tx.signature) newestSignature = tx.signature;
+
+    const moved = (tx.tokenTransfers ?? []).filter(
+      (t) => (t.fromUserAccount === address || t.toUserAccount === address) && t.mint !== WSOL_MINT
+    );
+    if (!moved.length) continue;
+
+    const mints = [...new Set(moved.map((t) => t.mint))];
+    if (mints.length !== 1) { ambiguous++; continue; }
+
+    const account = (tx.accountData ?? []).find((a) => a.account === address);
+    const netSol = (account?.nativeBalanceChange ?? 0) / LAMPORTS_PER_SOL;
+    if (Math.abs(netSol) < dustSol) { dustSkipped++; continue; }
+
+    swapLegs++;
+    const entry = perMint.get(mints[0]) ?? { solOut: 0, solIn: 0, legs: 0 };
+    if (netSol < 0) entry.solOut += -netSol;
+    else entry.solIn += netSol;
+    entry.legs++;
+    perMint.set(mints[0], entry);
+  }
+
+  return { perMint, swapLegs, dustSkipped, ambiguous, newestSignature };
+}
+
+/**
+ * Fold two per-mint maps together. PURE.
+ *
+ * Addition is the right merge because every field is a running total of SOL
+ * through one mint. Order does not matter, which is what makes an incremental
+ * top-up equivalent to a full replay of the same transactions.
+ */
+export function mergeMintTotals(base = {}, incoming = {}) {
+  const out = {};
+  for (const [mint, e] of Object.entries(base)) {
+    out[mint] = { solOut: e.solOut ?? 0, solIn: e.solIn ?? 0, legs: e.legs ?? 0 };
+  }
+  for (const [mint, e] of Object.entries(incoming)) {
+    const prior = out[mint] ?? { solOut: 0, solIn: 0, legs: 0 };
+    out[mint] = {
+      solOut: prior.solOut + (e.solOut ?? 0),
+      solIn: prior.solIn + (e.solIn ?? 0),
+      legs: prior.legs + (e.legs ?? 0),
+    };
+  }
+  return out;
+}
+
+/** Win rate and realized SOL from a per-mint map. PURE. */
+export function summariseMintTotals(perMint = {}, extra = {}) {
+  const entries = Object.entries(perMint);
+  const closed = entries
+    .filter(([, e]) => (e.solOut ?? 0) > 0 && (e.solIn ?? 0) > 0)
+    .map(([mint, e]) => ({ mint, ...e, netSol: e.solIn - e.solOut }));
+  const wins = closed.filter((c) => c.netSol > 0);
+
+  return {
+    trades: closed.length,
+    wins: wins.length,
+    losses: closed.length - wins.length,
+    winRatePct: closed.length ? (wins.length / closed.length) * 100 : null,
+    netSol: closed.reduce((a, c) => a + c.netSol, 0),
+    openPositions: entries.length - closed.length,
+    swapLegs: extra.swapLegs ?? 0,
+    dustSkipped: extra.dustSkipped ?? 0,
+    ambiguous: extra.ambiguous ?? 0,
+    dustSol: extra.dustSol ?? 0.05,
+  };
+}
+
 export function computeOnChainWinRate(transactions, { address, dustSol = 0.05 } = {}) {
   const perMint = new Map();
   let swapLegs = 0;
@@ -717,7 +809,20 @@ export function computeOnChainWinRate(transactions, { address, dustSol = 0.05 } 
  */
 export async function fetchWalletHistory(
   address,
-  { heliusKey, maxPages = 12, timeoutMs = 30_000, pageDelayMs = 120, retries = 3, retryDelayMs = 1_500 } = {}
+  {
+    heliusKey,
+    maxPages = 12,
+    timeoutMs = 30_000,
+    pageDelayMs = 120,
+    retries = 3,
+    retryDelayMs = 1_500,
+    // Stop as soon as this signature is seen and return only what is NEWER.
+    // The endpoint pages backwards from the most recent transaction, so the
+    // first page already contains everything since the last sync — an
+    // incremental top-up usually costs ONE call regardless of how much history
+    // the wallet has.
+    untilSignature = null,
+  } = {}
 ) {
   if (!heliusKey) return { ok: false, error: 'no Helius key', transactions: [], complete: false, pages: 0 };
 
@@ -744,7 +849,24 @@ export async function fetchWalletHistory(
       if (attempt) await new Promise((r) => setTimeout(r, retryDelayMs * attempt));
       try {
         const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-        if (!res.ok) { lastError = `HTTP ${res.status}`; continue; }
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          // A plan limit is terminal. Retrying it burns wall-clock for a result
+          // that cannot change, and the caller needs to stop rather than work
+          // through the rest of the shortlist the same way.
+          if (res.status === 429 && /max usage|quota|credit/i.test(text)) {
+            return {
+              ok: false,
+              error: `RPC quota exhausted: ${text.trim().slice(0, 80)}`,
+              quotaExhausted: true,
+              transactions,
+              complete: false,
+              pages,
+            };
+          }
+          lastError = `HTTP ${res.status}`;
+          continue;
+        }
         const body = await res.json();
         if (!Array.isArray(body)) { lastError = 'non-array response'; continue; }
         // An empty FIRST page is the ambiguous case: it is either a wallet with
@@ -762,9 +884,18 @@ export async function fetchWalletHistory(
       return { ok: pages > 0, error: lastError, transactions, complete: false, pages };
     }
     if (!batch.length) break;
+    pages++;
+
+    if (untilSignature) {
+      const hit = batch.findIndex((t) => t?.signature === untilSignature);
+      if (hit !== -1) {
+        // Everything from `hit` onward was already folded into the cache.
+        transactions.push(...batch.slice(0, hit));
+        return { ok: true, transactions, complete: true, pages, caughtUp: true };
+      }
+    }
 
     transactions.push(...batch);
-    pages++;
     before = batch[batch.length - 1]?.signature;
     // A short page is the end of the wallet's history — the only way to know
     // the window is genuinely all-time rather than merely capped.
@@ -772,37 +903,220 @@ export async function fetchWalletHistory(
     if (pageDelayMs) await new Promise((r) => setTimeout(r, pageDelayMs));
   }
 
-  return { ok: true, transactions, complete: pages < maxPages, pages };
+  // Reaching the page cap while looking for a known signature means the wallet
+  // moved more than maxPages of transactions since the last sync. The top-up is
+  // then incomplete, and merging it would double-count nothing but would leave
+  // a hole — so the caller is told to treat it as a full refresh instead.
+  return {
+    ok: true,
+    transactions,
+    complete: pages < maxPages,
+    pages,
+    caughtUp: untilSignature ? false : undefined,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * On-chain history cache
+ * ------------------------------------------------------------------ *
+ *
+ * The replay is the expensive half of a sync — measured at ~10-15 minutes for
+ * 40 wallets — and almost all of it is re-reading history that has not changed.
+ * This caches the per-mint SOL flow per wallet so a repeat sync costs nothing
+ * for wallets inside the TTL, and only the NEW transactions for wallets past
+ * it.
+ *
+ * WHY THE PER-MINT MAP AND NOT THE SUMMARY: a later sell turns an open position
+ * into a closed one, changing both sides of the win-rate ratio. "27% over 11
+ * trades" cannot be extended by new transactions; the flow it was derived from
+ * can. Merging is addition, so an incremental top-up is arithmetically identical
+ * to a full replay over the same transactions.
+ *
+ * `lifetimeTrades` is cached alongside it, because that is the OTHER per-wallet
+ * RPC call in an observe sync and leaving it uncached would keep the pass
+ * expensive no matter how good this cache is.
+ */
+export const ONCHAIN_CACHE_PATH = join(HERE, '.state', 'onchain_history_cache.json');
+export const ONCHAIN_CACHE_VERSION = 1;
+
+export async function loadOnChainCache(path = ONCHAIN_CACHE_PATH) {
+  try {
+    const raw = JSON.parse(await readFile(path, 'utf8'));
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+export async function saveOnChainCache(cache, path = ONCHAIN_CACHE_PATH) {
+  try {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, JSON.stringify(cache, null, 2), 'utf8');
+  } catch {
+    /* a cache that cannot be written is a cost problem, never a sync failure */
+  }
+}
+
+/**
+ * How this wallet's cache entry may be used.
+ *
+ *   'fresh'       inside the TTL — serve from disk, zero RPC.
+ *   'incremental' past the TTL but usable — fetch only what is newer.
+ *   'miss'        no entry, or one written by an older cache version.
+ *
+ * A version bump invalidates rather than migrates: the entry's meaning is the
+ * accumulator's semantics, and reusing totals computed under different rules
+ * (a changed dust floor, say) would silently blend two definitions.
+ */
+/**
+ * Bound the cache file.
+ *
+ * Each entry holds a per-mint map that can run to hundreds of tokens for an
+ * active wallet, and the shortlist churns — wallets enter and leave it every
+ * sync. Without a bound this file grows monotonically with every wallet ever
+ * shortlisted and eventually costs more to read than it saves.
+ *
+ * Oldest-first eviction, because a stale entry is the one whose next use would
+ * need a refetch anyway.
+ */
+export function pruneOnChainCache(cache, { maxCacheEntries = 500, maxCacheAgeDays = 30 } = {}, now = Date.now()) {
+  const floor = now - maxCacheAgeDays * 86_400_000;
+  const live = Object.entries(cache).filter(([, e]) => (e?.at ?? e?.sigCountAt ?? 0) >= floor);
+  live.sort((a, b) => (b[1]?.at ?? b[1]?.sigCountAt ?? 0) - (a[1]?.at ?? a[1]?.sigCountAt ?? 0));
+  return Object.fromEntries(live.slice(0, maxCacheEntries));
+}
+
+export function classifyCacheEntry(entry, { ttlHours = 24, now = Date.now(), dustSol = 0.05 } = {}) {
+  if (!entry || entry.version !== ONCHAIN_CACHE_VERSION || !entry.perMint) return 'miss';
+  // The dust floor changes what counts as a leg, so totals from a different one
+  // are a different measurement.
+  if (typeof entry.dustSol === 'number' && entry.dustSol !== dustSol) return 'miss';
+  const ageHours = (now - (entry.at ?? 0)) / 3_600_000;
+  if (ageHours < 0) return 'miss';
+  if (ageHours <= ttlHours) return 'fresh';
+  return entry.newestSignature ? 'incremental' : 'miss';
 }
 
 /** Attach the true on-chain win rate to each candidate. Mutates in place. */
-async function enrichOnChainWinRate(candidates, { heliusKey, cfg, solUsd = 0 }) {
+async function enrichOnChainWinRate(candidates, { heliusKey, cfg, solUsd = 0, cache = {}, now = Date.now() }) {
   if (!heliusKey) {
     console.log('   No Helius API key — true on-chain win rate cannot be derived');
     return { derived: 0, failed: candidates.length };
   }
   const maxPages = cfg?.maxHistoryPages ?? 12;
   const dustSol = cfg?.dustTradeSol ?? 0.05;
+  const ttlHours = cfg?.historyCacheTtlHours ?? 24;
   let derived = 0;
   let failed = 0;
   let partial = 0;
+  let fromCache = 0;
+  let topUps = 0;
+  let pagesFetched = 0;
 
+  let quotaExhausted = null;
   for (const c of candidates) {
-    const history = await fetchWalletHistory(c.address, {
-      heliusKey,
-      maxPages,
-      pageDelayMs: cfg?.historyPageDelayMs ?? 120,
-    });
-    if (!history.ok || !history.transactions.length) {
+    const entry = cache[c.address];
+    const disposition = classifyCacheEntry(entry, { ttlHours, now, dustSol });
+
+    // Once the plan limit is hit, only cache hits can still be served. Walking
+    // the rest of the shortlist against a hard quota costs minutes and returns
+    // nothing.
+    if (quotaExhausted && disposition !== 'fresh') {
       failed++;
-      // Recorded so a wallet dropped by Rule 4 can be distinguished from one
-      // that genuinely has a bad record.
-      c.onChain = { winRatePct: null, trades: 0, unavailable: history.error ?? 'no history returned' };
+      c.onChain = { winRatePct: null, trades: 0, unavailable: quotaExhausted };
       continue;
     }
 
-    const wr = computeOnChainWinRate(history.transactions, { address: c.address, dustSol });
-    c.onChain = { ...wr, complete: history.complete, pagesRead: history.pages };
+    let perMint;
+    let meta;
+    let complete;
+    let newestSignature;
+
+    if (disposition === 'fresh') {
+      // ZERO RPC. The whole point of the cache.
+      perMint = entry.perMint;
+      meta = { swapLegs: entry.swapLegs, dustSkipped: entry.dustSkipped, ambiguous: entry.ambiguous, dustSol };
+      complete = entry.complete;
+      newestSignature = entry.newestSignature;
+      fromCache++;
+    } else {
+      const incremental = disposition === 'incremental';
+      const history = await fetchWalletHistory(c.address, {
+        heliusKey,
+        maxPages,
+        pageDelayMs: cfg?.historyPageDelayMs ?? 120,
+        untilSignature: incremental ? entry.newestSignature : null,
+      });
+      pagesFetched += history.pages ?? 0;
+
+      if (history.quotaExhausted) quotaExhausted = history.error;
+
+      if (!history.ok) {
+        // A failed refresh falls back to the STALE entry rather than dropping
+        // the wallet. Under Rules 4 and 5 unmeasured is a failure, so treating
+        // a transient error as "no history" would delete a wallet from the
+        // watchlist for a network blip — the exact failure the retry inside
+        // fetchWalletHistory exists to prevent, one level up.
+        if (entry?.perMint) {
+          perMint = entry.perMint;
+          meta = { swapLegs: entry.swapLegs, dustSkipped: entry.dustSkipped, ambiguous: entry.ambiguous, dustSol };
+          complete = entry.complete;
+          newestSignature = entry.newestSignature;
+          fromCache++;
+        } else {
+          failed++;
+          c.onChain = { winRatePct: null, trades: 0, unavailable: history.error ?? 'no history returned' };
+          continue;
+        }
+      } else {
+        const batch = accumulateMintTotals(history.transactions, { address: c.address, dustSol });
+        const usableTopUp = incremental && history.caughtUp === true;
+
+        if (usableTopUp) {
+          // Arithmetic merge — identical to having replayed both batches at once.
+          perMint = mergeMintTotals(entry.perMint, Object.fromEntries(batch.perMint));
+          meta = {
+            swapLegs: (entry.swapLegs ?? 0) + batch.swapLegs,
+            dustSkipped: (entry.dustSkipped ?? 0) + batch.dustSkipped,
+            ambiguous: (entry.ambiguous ?? 0) + batch.ambiguous,
+            dustSol,
+          };
+          complete = entry.complete;
+          topUps++;
+        } else {
+          // Either a cold miss, or a top-up that ran past maxPages without
+          // reaching the known signature — in which case the window has a hole
+          // and the fresh read replaces the entry rather than extending it.
+          perMint = Object.fromEntries(batch.perMint);
+          meta = { swapLegs: batch.swapLegs, dustSkipped: batch.dustSkipped, ambiguous: batch.ambiguous, dustSol };
+          complete = history.complete;
+        }
+        newestSignature = batch.newestSignature ?? entry?.newestSignature ?? null;
+        if (!history.transactions.length && !entry?.perMint) {
+          failed++;
+          c.onChain = { winRatePct: null, trades: 0, unavailable: 'no history returned' };
+          continue;
+        }
+      }
+    }
+
+    const wr = summariseMintTotals(perMint, meta);
+    c.onChain = { ...wr, complete, pagesRead: 0, cached: disposition === 'fresh' };
+
+    cache[c.address] = {
+      version: ONCHAIN_CACHE_VERSION,
+      perMint,
+      newestSignature,
+      swapLegs: meta.swapLegs,
+      dustSkipped: meta.dustSkipped,
+      ambiguous: meta.ambiguous,
+      complete,
+      dustSol,
+      // Only advanced on a real read. A cache SERVED from disk keeps its
+      // original timestamp, or a wallet inside the TTL would refresh its own
+      // expiry on every sync and never be re-read again.
+      at: disposition === 'fresh' ? entry.at : now,
+    };
 
     // REAL realized profit, in dollars, from the wallet's own closed positions.
     //
@@ -816,10 +1130,11 @@ async function enrichOnChainWinRate(candidates, { heliusKey, cfg, solUsd = 0 }) 
     }
     if (wr.winRatePct !== null) {
       derived++;
-      if (!history.complete) partial++;
+      if (!complete) partial++;
       c.basis +=
         `; on-chain ${wr.winRatePct.toFixed(0)}% over ${wr.trades} closed trade(s)` +
-        `${history.complete ? ' (all-time)' : ` (most recent ${wr.swapLegs} swap legs, history truncated)`}`;
+        `${complete ? ' (all-time)' : ` (most recent ${wr.swapLegs} swap legs, history truncated)`}` +
+        `${disposition === 'fresh' ? ' [cached]' : ''}`;
     } else {
       failed++;
     }
@@ -827,10 +1142,17 @@ async function enrichOnChainWinRate(candidates, { heliusKey, cfg, solUsd = 0 }) 
 
   console.log(
     `   ↳ on-chain win rate derived for ${derived}/${candidates.length} wallet(s)` +
+      ` — ${fromCache} from cache (0 RPC), ${topUps} incremental, ${pagesFetched} page(s) fetched` +
       (partial ? `, ${partial} from a truncated history` : '') +
-      (failed ? `, ${failed} with too little closed history` : '')
+      (failed ? `, ${failed} unmeasured` : '')
   );
-  return { derived, failed, partial };
+  if (quotaExhausted) {
+    console.error(`   🔴 [QUOTA] ${quotaExhausted}`);
+    console.error('      Only cached wallets could be served. Rules 4 and 5 treat unmeasured as a');
+    console.error('      failure, so the rest cannot qualify this pass — that is the account limit');
+    console.error('      talking, not their records.');
+  }
+  return { derived, failed, partial, quotaExhausted };
 }
 
 /** Attach derived PnL to each candidate. Mutates in place, like enrichment. */
@@ -867,8 +1189,17 @@ async function enrichRealizedPnl(candidates, { heliusKey, solUsd, cfg }) {
 }
 
 /** Count on-chain signatures as a lifetime-activity proxy for finalists. */
-async function enrichLifetimeTrades(candidates, rpcUrl) {
+async function enrichLifetimeTrades(candidates, rpcUrl, { cache = {}, ttlHours = 24, now = Date.now() } = {}) {
   if (!rpcUrl) return;
+
+  // Cached alongside the replay, because this is the OTHER per-wallet RPC call
+  // in an observe sync — 198 calls a pass. Leaving it uncached would keep a
+  // warm-cache sync expensive no matter how good the history cache is.
+  //
+  // A signature COUNT is cheap to be slightly stale about: it feeds Rule 3's
+  // >=100 floor, and a wallet near that boundary is not one whose qualification
+  // should turn on a few hours of drift.
+  let servedFromCache = 0;
 
   // A failed enrichment leaves lifetimeTrades at the observed buy count, which
   // then fails the >=100 trades rule — so a single transient RPC error silently
@@ -880,7 +1211,25 @@ async function enrichLifetimeTrades(candidates, rpcUrl) {
   // into something you can see in the log. It is affordable now only because
   // the shortlist is capped — retrying 3,444 wallets would not have been.
   let failed = 0;
+  // QUOTA EXHAUSTION IS NOT A RETRYABLE ERROR, and treating it as one is
+  // expensive and silent. Measured: with the Helius plan at its limit, a sync
+  // ground through 198 wallets x 3 retries for 13.5 MINUTES, set no
+  // lifetimeTrades at all, and reported only "N enrichment call(s) failed" —
+  // so the run looked like a code fault rather than an account limit. The
+  // giveaway was HTTP 429 with the body "max usage reached", which no amount
+  // of backoff will clear.
+  let quotaExhausted = null;
   for (const c of candidates) {
+    if (quotaExhausted) { failed++; continue; }
+    const cached = cache[c.address];
+    const ageHours = cached?.sigCountAt ? (now - cached.sigCountAt) / 3_600_000 : Infinity;
+    if (typeof cached?.sigCount === 'number' && ageHours <= ttlHours) {
+      c.lifetimeTrades = cached.sigCount;
+      c.basis += `; lifetime activity = ${cached.sigCount} signatures [cached]`;
+      servedFromCache++;
+      continue;
+    }
+
     let got = null;
     for (let attempt = 0; attempt < 3 && got === null; attempt++) {
       if (attempt) await new Promise((r) => setTimeout(r, 1200 * attempt));
@@ -896,9 +1245,16 @@ async function enrichLifetimeTrades(candidates, rpcUrl) {
           }),
           signal: AbortSignal.timeout(20000),
         });
-        const j = await r.json();
-        if (Array.isArray(j.result)) {
+        const raw = await r.text();
+        let j = null;
+        try { j = JSON.parse(raw); } catch { /* a quota refusal is plain text */ }
+
+        if (Array.isArray(j?.result)) {
           got = j.result.length;
+        } else if (r.status === 429 && /max usage|quota|credit/i.test(raw)) {
+          // A hard plan limit, not a rate limit. Stop the whole pass.
+          quotaExhausted = raw.trim().slice(0, 120);
+          break;
         } else if (r.status === 429 || j?.error?.code === -32429) {
           await new Promise((res) => setTimeout(res, 1500));
         }
@@ -909,11 +1265,27 @@ async function enrichLifetimeTrades(candidates, rpcUrl) {
 
     if (got === null) {
       failed++;
+      // Fall back to a stale count rather than dropping the wallet — Rule 3
+      // reads this, and an absent count fails it.
+      if (typeof cached?.sigCount === 'number') {
+        c.lifetimeTrades = cached.sigCount;
+        c.basis += `; lifetime activity = ${cached.sigCount} signatures [stale cache, refresh failed]`;
+      }
     } else {
       c.lifetimeTrades = got;
       c.basis += `; lifetime activity = ${got} signatures${got === 1000 ? ' (capped)' : ''}`;
+      cache[c.address] = { ...(cache[c.address] ?? {}), sigCount: got, sigCountAt: now };
     }
     await new Promise((r) => setTimeout(r, 150));
+  }
+  if (servedFromCache) {
+    console.log(`   ↳ ${servedFromCache}/${candidates.length} signature count(s) served from cache (0 RPC)`);
+  }
+  if (quotaExhausted) {
+    console.error(`   🔴 [QUOTA] RPC plan limit reached — "${quotaExhausted}"`);
+    console.error(`      ${failed} wallet(s) left unmeasured. Rule 3 reads this, so they cannot qualify this pass.`);
+    console.error('      This is an account limit, not a fault: no retry clears it. Wait for the');
+    console.error('      quota window to reset, or raise the plan. Cached wallets are unaffected.');
   }
 
   if (failed) {
@@ -1065,6 +1437,21 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
 
   const rules = { ...ELITE_RULES, ...(config.eliteWhales ?? {}) };
 
+  // Loaded once per sync, written once at the end.
+  //
+  // NOT loaded on the import path: an import runs no per-candidate enrichment,
+  // so there is nothing to cache and reading a file of per-mint maps to serve
+  // zero lookups is pure cost.
+  //
+  // To be precise about "zero overhead": an import makes no enrichment calls at
+  // all, so its cost does not scale with the size of the leaderboard. It is not
+  // literally zero network — the system-account screen still runs on the FINAL
+  // list (topN at most), and that stays. An imported leaderboard can contain a
+  // Raydium pool authority just as easily as an observed one, and that screen
+  // is the only thing standing between such an address and the watchlist.
+  const onChainCache = importPath ? {} : await loadOnChainCache();
+  const cachedBefore = Object.keys(onChainCache).length;
+
   let candidates = [];
   let source;
   let totalSeen = 0;
@@ -1197,7 +1584,11 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
 
   if (!importPath && shortlist.length) {
     console.log(`   ↳ enriching ${shortlist.length} shortlisted wallet(s) with on-chain activity…`);
-    await enrichLifetimeTrades(shortlist, config.rpcUrl);
+    await enrichLifetimeTrades(shortlist, config.rpcUrl, {
+      cache: onChainCache,
+      ttlHours: rules.historyCacheTtlHours ?? 24,
+      now: Date.now(),
+    });
 
     // Only worth paying for when Rule 2 is actually going to read it. Under
     // profitRule 'skip' the figure is never consulted, and deriving it would
@@ -1275,7 +1666,13 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
             : '') +
           ` (floor ${rules.minAllTimeWinRatePct}% over ${rules.minAllTimeTrades ?? 0}+ trades)…`
       );
-      await enrichOnChainWinRate(replaying, { heliusKey, cfg: config.eliteWhales ?? {}, solUsd });
+      await enrichOnChainWinRate(replaying, {
+        heliusKey,
+        cfg: config.eliteWhales ?? {},
+        solUsd,
+        cache: onChainCache,
+        now: Date.now(),
+      });
     }
   }
 
@@ -1395,6 +1792,16 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     console.log(
       `   ${String(i + 1).padStart(2)}. ${w.address}  ${w.winRatePct.toFixed(0)}% WR · ${money(w.netProfitUsd)} · ${w.lifetimeTrades} trades`
     );
+  }
+
+  // Persisted before any early return, so a sync that qualifies nobody still
+  // banks the RPC work it just paid for. Discarding it there would make the
+  // most common outcome — a strict rule set rejecting everyone — also the one
+  // that never warms the cache.
+  if (!importPath && Object.keys(onChainCache).length) {
+    await saveOnChainCache(pruneOnChainCache(onChainCache, rules));
+    const added = Object.keys(onChainCache).length - cachedBefore;
+    if (added > 0) console.log(`   ↳ on-chain cache: +${added} wallet(s), ${Object.keys(onChainCache).length} total`);
   }
 
   if (reportOnly) return { qualified, evaluated, written: false };

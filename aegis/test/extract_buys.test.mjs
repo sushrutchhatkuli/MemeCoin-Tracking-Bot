@@ -2514,6 +2514,137 @@ test('a net-negative wallet is rejected however often it was right', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * On-chain history disk cache
+ *
+ * Tested offline against the accumulator's own output rather than live, because
+ * the Helius plan hit its limit while this was being built (HTTP 429, "max
+ * usage reached") and a warm/cold comparison cannot be run until it resets.
+ * The property that matters is arithmetic and provable without a network:
+ * an incremental top-up must equal a full replay of the same transactions.
+ * ------------------------------------------------------------------ */
+
+const cacheTx = ({ mint, sig, tokenOut = false, netSol }) => ({
+  type: 'SWAP', signature: sig, transactionError: null,
+  tokenTransfers: [{ mint, tokenAmount: 1, fromUserAccount: tokenOut ? TRADER : 'P', toUserAccount: tokenOut ? 'P' : TRADER }],
+  nativeTransfers: [],
+  accountData: [{ account: TRADER, nativeBalanceChange: netSol * 1e9 }],
+});
+
+test('an incremental top-up equals a full replay of the same transactions', async () => {
+  const { accumulateMintTotals, mergeMintTotals, summariseMintTotals } = await import('../auto_top_whales.mjs');
+  // Newest first, exactly as the endpoint pages them.
+  const newer = [
+    cacheTx({ mint: 'B', sig: 's4', tokenOut: true, netSol: 3.0 }),
+    cacheTx({ mint: 'B', sig: 's3', netSol: -1.0 }),
+  ];
+  const older = [
+    cacheTx({ mint: 'A', sig: 's2', tokenOut: true, netSol: 0.5 }),
+    cacheTx({ mint: 'A', sig: 's1', netSol: -2.0 }),
+  ];
+
+  const full = accumulateMintTotals([...newer, ...older], { address: TRADER });
+  const cached = accumulateMintTotals(older, { address: TRADER });
+  const topUp = accumulateMintTotals(newer, { address: TRADER });
+  const merged = mergeMintTotals(Object.fromEntries(cached.perMint), Object.fromEntries(topUp.perMint));
+
+  assert.deepEqual(merged, Object.fromEntries(full.perMint));
+  const a = summariseMintTotals(merged);
+  const b = summariseMintTotals(Object.fromEntries(full.perMint));
+  assert.deepEqual(a, b);
+  assert.equal(a.trades, 2, 'A lost, B won');
+  assert.equal(a.wins, 1);
+});
+
+test('a late sell closes a position the cache recorded as open', async () => {
+  // The reason the per-mint MAP is cached and not the summary: this changes
+  // both sides of the ratio, and "0 trades" cannot be extended into "1 win".
+  const { accumulateMintTotals, mergeMintTotals, summariseMintTotals } = await import('../auto_top_whales.mjs');
+  const buyOnly = accumulateMintTotals([cacheTx({ mint: 'A', sig: 's1', netSol: -1 })], { address: TRADER });
+  const first = summariseMintTotals(Object.fromEntries(buyOnly.perMint));
+  assert.equal(first.trades, 0);
+  assert.equal(first.winRatePct, null);
+  assert.equal(first.openPositions, 1);
+
+  const sell = accumulateMintTotals([cacheTx({ mint: 'A', sig: 's2', tokenOut: true, netSol: 4 })], { address: TRADER });
+  const after = summariseMintTotals(mergeMintTotals(Object.fromEntries(buyOnly.perMint), Object.fromEntries(sell.perMint)));
+  assert.equal(after.trades, 1);
+  assert.equal(after.wins, 1);
+  assert.equal(after.netSol, 3);
+});
+
+test('cache entries are classified fresh, incremental or miss', async () => {
+  const { classifyCacheEntry, ONCHAIN_CACHE_VERSION } = await import('../auto_top_whales.mjs');
+  const now = Date.now();
+  const base = { version: ONCHAIN_CACHE_VERSION, perMint: {}, newestSignature: 'sig', at: now - 1000, dustSol: 0.05 };
+
+  assert.equal(classifyCacheEntry(base, { now }), 'fresh', 'inside the TTL costs nothing');
+  assert.equal(classifyCacheEntry({ ...base, at: now - 25 * 3600e3 }, { now }), 'incremental');
+  // No anchor signature means nothing to fetch "since", so a full re-read.
+  assert.equal(classifyCacheEntry({ ...base, at: now - 25 * 3600e3, newestSignature: null }, { now }), 'miss');
+  // A different dust floor is a different measurement, not a stale one.
+  assert.equal(classifyCacheEntry(base, { now, dustSol: 0.1 }), 'miss');
+  assert.equal(classifyCacheEntry({ ...base, version: 0 }, { now }), 'miss');
+  assert.equal(classifyCacheEntry(undefined, { now }), 'miss');
+  // A clock that jumped backwards must not make an entry immortal.
+  assert.equal(classifyCacheEntry({ ...base, at: now + 60_000 }, { now }), 'miss');
+});
+
+test('the cache is bounded by age and count, newest kept', async () => {
+  const { pruneOnChainCache } = await import('../auto_top_whales.mjs');
+  const now = Date.now();
+  const cache = {
+    fresh1: { at: now - 1000 },
+    fresh2: { at: now - 2000 },
+    old: { at: now - 40 * 86_400_000 },
+    bySigOnly: { sigCountAt: now - 3000 },
+  };
+  const pruned = pruneOnChainCache(cache, { maxCacheEntries: 500, maxCacheAgeDays: 30 }, now);
+  assert.deepEqual(Object.keys(pruned).sort(), ['bySigOnly', 'fresh1', 'fresh2'], 'the 40-day entry is dropped');
+
+  const capped = pruneOnChainCache(cache, { maxCacheEntries: 2, maxCacheAgeDays: 30 }, now);
+  assert.deepEqual(Object.keys(capped), ['fresh1', 'fresh2'], 'newest kept when capped');
+});
+
+test('the import path skips enrichment entirely and never touches the cache', async () => {
+  // The cache file can hold hundreds of per-mint maps and would serve zero
+  // lookups on an import, so it is not even read there.
+  const { mkdtemp, writeFile: wf, rm, readFile: rf } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join: pjoin } = await import('node:path');
+  const { syncTopWhales, ONCHAIN_CACHE_PATH } = await import('../auto_top_whales.mjs');
+
+  const before = await rf(ONCHAIN_CACHE_PATH, 'utf8').catch(() => null);
+  const dir = await mkdtemp(pjoin(tmpdir(), 'aegis-nocache-'));
+  try {
+    const p = pjoin(dir, 'lb.csv');
+    await wf(p, 'wallet,pnl,winrate,trades\nZZZ1111111111111111111111111111111111111111,50000,0.60,400\n', 'utf8');
+
+    let fetched = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (...a) => { fetched++; return originalFetch(...a); };
+    try {
+      const r = await syncTopWhales({ importPath: p, dryRun: true, reportOnly: true });
+      assert.equal(r.evaluated.length, 1);
+      // NOT zero, and the difference is worth stating. An import skips every
+      // per-candidate enrichment — no signature counts, no history replay — so
+      // its cost does not scale with the size of the leaderboard. What remains
+      // is the system-account screen, which runs on the FINAL list only (topN
+      // at most) and is a safety check rather than enrichment: an imported
+      // leaderboard can contain a Raydium pool authority just as easily as an
+      // observed one, and that is exactly what this catches.
+      assert.ok(fetched <= 4, `expected a bounded screen, saw ${fetched} call(s)`);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    const after = await rf(ONCHAIN_CACHE_PATH, 'utf8').catch(() => null);
+    assert.equal(after, before, 'the cache file must be untouched by an import');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------------------------------------------------ *
  * Leaderboard CSV import
  *
  * Every case here is a header shape that produced a WRONG answer silently:

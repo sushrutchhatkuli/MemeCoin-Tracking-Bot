@@ -1120,6 +1120,9 @@
     ],
     "maxHistoryPages": 12,
     "maxOnChainReplays": 40,
+    "historyCacheTtlHours": 24,
+    "maxCacheEntries": 500,
+    "maxCacheAgeDays": 30,
     "dustTradeSol": 0.05,
     "historyPageDelayMs": 120,
     "_allTimeWinRateNote": [
