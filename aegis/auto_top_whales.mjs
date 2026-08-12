@@ -1711,12 +1711,24 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
   }
 
   // ---- reporting ---------------------------------------------------
-  const failing = { sample: 0, winRate: 0, netProfit: 0, trades: 0 };
+  //
+  // RULES 4 AND 5 ARE COUNTED HERE TOO, and they were not before. The report
+  // walked checks.sample/winRate/netProfit/trades and stopped, so the two rules
+  // that read the on-chain replay never appeared — a sync blocked entirely by
+  // the net-SOL floor printed four healthy pass counts and then "passing all
+  // three: 0", with nothing naming the rule that did it.
+  //
+  // That gap matters at the current floors: minAllTimeNetSol is 200 SOL against
+  // a measured best of +37.5, so Rule 5 IS the binding constraint and the log
+  // has to say so rather than leave a zero to be explained.
+  const failing = { sample: 0, winRate: 0, netProfit: 0, trades: 0, netSol: 0, onChainWinRate: 0 };
   for (const c of evaluated) {
     if (!c.checks.sample) failing.sample++;
     if (!c.checks.winRate) failing.winRate++;
     if (!c.checks.netProfit) failing.netProfit++;
     if (!c.checks.trades) failing.trades++;
+    if (!c.checks.netSol) failing.netSol++;
+    if (!c.checks.onChainWinRate) failing.onChainWinRate++;
   }
 
   console.log('');
@@ -1786,7 +1798,47 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
     }
   }
   console.log(`   Rule 3  trades ≥ ${rules.minLifetimeTrades}         → ${evaluated.length - failing.trades} pass`);
-  console.log(`   passing all three: ${qualified.length} (writing top ${Math.min(qualified.length, rules.topN)})`);
+
+  if (rules.minAllTimeWinRatePct) {
+    console.log(
+      `   Rule 4  on-chain WR ≥ ${rules.minAllTimeWinRatePct}% over ${rules.minAllTimeTrades ?? 0}+ trades → ` +
+        `${evaluated.length - failing.onChainWinRate} pass`
+    );
+  }
+
+  if (rules.minAllTimeNetSol !== null && rules.minAllTimeNetSol !== undefined) {
+    console.log(
+      `   Rule 5  realized net SOL > ${rules.minAllTimeNetSol} → ${evaluated.length - failing.netSol} pass`
+    );
+    // The same diagnostic Rule 2 carries, for the same reason: a floor that
+    // admits nobody should be visibly a FLOOR problem rather than a mystery.
+    // Only wallets whose history was actually replayed are counted — every
+    // other candidate has no onChain figure at all, and folding those in would
+    // report a spread across thousands of wallets when a few dozen were
+    // measured.
+    const nets = evaluated
+      .map((c) => c.onChain?.netSol)
+      .filter((n) => typeof n === 'number' && Number.isFinite(n))
+      .sort((a, b) => b - a);
+    if (nets.length) {
+      const median = nets[Math.floor(nets.length / 2)];
+      console.log(
+        `           realized SOL across ${nets.length} replayed wallet(s): ` +
+          `best ${nets[0].toFixed(1)} · median ${median.toFixed(1)} · worst ${nets[nets.length - 1].toFixed(1)} · ` +
+          `${nets.filter((n) => n > 0).length} positive`
+      );
+      if (nets[0] <= rules.minAllTimeNetSol) {
+        console.log(
+          `           the best wallet is ${nets[0].toFixed(1)} SOL against a ${rules.minAllTimeNetSol} SOL floor — ` +
+            `no floor above ${nets[0].toFixed(1)} can admit anyone from this population`
+        );
+      }
+    } else {
+      console.log('           realized SOL: none derived (no Helius key, quota, or every replay failed)');
+    }
+  }
+
+  console.log(`   passing every rule: ${qualified.length} (writing top ${Math.min(qualified.length, rules.topN)})`);
 
   for (const [i, w] of qualified.slice(0, 10).entries()) {
     console.log(
@@ -1808,9 +1860,12 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
 
   if (!qualified.length) {
     console.log('');
-    console.log('No wallet cleared all three rules — smart_wallets.json left untouched.');
+    console.log('No wallet cleared every rule — smart_wallets.json left untouched.');
     console.log('   The rules are strict by design; an empty elite list is correct when');
     console.log('   nothing has earned a place, and is safer than a padded one.');
+    console.log('   NOTE: "left untouched" means the file keeps its PREVIOUS contents, which');
+    console.log('   were admitted under whatever rules were in force then. Read the _comment');
+    console.log('   header inside it for those, not the config as it stands now.');
     if (!importPath && failing.sample === evaluated.length) {
       const decided = maturity?.decidedTokens ?? 0;
       console.log(`   Every wallet failed the graded-sample floor of ${rules.minGradedBuys}.`);
@@ -1823,12 +1878,44 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
       console.log('   For a list today, import a leaderboard:');
       console.log('     node auto_top_whales.mjs --import <file.csv>');
     } else if (!importPath) {
-      if (rules.profitRule !== 'skip' && failing.netProfit === evaluated.length) {
-        console.log('   Rule 2 rejected every candidate. That is expected in OBSERVE mode:');
-        console.log('   lifetime realized P&L cannot be derived from observation — Aegis sees');
-        console.log('   a wallet\'s buys only on tokens it scanned, and never its exits.');
-        console.log('   Either set eliteWhales.profitRule = "skip" to rank on win rate +');
-        console.log('   lifetime activity, or import a leaderboard that carries real P&L:');
+      // The money rules are reported TOGETHER because at matching floors they
+      // are one bar in two units — minAllTimeNetSol x the SOL price IS
+      // allTimeNetProfitUsd — so blaming either alone describes half a cause.
+      const moneyBlocked =
+        (rules.minAllTimeNetSol !== null &&
+          rules.minAllTimeNetSol !== undefined &&
+          failing.netSol === evaluated.length) ||
+        (rules.profitRule !== 'skip' && failing.netProfit === evaluated.length);
+
+      if (moneyBlocked) {
+        const nets = evaluated
+          .map((c) => c.onChain?.netSol)
+          .filter((n) => typeof n === 'number' && Number.isFinite(n))
+          .sort((a, b) => b - a);
+        console.log('   The REALIZED-PROFIT floor rejected every candidate.');
+        if (nets.length) {
+          // Distinguishes a floor that is merely high from one nothing can
+          // reach. The earlier version of this branch blamed observation for
+          // being unable to derive lifetime P&L, which stopped being true when
+          // Rule 2 moved onto the on-chain replay — it now misdiagnoses a
+          // deliberate threshold as a missing measurement.
+          console.log(
+            `   ${nets.length} wallet(s) WERE replayed successfully, so this is a threshold,`
+          );
+          console.log(
+            `   not a measurement failure: best ${nets[0].toFixed(1)} SOL against a floor of ` +
+              `${rules.minAllTimeNetSol} SOL`
+          );
+          console.log(
+            `   ($${Math.round(rules.minNetProfitUsd).toLocaleString('en-US')} on Rule 2). Nothing observed is within ` +
+              `${nets[0] > 0 ? (rules.minAllTimeNetSol / nets[0]).toFixed(1) : '∞'}x of it.`
+          );
+        } else {
+          console.log('   No wallet history could be replayed at all — check the Helius key and quota');
+          console.log('   before reading this as a verdict on the wallets.');
+        }
+        console.log('   Lower eliteWhales.minAllTimeNetSol / minNetProfitUsd, or import a');
+        console.log('   leaderboard carrying real lifetime P&L (Rule 5 does not apply to imports):');
       } else {
         console.log('   OBSERVE mode needs more graded history. To seed it now,');
       }
