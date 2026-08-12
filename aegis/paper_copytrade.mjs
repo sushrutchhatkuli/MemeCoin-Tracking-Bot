@@ -7,7 +7,11 @@
  *   node paper_copytrade.mjs --scorecard   print the scorecard, change nothing
  *   node paper_copytrade.mjs --target      show the active target and why
  *   node paper_copytrade.mjs --reset       start a fresh book at the configured budget
- *   node paper_copytrade.mjs --watch 60    tick every 60s
+ *   node paper_copytrade.mjs --watch 30    fixed in-place dashboard, redrawn every 30s
+ *   node paper_copytrade.mjs --demo        open one live test position right now
+ *
+ *   --budget <usd> / --starting-balance <usd>   fund a NEW book in dollars,
+ *                                               e.g. --reset --budget 50
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * THIS SPENDS NOTHING AND SIGNS NOTHING.
@@ -104,12 +108,42 @@ export const PAPER_DEFAULTS = {
  * Book state — pure
  * ------------------------------------------------------------------ */
 
-export function createBook({ budgetSol = PAPER_DEFAULTS.budgetSol, target = null, now = Date.now() } = {}) {
+/**
+ * A fresh book.
+ *
+ * `budgetUsd` converts to SOL at the rate given, and BOTH the dollar figure and
+ * the rate used are recorded. Keeping only the resulting SOL would make "I
+ * started with $50" unrecoverable the moment SOL moved, and keeping only the
+ * dollars would leave the book unable to size a trade. The pair is what lets
+ * the dashboard separate a trading result from a SOL price move later.
+ */
+export function createBook({
+  budgetSol = PAPER_DEFAULTS.budgetSol,
+  budgetUsd = null,
+  solUsd = null,
+  target = null,
+  now = Date.now(),
+} = {}) {
+  let startSol = budgetSol;
+  let budgetUsdAtStart = null;
+  let solUsdAtStart = null;
+
+  if (Number.isFinite(budgetUsd) && budgetUsd > 0) {
+    if (!Number.isFinite(solUsd) || solUsd <= 0) {
+      throw new Error('a USD budget needs a SOL/USD rate to convert with');
+    }
+    startSol = budgetUsd / solUsd;
+    budgetUsdAtStart = budgetUsd;
+    solUsdAtStart = solUsd;
+  }
+
   return {
     version: BOOK_VERSION,
     createdAt: now,
-    budgetSol,
-    balanceSol: budgetSol,
+    budgetSol: startSol,
+    balanceSol: startSol,
+    budgetUsdAtStart,
+    solUsdAtStart,
     target: target ? { ...target, since: now } : null,
     positions: {},
     closed: [],
@@ -147,7 +181,7 @@ export function paperConfig(overrides = {}) {
  * "no balance" and "already holding" are ordinary outcomes of a tick and the
  * caller reports them rather than failing.
  */
-export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, now = Date.now(), source = null }) {
+export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, now = Date.now(), source = null, demo = false }) {
   if (!mint) return { ok: false, reason: 'no mint' };
   if (!Number.isFinite(priceUsd) || priceUsd <= 0) return { ok: false, reason: 'no usable price' };
   if (book.positions[mint]) return { ok: false, reason: 'already holding' };
@@ -184,6 +218,9 @@ export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, no
     realisedSol: 0,
     firedRungs: [],
     source,
+    // Tagged so the scorecard can disclose that a number includes trades that
+    // were never mirrored from the target.
+    ...(demo ? { demo: true } : {}),
     lastPricedAt: now,
   };
   return { ok: true, position: book.positions[mint], sizeSol: size };
@@ -281,6 +318,7 @@ export function applyPaperExit(book, mint, { priceUsd, trigger, sellFraction = 1
       reason: trigger,
       label,
       source: p.source,
+      ...(p.demo ? { demo: true } : {}),
     });
     delete book.positions[mint];
   }
@@ -344,26 +382,125 @@ export function paperScorecard(book, cfg = PAPER_DEFAULTS) {
     totalPnlSol: equitySol - budget,
     totalPnlPct: budget > 0 ? ((equitySol - budget) / budget) * 100 : 0,
     target: book?.target ?? null,
+    // Carried through so the renderer can separate a trading result from a SOL
+    // price move. Null unless the book was opened with a USD budget.
+    budgetUsdAtStart: book?.budgetUsdAtStart ?? null,
+    solUsdAtStart: book?.solUsdAtStart ?? null,
+    // Demo trades are counted so the dashboard can say the numbers include
+    // positions that were never mirrored from the target. Without this a demo
+    // silently contaminates the win rate the book exists to report.
+    demoPositions: positions.filter((p) => p.demo === true).length,
+    demoClosed: closed.filter((c) => c.demo === true).length,
   };
 }
 
 const sol = (n) => `${n >= 0 ? '+' : '-'}${Math.abs(n).toFixed(3)}`;
 
-/** Render the scorecard as plain text. PURE. */
-export function renderScorecard(card, { title = 'PAPER COPYTRADE SCORECARD' } = {}) {
+/** USD, with a sign and thousands separators. PURE. */
+export function usd(n, { sign = true } = {}) {
+  if (!Number.isFinite(n)) return '$?';
+  const body = Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (!sign) return `$${body}`;
+  return `${n < 0 ? '-' : '+'}$${body}`;
+}
+
+/**
+ * Live SOL/USD, from the same pair feed the scanner prices everything else on.
+ *
+ * Returns null rather than a guess when it cannot be read. Every USD figure
+ * downstream is derived from this one number, so a fallback constant would
+ * silently mis-state the entire dashboard — a wrong price is worse than a
+ * dashboard that says it could not price itself.
+ */
+export async function fetchSolUsd({ batchFetcher = fetchPairsBatch } = {}) {
+  const SOL_MINT = 'So11111111111111111111111111111111111111112';
+  try {
+    const byAddress = await batchFetcher([SOL_MINT]);
+    const price = Number(byAddress?.get?.(SOL_MINT.toLowerCase())?.priceUsd);
+    return Number.isFinite(price) && price > 0 ? price : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Render the scorecard in USD. PURE.
+ *
+ * ── THE BOOK IS KEPT IN SOL AND CONVERTED ONLY HERE, ON PURPOSE ────────────
+ * Positions are opened, sized and exited in SOL, and the closed-trade history
+ * is SOL. Storing USD instead would freeze each trade at the SOL price of the
+ * moment it happened and make the running total un-recomputable; storing both
+ * would let them drift apart. One source of truth, converted at the edge.
+ *
+ * ── WHICH MEANS "TOTAL PnL" IN USD IS A TRADING RESULT PRICED TODAY ────────
+ * It is `SOL P&L x today's spot`, NOT the dollars that would have landed in an
+ * account. Those differ whenever SOL moved between a trade and now, and on a
+ * memecoin book the trades are days apart. The distinction is reported rather
+ * than smoothed over: when a starting USD budget was set, the drift line shows
+ * how much of the USD change is the SOL price rather than the strategy.
+ */
+export function renderScorecard(card, { title = 'PAPER COPYTRADE SCORECARD', solUsd = null, width = 64 } = {}) {
+  const bar = '═'.repeat(Math.max(8, width));
+  if (!Number.isFinite(solUsd) || solUsd <= 0) {
+    // Never silently fall back to SOL-only under a USD heading, and never
+    // invent a rate. The dashboard says which number it is missing.
+    return [
+      bar,
+      `  ${title}`,
+      bar,
+      '  SOL/USD unavailable — cannot price this book in USD right now.',
+      `  Equity ${card.equitySol.toFixed(3)} SOL · balance ${card.balanceSol.toFixed(3)} SOL · ` +
+        `${card.activePositions} open · ${card.closedPositions} closed`,
+      bar,
+    ].join('\n');
+  }
+
+  const toUsd = (s) => s * solUsd;
+  const pnlUsd = toUsd(card.totalPnlSol);
+  const arrow = card.totalPnlSol > 0 ? '▲' : card.totalPnlSol < 0 ? '▼' : '·';
+
   const lines = [
-    `═══ ${title} ═══`,
-    `  Target        : ${card.target?.label ?? card.target?.address ?? '(none selected)'}`,
-    `  Virtual budget: ${card.budgetSol.toFixed(3)} SOL`,
-    `  Balance (free): ${card.balanceSol.toFixed(3)} SOL`,
-    `  Open positions: ${card.activePositions}  (marked at ${card.openValueSol.toFixed(3)} SOL)`,
-    `  Equity        : ${card.equitySol.toFixed(3)} SOL`,
-    `  Closed trades : ${card.closedPositions}  (${card.wins}W / ${card.losses}L)`,
-    `  Win rate      : ${card.winRatePct === null ? 'n/a — nothing closed yet' : `${card.winRatePct.toFixed(1)}%`}`,
-    `  Realised PnL  : ${sol(card.realisedPnlSol)} SOL`,
-    `  TOTAL PnL     : ${sol(card.totalPnlSol)} SOL  (${card.totalPnlPct >= 0 ? '+' : ''}${card.totalPnlPct.toFixed(1)}%)`,
-    '  Virtual SOL only — nothing here was bought, sold or signed.',
+    bar,
+    `  ${title}`,
+    bar,
+    `  Target         ${card.target?.label ?? card.target?.address?.slice(0, 20) ?? '(none selected)'}`,
+    `  SOL spot       ${usd(solUsd, { sign: false })}`,
+    '',
+    `  Virtual budget ${usd(toUsd(card.budgetSol), { sign: false }).padStart(14)}   (${card.budgetSol.toFixed(3)} SOL)`,
+    `  Balance free   ${usd(toUsd(card.balanceSol), { sign: false }).padStart(14)}   (${card.balanceSol.toFixed(3)} SOL)`,
+    `  Open positions ${String(card.activePositions).padStart(14)}   marked ${usd(toUsd(card.openValueSol), { sign: false })}`,
+    `  Equity         ${usd(toUsd(card.equitySol), { sign: false }).padStart(14)}   (${card.equitySol.toFixed(3)} SOL)`,
+    '',
+    `  Closed trades  ${String(card.closedPositions).padStart(14)}   ${card.wins}W / ${card.losses}L`,
+    `  Win rate       ${(card.winRatePct === null ? 'n/a' : `${card.winRatePct.toFixed(1)}%`).padStart(14)}   ${
+      card.winRatePct === null ? 'nothing closed yet' : 'of closed positions only'
+    }`,
+    `  Realised PnL   ${usd(toUsd(card.realisedPnlSol)).padStart(14)}   (${sol(card.realisedPnlSol)} SOL)`,
+    `  TOTAL PnL   ${arrow}  ${usd(pnlUsd).padStart(14)}   ${card.totalPnlPct >= 0 ? '+' : ''}${card.totalPnlPct.toFixed(2)}%`,
   ];
+
+  // Only when a USD starting balance was actually set. Computing it against a
+  // budget that was always denominated in SOL would invent a comparison the
+  // operator never asked for.
+  if (Number.isFinite(card.budgetUsdAtStart) && Number.isFinite(card.solUsdAtStart) && card.solUsdAtStart > 0) {
+    const equityUsdNow = toUsd(card.equitySol);
+    const vsStart = equityUsdNow - card.budgetUsdAtStart;
+    const solDrift = card.budgetSol * (solUsd - card.solUsdAtStart);
+    lines.push(
+      '',
+      `  vs start USD   ${usd(vsStart).padStart(14)}   started ${usd(card.budgetUsdAtStart, { sign: false })} @ ${usd(card.solUsdAtStart, { sign: false })}/SOL`,
+      `    of which SOL price movement: ${usd(solDrift)} — not the strategy`
+    );
+  }
+
+  if (card.demoPositions || card.demoClosed) {
+    lines.push(
+      '',
+      `  ⚠ includes ${card.demoPositions} open and ${card.demoClosed} closed DEMO trade(s) — not mirrored from the target.`
+    );
+  }
+
+  lines.push(bar, '  Virtual only — nothing here was bought, sold or signed.');
   return lines.join('\n');
 }
 
@@ -572,9 +709,115 @@ export async function runPaperTick({
   return report;
 }
 
+/**
+ * Pick a live, liquid Solana token for a demo entry.
+ *
+ * A REAL token is used rather than a synthetic one precisely because the point
+ * of --demo is to watch the mark move: a fabricated position would sit at its
+ * entry forever and demonstrate nothing about whether pricing, marking and
+ * exits actually work.
+ *
+ * Deepest liquidity wins, so the demo lands on something that prices reliably
+ * every tick rather than a dead pair that would exercise the stale path.
+ */
+/**
+ * Never demo on these. Excluded BY MINT, never by symbol.
+ *
+ * MEASURED 2026-08-12, and the reason this list exists: picking the deepest
+ * search result returned mint GqR98CsEbPtV… displaying the symbol "SOL", priced
+ * at $85.48 with $1.79bn of liquidity, while real WSOL/USDC on Orca was $76.22.
+ * The dashboard then showed a "SOL" position beside a "SOL spot" that disagreed
+ * by 12% — two different assets wearing one ticker.
+ *
+ * Solana's ticker namespace is unrestricted, which socialTracer's note already
+ * spells out at length: it matches trending coins on contract address rather
+ * than symbol precisely so a token named PENGU cannot impersonate PENGU. A
+ * symbol-based exclusion here would have been the same mistake, and would not
+ * have caught this one — the impostor's symbol was legitimate-looking.
+ */
+export const DEMO_EXCLUDED_MINTS = new Set([
+  'So11111111111111111111111111111111111111112', // WSOL
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+].map((m) => m.toLowerCase()));
+
+/**
+ * Pick a live token for a demo entry, FROM THE OBSERVATION LEDGER.
+ *
+ * ── WHY NOT A DEXSCREENER NAME SEARCH, WHICH IS THE OBVIOUS IMPLEMENTATION ──
+ * Because it does not return what it appears to. MEASURED 2026-08-12, the
+ * deepest ten results for `q=solana` inside any sane liquidity band were TEN
+ * DIFFERENT MINTS ALL SYMBOLED "SOL", priced at $84.54, $143.20, $126.10,
+ * $136.47 and $138.03 — while real WSOL/USDC sat at $76.22. A name search
+ * returns tokens NAMED after the query, which on Solana means ticker squatters,
+ * and the first version of this function put one of them in the book beside a
+ * "SOL spot" line that disagreed with it by 12%.
+ *
+ * The ledger has none of that problem and is the better source anyway: it is
+ * exactly the universe this book mirrors, it is local, and a demo drawn from it
+ * exercises the real path — the same mints, priced through the same
+ * fetchPrices, marked and exited by the same rules. DEMO_EXCLUDED_MINTS still
+ * applies as a backstop, by mint and never by symbol.
+ *
+ * Most recently seen first, because a fresh token is the one most likely to
+ * still price and to move while being watched.
+ */
+export function demoCandidateMints(observations, { book = null, limit = 40 } = {}) {
+  const held = new Set(Object.keys(book?.positions ?? {}));
+  const seen = new Set();
+  const rows = [];
+
+  for (const entry of Object.values(observations?.wallets ?? {})) {
+    for (const b of entry?.buys ?? []) {
+      if (!b?.token || typeof b.ts !== 'number') continue;
+      if (seen.has(b.token) || held.has(b.token)) continue;
+      if (DEMO_EXCLUDED_MINTS.has(String(b.token).toLowerCase())) continue;
+      seen.add(b.token);
+      rows.push({ mint: b.token, symbol: b.symbol ?? null, ts: b.ts });
+    }
+  }
+  return rows.sort((a, b) => b.ts - a.ts).slice(0, limit);
+}
+
+export async function pickDemoToken({ observations = null, book = null, priceFetcher = fetchPrices, limit = 40 } = {}) {
+  const candidates = demoCandidateMints(observations, { book, limit });
+  if (!candidates.length) return null;
+
+  try {
+    const prices = await priceFetcher(candidates.map((c) => c.mint));
+    for (const c of candidates) {
+      const price = prices?.get?.(c.mint);
+      if (Number.isFinite(price) && price > 0) {
+        return { mint: c.mint, symbol: c.symbol, priceUsd: price, observedAt: c.ts };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * CLI
  * ------------------------------------------------------------------ */
+
+/**
+ * Parse a numeric CLI flag. PURE.
+ *
+ * Rejects a missing or non-numeric value rather than falling back to a default:
+ * `--budget` with a typo'd value would otherwise silently open a book at 10 SOL
+ * when the operator asked for $50, and the difference is invisible afterwards.
+ */
+export function numericFlag(argv, name) {
+  const i = argv.indexOf(name);
+  if (i === -1) return { present: false, value: null };
+  const raw = argv[i + 1];
+  const value = Number(String(raw ?? '').replace(/[$,]/g, ''));
+  if (!Number.isFinite(value) || value <= 0) {
+    return { present: true, value: null, error: `${name} needs a positive number, got ${raw ?? '(nothing)'}` };
+  }
+  return { present: true, value };
+}
 
 async function loadJson(path, fallback = null) {
   try {
@@ -584,25 +827,91 @@ async function loadJson(path, fallback = null) {
   }
 }
 
+/** Open-position table for the dashboard. PURE. */
+export function renderPositions(book, solUsd) {
+  const positions = Object.values(book?.positions ?? {});
+  if (!positions.length) return '  (no open positions)';
+
+  const rows = positions
+    .sort((a, b) => (b.stakeSol ?? 0) - (a.stakeSol ?? 0))
+    .map((p) => {
+      const gain = p.entryPriceUsd > 0 ? (p.markPriceUsd / p.entryPriceUsd - 1) * 100 : 0;
+      const valueSol = p.stakeSol * (p.entryPriceUsd > 0 ? p.markPriceUsd / p.entryPriceUsd : 1);
+      const mark = Number.isFinite(solUsd) && solUsd > 0 ? usd(valueSol * solUsd, { sign: false }) : `${valueSol.toFixed(3)} SOL`;
+      const tp = p.firedRungs?.length ? ` ${p.firedRungs.join(',')}` : '';
+      return (
+        `  ${(p.symbol ?? p.mint.slice(0, 8)).padEnd(12).slice(0, 12)}` +
+        `${mark.padStart(12)}` +
+        `${`${gain >= 0 ? '+' : ''}${gain.toFixed(1)}%`.padStart(10)}` +
+        `${p.demo ? '  [DEMO]' : ''}${tp}`
+      );
+    });
+  return ['  POSITION         VALUE     CHANGE', ...rows].join('\n');
+}
+
 export async function main(argv = []) {
   const config = await loadJson(join(HERE, 'config.json'), {});
   const cfg = paperConfig(config.paperCopytrade ?? {});
   const watchlist = await loadJson(join(HERE, config.smartMoney?.watchlistFile ?? 'smart_wallets.json'), { wallets: [] });
 
+  // --budget and --starting-balance are the same thing; both names are accepted
+  // because both were asked for and silently honouring one would be worse than
+  // accepting two.
+  const budgetFlag = numericFlag(argv, '--budget');
+  const startFlag = numericFlag(argv, '--starting-balance');
+  for (const f of [budgetFlag, startFlag]) {
+    if (f.error) {
+      console.error(`Error: ${f.error}`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+  const budgetUsd = budgetFlag.value ?? startFlag.value ?? null;
+
+  // Fetched once up front: every USD figure on the dashboard derives from it,
+  // and a book opened with a USD budget cannot be sized without it.
+  const solUsd = await fetchSolUsd();
+  if (budgetUsd !== null && !solUsd) {
+    console.error('Error: a USD budget needs a live SOL/USD rate, and it could not be fetched.');
+    process.exitCode = 1;
+    return;
+  }
+
+  const freshBook = () =>
+    budgetUsd !== null
+      ? createBook({ budgetUsd, solUsd })
+      : createBook({ budgetSol: cfg.budgetSol, ...(solUsd ? { budgetUsd: null } : {}) });
+
   if (argv.includes('--reset')) {
-    const fresh = createBook({ budgetSol: cfg.budgetSol });
+    const fresh = freshBook();
     const resolved = resolveTarget(watchlist, null);
     fresh.target = resolved.target ? { ...resolved.target, since: Date.now() } : null;
     await saveBook(fresh);
-    console.log(`Fresh paper book at ${cfg.budgetSol.toFixed(3)} virtual SOL.`);
-    console.log(renderScorecard(paperScorecard(fresh, cfg)));
+    console.log(
+      budgetUsd !== null
+        ? `Fresh paper book at ${usd(budgetUsd, { sign: false })} (${fresh.budgetSol.toFixed(3)} SOL @ ${usd(solUsd, { sign: false })}/SOL).`
+        : `Fresh paper book at ${fresh.budgetSol.toFixed(3)} virtual SOL.`
+    );
+    console.log(renderScorecard(paperScorecard(fresh, cfg), { solUsd }));
     return;
   }
 
   let book = await loadBook();
   if (!book) {
-    book = createBook({ budgetSol: cfg.budgetSol });
-    console.log(`No paper book found — starting one at ${cfg.budgetSol.toFixed(3)} virtual SOL.`);
+    book = freshBook();
+    console.log(
+      budgetUsd !== null
+        ? `No paper book found — starting one at ${usd(budgetUsd, { sign: false })}.`
+        : `No paper book found — starting one at ${book.budgetSol.toFixed(3)} virtual SOL.`
+    );
+  } else if (budgetUsd !== null) {
+    // An existing book is NOT silently re-funded. Changing the budget under a
+    // running book would rewrite the denominator of every percentage already
+    // reported, so the operator is told how to do it deliberately.
+    console.log(
+      `Note: a book already exists (${book.budgetSol.toFixed(3)} SOL). ` +
+        `--budget only applies to a new book — add --reset to start over at ${usd(budgetUsd, { sign: false })}.`
+    );
   }
 
   if (argv.includes('--target')) {
@@ -613,33 +922,92 @@ export async function main(argv = []) {
     return;
   }
 
+  if (argv.includes('--demo')) {
+    const demoObservations = await loadObservations(join(HERE, '.state', 'wallet_observations.json'));
+    const token = await pickDemoToken({ observations: demoObservations, book });
+    if (!token) {
+      console.error(
+        'No demo token available — the observation ledger has no recently-seen mint that still prices.\n' +
+          'Run a scan first so the ledger has something in it.'
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const res = openPaperPosition(book, {
+      mint: token.mint,
+      symbol: token.symbol,
+      priceUsd: token.priceUsd,
+      cfg,
+      now: Date.now(),
+      source: 'demo',
+      demo: true,
+    });
+    if (!res.ok) {
+      console.error(`Demo trade declined: ${res.reason}`);
+      process.exitCode = 1;
+      return;
+    }
+    await saveBook(book);
+    console.log(
+      `DEMO PAPER BUY ${token.symbol ?? token.mint.slice(0, 8)} — ` +
+        `${res.sizeSol.toFixed(3)} SOL${solUsd ? ` (${usd(res.sizeSol * solUsd, { sign: false })})` : ''} @ $${token.priceUsd.toPrecision(4)}`
+    );
+    console.log('This position is TAGGED as a demo and is not mirrored from the target.');
+    console.log('It obeys the same exit rules; --reset clears it.\n');
+  }
+
   if (argv.includes('--scorecard')) {
-    console.log(renderScorecard(paperScorecard(book, cfg)));
+    console.log(renderScorecard(paperScorecard(book, cfg), { solUsd }));
+    console.log(renderPositions(book, solUsd));
     return;
   }
 
   const watchIndex = argv.indexOf('--watch');
   const intervalSec = watchIndex !== -1 ? Number(argv[watchIndex + 1]) || 60 : null;
+  // A cleared screen is only a dashboard on a terminal. Piped to a file or
+  // through a pager, console.clear() emits escape codes into the output and
+  // destroys exactly the scrollback someone redirecting to a log wanted.
+  const canClear = Boolean(intervalSec) && process.stdout.isTTY;
+
+  const recent = [];
 
   const tick = async () => {
     const observations = await loadObservations(join(HERE, '.state', 'wallet_observations.json'));
     const report = await runPaperTick({ book, observations, watchlist, cfg });
     await saveBook(book);
 
+    // Re-priced every tick so the dashboard tracks SOL, not just the tokens.
+    const spot = (await fetchSolUsd()) ?? solUsd;
+
     const stamp = new Date().toISOString().slice(11, 19);
-    for (const o of report.opened) console.log(`[${stamp}] PAPER BUY  ${o.symbol ?? o.mint.slice(0, 8)} — ${o.sizeSol.toFixed(3)} SOL`);
+    for (const o of report.opened) {
+      recent.push(`[${stamp}] BUY  ${o.symbol ?? o.mint.slice(0, 8)} — ${o.sizeSol.toFixed(3)} SOL`);
+    }
     for (const e of report.exits) {
-      console.log(`[${stamp}] PAPER SELL ${e.symbol ?? e.mint.slice(0, 8)} — ${e.label ?? e.trigger}${Number.isFinite(e.gainPct) ? ` (${e.gainPct >= 0 ? '+' : ''}${e.gainPct.toFixed(0)}%)` : ''}`);
+      recent.push(
+        `[${stamp}] SELL ${e.symbol ?? e.mint.slice(0, 8)} — ${e.label ?? e.trigger}` +
+          `${Number.isFinite(e.gainPct) ? ` (${e.gainPct >= 0 ? '+' : ''}${e.gainPct.toFixed(0)}%)` : ''}`
+      );
     }
-    if (!report.opened.length && !report.exits.length) {
-      console.log(`[${stamp}] no paper action — ${report.marked} position(s) marked, target ${book.target?.address?.slice(0, 8) ?? 'none'}…`);
+    // Bounded, because the dashboard is fixed-height by design — an unbounded
+    // activity log would push the numbers off the screen, which is the exact
+    // scrolling this mode exists to stop.
+    while (recent.length > 6) recent.shift();
+
+    if (canClear) console.clear();
+    console.log(renderScorecard(paperScorecard(book, cfg), { solUsd: spot }));
+    console.log(renderPositions(book, spot));
+    if (recent.length) {
+      console.log('\n  RECENT ACTIVITY');
+      for (const line of recent) console.log(`  ${line}`);
     }
-    console.log(renderScorecard(paperScorecard(book, cfg)));
+    if (intervalSec) {
+      console.log(`\n  updated ${stamp} · every ${intervalSec}s · Ctrl+C to stop`);
+    }
   };
 
   await tick();
   if (intervalSec) {
-    console.log(`\nWatching every ${intervalSec}s. Ctrl+C to stop.`);
     // eslint-disable-next-line no-constant-condition
     while (true) {
       await new Promise((r) => setTimeout(r, intervalSec * 1000));

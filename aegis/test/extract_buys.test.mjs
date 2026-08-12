@@ -6695,3 +6695,229 @@ test('the proposal message labels lifetime figures as lifetime', async () => {
     assert.match(m, /not a prediction/);
   }
 });
+
+/* ------------------------------------------------------------------ *
+ * USD dashboard
+ * ------------------------------------------------------------------ */
+
+test('a USD budget converts to SOL and records the rate it used', async () => {
+  const { createBook, paperScorecard, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({});
+
+  const book = createBook({ budgetUsd: 50, solUsd: 100 });
+  assert.equal(book.budgetSol, 0.5);
+  assert.equal(book.balanceSol, 0.5);
+  // BOTH the dollars and the rate are kept. Only the SOL would make "I started
+  // with $50" unrecoverable the moment SOL moved; only the dollars would leave
+  // the book unable to size a trade.
+  assert.equal(book.budgetUsdAtStart, 50);
+  assert.equal(book.solUsdAtStart, 100);
+
+  const card = paperScorecard(book, cfg);
+  assert.equal(card.budgetUsdAtStart, 50);
+  assert.equal(card.solUsdAtStart, 100);
+
+  // A USD budget without a rate is refused rather than guessed at.
+  assert.throws(() => createBook({ budgetUsd: 50 }), /needs a SOL\/USD rate/);
+  assert.throws(() => createBook({ budgetUsd: 50, solUsd: 0 }), /needs a SOL\/USD rate/);
+
+  // A SOL-denominated book carries no USD origin at all.
+  const solBook = createBook({ budgetSol: 10 });
+  assert.equal(solBook.budgetUsdAtStart, null);
+});
+
+test('the scorecard renders USD and separates SOL drift from strategy', async () => {
+  const { createBook, openPaperPosition, applyPaperExit, paperScorecard, renderScorecard, paperConfig } =
+    await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ perTradeSol: 0.1, slippagePct: 0, feeSol: 0 });
+
+  const book = createBook({ budgetUsd: 50, solUsd: 100 });
+  openPaperPosition(book, { mint: 'M', priceUsd: 1, cfg, now: 0 });
+  applyPaperExit(book, 'M', { priceUsd: 2, trigger: 'TP1', sellFraction: 1, cfg, now: 1 });
+  // +0.1 SOL realised on a 0.5 SOL book.
+
+  const card = paperScorecard(book, cfg);
+  const out = renderScorecard(card, { solUsd: 100 });
+  assert.match(out, /\$50\.00/, 'budget shown in dollars');
+  assert.match(out, /\+\$10\.00/, '0.1 SOL at $100 is $10');
+  assert.match(out, /SOL spot/);
+
+  // SOL DOUBLES: the strategy result is unchanged in SOL but doubles in USD,
+  // and the drift line must attribute that to the SOL price, not the trading.
+  const drifted = renderScorecard(card, { solUsd: 200 });
+  assert.match(drifted, /vs start USD/);
+  assert.match(drifted, /SOL price movement/);
+  assert.match(drifted, /not the strategy/);
+
+  // A SOL-only book shows no drift line — there is no starting dollar figure
+  // to compare against, and inventing one would answer a question nobody asked.
+  const solOnly = renderScorecard(paperScorecard(createBook({ budgetSol: 10 }), cfg), { solUsd: 100 });
+  assert.ok(!/vs start USD/.test(solOnly));
+});
+
+test('the dashboard refuses to invent a SOL price', async () => {
+  const { createBook, paperScorecard, renderScorecard, paperConfig } = await import('../paper_copytrade.mjs');
+  const card = paperScorecard(createBook({ budgetSol: 10 }), paperConfig({}));
+
+  // Every USD figure derives from this one number, so a fallback constant would
+  // silently mis-state the whole dashboard. It says so instead.
+  for (const bad of [null, undefined, 0, -5, NaN]) {
+    const out = renderScorecard(card, { solUsd: bad });
+    assert.match(out, /SOL\/USD unavailable/);
+    assert.ok(!/\$\d/.test(out.replace(/SOL\/USD/g, '')), `must not print dollars for solUsd=${bad}`);
+  }
+});
+
+test('fetchSolUsd reads the WSOL pair and returns null when it cannot', async () => {
+  const { fetchSolUsd } = await import('../paper_copytrade.mjs');
+  const WSOL = 'so11111111111111111111111111111111111111112';
+
+  assert.equal(
+    await fetchSolUsd({ batchFetcher: async () => new Map([[WSOL, { priceUsd: '176.25' }]]) }),
+    176.25
+  );
+  // Unpriceable, absent, malformed and thrown all degrade to null — never to a
+  // number the dashboard would then present as fact.
+  assert.equal(await fetchSolUsd({ batchFetcher: async () => new Map([[WSOL, { priceUsd: '0' }]]) }), null);
+  assert.equal(await fetchSolUsd({ batchFetcher: async () => new Map() }), null);
+  assert.equal(await fetchSolUsd({ batchFetcher: async () => null }), null);
+  assert.equal(await fetchSolUsd({ batchFetcher: async () => { throw new Error('net'); } }), null);
+});
+
+test('usd() formats sign and thousands, and refuses non-numbers', async () => {
+  const { usd } = await import('../paper_copytrade.mjs');
+  assert.equal(usd(1234.5), '+$1,234.50');
+  assert.equal(usd(-1234.5), '-$1,234.50');
+  assert.equal(usd(1234.5, { sign: false }), '$1,234.50');
+  assert.equal(usd(0), '+$0.00');
+  assert.equal(usd(NaN), '$?');
+  assert.equal(usd(null), '$?');
+});
+
+test('numericFlag parses money-ish input and rejects typos', async () => {
+  const { numericFlag } = await import('../paper_copytrade.mjs');
+  assert.deepEqual(numericFlag(['--budget', '50'], '--budget'), { present: true, value: 50 });
+  // A pasted "$1,500" is what someone actually types.
+  assert.equal(numericFlag(['--budget', '$1,500'], '--budget').value, 1500);
+  assert.deepEqual(numericFlag([], '--budget'), { present: false, value: null });
+
+  // A TYPO MUST NOT FALL BACK TO A DEFAULT. Silently opening a 10 SOL book when
+  // $50 was asked for is invisible afterwards.
+  for (const bad of ['abc', '', '-5', '0', undefined]) {
+    const r = numericFlag(['--budget', bad], '--budget');
+    assert.equal(r.value, null, `must reject ${String(bad)}`);
+    assert.match(r.error, /positive number/);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * Demo trade
+ * ------------------------------------------------------------------ */
+
+test('a demo position is tagged and disclosed in the scorecard', async () => {
+  const { createBook, openPaperPosition, applyPaperExit, paperScorecard, renderScorecard, paperConfig } =
+    await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const book = createBook({ budgetSol: 10 });
+
+  openPaperPosition(book, { mint: 'D', symbol: 'DEMO', priceUsd: 1, cfg, now: 0, demo: true });
+  openPaperPosition(book, { mint: 'R', symbol: 'REAL', priceUsd: 1, cfg, now: 0 });
+  assert.equal(book.positions.D.demo, true);
+  assert.equal(book.positions.R.demo, undefined);
+
+  const card = paperScorecard(book, cfg);
+  assert.equal(card.demoPositions, 1);
+  // A demo silently contaminating the win rate is the whole hazard, so the
+  // dashboard says the numbers include one.
+  assert.match(renderScorecard(card, { solUsd: 100 }), /includes 1 open and 0 closed DEMO/);
+
+  // The tag survives the close, so a closed demo keeps being disclosed.
+  applyPaperExit(book, 'D', { priceUsd: 2, trigger: 'TP1', sellFraction: 1, cfg, now: 1 });
+  const after = paperScorecard(book, cfg);
+  assert.equal(after.demoClosed, 1);
+  assert.equal(after.demoPositions, 0);
+  assert.match(renderScorecard(after, { solUsd: 100 }), /0 open and 1 closed DEMO/);
+});
+
+test('demo candidates come from the ledger, newest first, minus held and excluded', async () => {
+  const { demoCandidateMints, createBook } = await import('../paper_copytrade.mjs');
+  const book = createBook({ budgetSol: 10 });
+  book.positions.HELD = { mint: 'HELD' };
+
+  const observations = {
+    wallets: {
+      A: {
+        buys: [
+          { token: 'OLD', symbol: 'O', ts: 100 },
+          { token: 'NEW', symbol: 'N', ts: 900 },
+          { token: 'HELD', symbol: 'H', ts: 950 },
+          // Excluded BY MINT. Never by symbol — Solana's ticker namespace is
+          // unrestricted, so a symbol check catches nothing that matters.
+          { token: 'So11111111111111111111111111111111111111112', symbol: 'SOL', ts: 999 },
+        ],
+      },
+      B: { buys: [{ token: 'MID', symbol: 'M', ts: 500 }, { token: 'NEW', symbol: 'N', ts: 400 }] },
+    },
+  };
+
+  const out = demoCandidateMints(observations, { book });
+  assert.deepEqual(out.map((c) => c.mint), ['NEW', 'MID', 'OLD'], 'newest first, deduped');
+  assert.deepEqual(demoCandidateMints({ wallets: {} }, { book }), []);
+  assert.deepEqual(demoCandidateMints(null), []);
+});
+
+test('pickDemoToken returns the newest ledger mint that still prices', async () => {
+  const { pickDemoToken } = await import('../paper_copytrade.mjs');
+  const observations = {
+    wallets: {
+      A: {
+        buys: [
+          { token: 'DEAD', symbol: 'D', ts: 900 },
+          { token: 'LIVE', symbol: 'L', ts: 800 },
+        ],
+      },
+    },
+  };
+
+  // DEAD is newer but no longer prices, so the demo falls through to LIVE
+  // rather than opening a position at no price.
+  const token = await pickDemoToken({
+    observations,
+    priceFetcher: async () => new Map([['LIVE', 0.0004]]),
+  });
+  assert.equal(token.mint, 'LIVE');
+  assert.equal(token.priceUsd, 0.0004);
+
+  // Nothing prices, an empty ledger, and a thrown fetch all return null rather
+  // than throwing into the CLI.
+  assert.equal(await pickDemoToken({ observations, priceFetcher: async () => new Map() }), null);
+  assert.equal(await pickDemoToken({ observations: { wallets: {} } }), null);
+  assert.equal(
+    await pickDemoToken({ observations, priceFetcher: async () => { throw new Error('net'); } }),
+    null
+  );
+});
+
+test('the positions table renders USD values and flags demo rows', async () => {
+  const { createBook, openPaperPosition, markPosition, renderPositions, paperConfig } =
+    await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const book = createBook({ budgetSol: 10 });
+
+  assert.match(renderPositions(book, 100), /no open positions/);
+
+  openPaperPosition(book, { mint: 'M', symbol: 'AAA', priceUsd: 1, cfg, now: 0 });
+  openPaperPosition(book, { mint: 'D', symbol: 'BBB', priceUsd: 1, cfg, now: 0, demo: true });
+  markPosition(book.positions.M, 2, 1);
+
+  const out = renderPositions(book, 100);
+  assert.match(out, /AAA/);
+  // 1 SOL doubled, priced at $100/SOL.
+  assert.match(out, /\$200\.00/);
+  assert.match(out, /\+100\.0%/);
+  assert.match(out, /\[DEMO\]/);
+
+  // Without a SOL price it falls back to SOL rather than printing a wrong
+  // dollar figure.
+  assert.match(renderPositions(book, null), /SOL/);
+});
