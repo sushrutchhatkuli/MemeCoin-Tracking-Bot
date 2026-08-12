@@ -2646,6 +2646,121 @@ test('the ranking profit figure prefers realized over estimated', async () => {
   assert.equal(rankingProfitUsd(undefined), null);
 });
 
+test('auto-import resolves by precedence and refuses a mis-shaped file', async () => {
+  const { resolveImportSource } = await import('../auto_top_whales.mjs');
+  const on = { eliteWhales: { autoImport: { enabled: true, path: '../leaderboard.csv', requireColumns: ['address', 'wallet'] } } };
+  const good = async () => 'address,realized_profit,win_rate,txs_30d\nAbc,1,2,3\n';
+
+  // Explicit --import beats everything, including a forced observe.
+  assert.equal((await resolveImportSource(on, { explicitPath: 'x.csv', forceObserve: true })).path, 'x.csv');
+  // --observe beats the config.
+  assert.equal((await resolveImportSource(on, { forceObserve: true, readFileImpl: good })).path, null);
+  // Disabled config does nothing.
+  assert.equal((await resolveImportSource({ eliteWhales: { autoImport: { enabled: false } } }, { readFileImpl: good })).path, null);
+
+  // Enabled + present + valid header -> import.
+  const hit = await resolveImportSource(on, { readFileImpl: good });
+  assert.ok(hit.path && hit.path.endsWith('leaderboard.csv'));
+
+  // A MISSING FILE MUST NOT BREAK THE PASS — it falls back to observe, so a
+  // deleted CSV does not take the watchlist down with it.
+  const missing = await resolveImportSource(on, {
+    readFileImpl: async () => { throw new Error('ENOENT'); },
+  });
+  assert.equal(missing.path, null);
+  assert.match(missing.reason, /not found/);
+
+  // A file with no address column is REFUSED rather than imported to zero
+  // rows. Zero rows on the import path is indistinguishable from an empty
+  // leaderboard, and would silently freeze the watchlist.
+  const bad = await resolveImportSource(on, {
+    readFileImpl: async () => 'foo,bar,baz\n1,2,3\n',
+  });
+  assert.equal(bad.path, null);
+  assert.match(bad.warn, /no recognised address column/);
+});
+
+test('imported rows rank by realized profit, then win rate, then trades', async () => {
+  const { applyEliteRules } = await import('../auto_top_whales.mjs');
+  const rules = {
+    minWinRatePct: 40, minGradedBuys: 0, minLifetimeTrades: 100, minNetProfitUsd: 100,
+    profitRule: 'enforce', minAllTimeWinRatePct: 40, minAllTimeTrades: 50,
+    minAllTimeNetSol: 1, topN: 50,
+  };
+  const row = (address, netProfitUsd, winRatePct, lifetimeTrades) => ({
+    address, netProfitUsd, winRatePct, lifetimeTrades, providerMetrics: true,
+    source: 'imported-leaderboard', basis: 'imported',
+  });
+
+  // The real leaderboard.csv contents.
+  const { qualified } = applyEliteRules(
+    [
+      row('BEvw', 13500, 50.0, 132),
+      row('Gsuc', 17200, 43.24, 405),
+      row('Ar2Y', 1_500_000, 61.84, 12237),
+      row('DZbg', 25000, 46.0, 179),
+    ],
+    rules
+  );
+  assert.deepEqual(qualified.map((c) => c.address), ['Ar2Y', 'DZbg', 'Gsuc', 'BEvw']);
+
+  // Rules 4 and 5 are WAIVED for provider rows — none of these has any onChain
+  // data, and under the observe path that is an automatic failure.
+  assert.ok(qualified.every((c) => c.checks.netSol && c.checks.onChainWinRate));
+
+  // Win rate breaks a profit tie; trades break a win-rate tie. This is the
+  // ordering that used to depend on NaN being falsy.
+  const tie = applyEliteRules(
+    [row('lowWr', 5000, 45, 900), row('highWr', 5000, 80, 100)],
+    rules
+  );
+  assert.deepEqual(tie.qualified.map((c) => c.address), ['highWr', 'lowWr']);
+
+  const tie2 = applyEliteRules(
+    [row('fewTrades', 5000, 50, 120), row('manyTrades', 5000, 50, 9000)],
+    rules
+  );
+  assert.deepEqual(tie2.qualified.map((c) => c.address), ['manyTrades', 'fewTrades']);
+});
+
+test('#1 follows the data, not the wallet — ranking is not pinned', async () => {
+  const { applyEliteRules } = await import('../auto_top_whales.mjs');
+  const rules = {
+    minWinRatePct: 40, minGradedBuys: 0, minLifetimeTrades: 100, minNetProfitUsd: 100,
+    profitRule: 'enforce', minAllTimeWinRatePct: 40, minAllTimeTrades: 50,
+    minAllTimeNetSol: 1, topN: 50,
+  };
+  const row = (address, netProfitUsd, winRatePct, lifetimeTrades) => ({
+    address, netProfitUsd, winRatePct, lifetimeTrades, providerMetrics: true,
+    source: 'imported-leaderboard', basis: 'imported',
+  });
+
+  // The current file puts Ar2Y on top because its PROFIT is highest.
+  const now = applyEliteRules(
+    [row('Ar2Y', 1_500_000, 61.84, 12237), row('DZbg', 25_000, 46, 179)],
+    rules
+  );
+  assert.equal(now.qualified[0].address, 'Ar2Y');
+
+  // Give DZbg a larger figure and it takes #1 with no code change. Nothing
+  // about the ordering is attached to an address — if it were, a wallet whose
+  // record decayed would keep a rank it no longer earns, which is the exact
+  // failure a "permanently crowns X" ranking would produce.
+  const later = applyEliteRules(
+    [row('Ar2Y', 1_500_000, 61.84, 12237), row('DZbg', 9_000_000, 46, 179)],
+    rules
+  );
+  assert.equal(later.qualified[0].address, 'DZbg');
+
+  // A wallet that stops clearing Rule 1 leaves the list entirely, however
+  // large its profit.
+  const demoted = applyEliteRules(
+    [row('Ar2Y', 1_500_000, 12, 12237), row('DZbg', 25_000, 46, 179)],
+    rules
+  );
+  assert.deepEqual(demoted.qualified.map((c) => c.address), ['DZbg']);
+});
+
 test('GMGN payloads are parsed across shapes and field names', async () => {
   const { parseGmgnMetrics } = await import('../auto_top_whales.mjs');
 

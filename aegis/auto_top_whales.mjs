@@ -2,8 +2,12 @@
 /**
  * Automated Top-50 Elite Whale Sync — Composite Elite Ranking.
  *
- *   node auto_top_whales.mjs                 rank from Aegis's own observations
+ *   node auto_top_whales.mjs                 rank from Aegis's own observations,
+ *                                            OR auto-import when
+ *                                            eliteWhales.autoImport is enabled
+ *                                            and its file is present
  *   node auto_top_whales.mjs --import <file> rank from a leaderboard export
+ *   node auto_top_whales.mjs --observe       ignore auto-import for this pass
  *   node auto_top_whales.mjs --dry-run       report only, do not write
  *   node auto_top_whales.mjs --report        show current qualification progress
  *
@@ -59,6 +63,11 @@ const KNOWN_NON_RULE_KEYS = new Set([
   'enabled', 'observe', 'syncIntervalHours', 'enrichShortlistCap',
   'minRepresentativeness', 'profitRule', 'historyPageDelayMs',
   'pnlMaxPages', 'pnlSwapsOnly', 'pnlDelayMs', 'pnlTimeoutMs',
+  // Sub-objects of settings, not thresholds. Absent from this list they are
+  // reported as dead keys on every sync — which is exactly what happened to
+  // autoImport the first time it ran, and a warning that cries wolf about a
+  // working setting is worse than no warning at all.
+  'autoImport', 'gmgn',
 ]);
 
 /**
@@ -390,15 +399,26 @@ export function applyEliteRules(candidates, rules = ELITE_RULES) {
         // Then the true win rate: GMGN's career figure where one exists, the
         // on-chain replay next, the observed rate last.
         (rankingWinRate(b) ?? -Infinity) - (rankingWinRate(a) ?? -Infinity) ||
-        // Realized SOL. NOTE THAT THIS CAN ALMOST NEVER FIRE, and it is kept
-        // for the case where it can rather than as a working tie-break: on the
-        // observe path allTimeNetProfitUsd IS onChain.netSol multiplied by one
-        // per-sync SOL price, so ordering by it is arithmetically identical to
-        // ordering by netSol and the primary key has already decided. It only
-        // separates wallets whose USD figures came from DIFFERENT sources — an
-        // imported row judged on a provider's P&L beside an observed one — and
-        // there the imported row has no onChain at all.
-        (b.onChain?.netSol ?? -Infinity) - (a.onChain?.netSol ?? -Infinity) ||
+        // Realized SOL, ONLY when both wallets actually have it.
+        //
+        // The guard is not defensive noise. Written as a bare
+        // `(b.onChain?.netSol ?? -Infinity) - (a…)`, two IMPORTED rows give
+        // -Infinity - -Infinity = NaN, and the chain then continued to the
+        // trade-count tie-break purely because NaN happens to be falsy. That
+        // worked, and it worked by accident: any later refactor that made this
+        // step a comparator return rather than a `||` operand would have
+        // silently randomised the order of every imported list.
+        //
+        // It can almost never fire on the observe path either, and that is
+        // arithmetic rather than caution: allTimeNetProfitUsd IS onChain.netSol
+        // times one per-sync SOL price, so ordering by it is identical to
+        // ordering by netSol and the primary key has already decided.
+        (Number.isFinite(a.onChain?.netSol) && Number.isFinite(b.onChain?.netSol)
+          ? b.onChain.netSol - a.onChain.netSol
+          : 0) ||
+        // Total trades. For an imported row this is the provider's own count —
+        // txs_30d and friends — and it is the third key the GMGN ordering asks
+        // for: realized profit, then win rate, then trades.
         (b.lifetimeTrades ?? 0) - (a.lifetimeTrades ?? 0)
     )
     .slice(0, rules.topN);
@@ -443,6 +463,21 @@ export function buildWatchlist(qualified, { source, rules }) {
         ? [
             `REALIZED net SOL > ${rules.minAllTimeNetSol} over the replayed window ` +
               `(strictly greater; unmeasured counts as a failure).`,
+          ]
+        : []),
+      // An imported list must say what was NOT checked. Without this the header
+      // above reads as though every floor was applied, when the two that read
+      // chain were waived for every row in the file.
+      ...(qualified.some((w) => w.providerMetrics === true)
+        ? [
+            '',
+            'THESE ENTRIES CAME FROM AN IMPORTED FILE AND WERE NOT VERIFIED ON CHAIN.',
+            'Rows carrying a provider’s own metrics WAIVE the two rules above that read',
+            'chain — the on-chain win rate and the realized net-SOL floor. They were',
+            'admitted on the file’s numbers, filtered only by win rate, profit and trade',
+            'count. Nothing here re-derives those figures, and where Aegis has measured',
+            'the same wallet the two have disagreed by orders of magnitude. Check the',
+            'solscan link on an entry before sizing into it.',
           ]
         : []),
       // Describes the ACTUAL sort. This line claimed "by win rate, then sample
@@ -1843,11 +1878,87 @@ async function candidatesFromImport(path) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Auto-import
+ * ------------------------------------------------------------------ */
+
+/**
+ * Decide whether this pass should import, and from where.
+ *
+ * Precedence, strictest first:
+ *   explicit --import   always wins; an operator naming a file means it
+ *   forceObserve        --observe overrides the config, for checking what the
+ *                       ledger says without editing config.json
+ *   config auto-import   only when enabled AND the file is actually readable
+ *
+ * A CONFIGURED-BUT-MISSING FILE IS NOT AN ERROR. The pass falls back to
+ * observe, which is the behaviour that keeps a deleted or not-yet-written CSV
+ * from taking the watchlist down with it.
+ *
+ * The header check is the load-bearing part. candidatesFromImport already
+ * reports "no address column found", but it reports it AFTER returning zero
+ * candidates — and zero candidates on the import path looks exactly like an
+ * empty leaderboard. Refusing up front, and falling back to observe, means a
+ * mis-shaped file costs a warning rather than a silently frozen watchlist.
+ */
+export async function resolveImportSource(
+  config,
+  { explicitPath = null, forceObserve = false, baseDir = HERE, readFileImpl = readFile } = {}
+) {
+  if (explicitPath) return { path: explicitPath, reason: 'explicit --import' };
+  if (forceObserve) return { path: null, reason: 'observe forced by --observe' };
+
+  const cfg = config?.eliteWhales?.autoImport ?? {};
+  if (!cfg.enabled) return { path: null, reason: 'auto-import disabled' };
+
+  const candidatePath = resolve(baseDir, cfg.path ?? '../leaderboard.csv');
+  let head = null;
+  try {
+    head = (await readFileImpl(candidatePath, 'utf8')).split(/\r?\n/)[0] ?? '';
+  } catch {
+    return { path: null, reason: `auto-import file not found: ${candidatePath}` };
+  }
+
+  const required = cfg.requireColumns ?? ['address'];
+  const headers = head.split(',').map((h) => normaliseHeader(h));
+  if (required.length && !required.some((r) => headers.includes(normaliseHeader(r)))) {
+    return {
+      path: null,
+      warn:
+        `auto-import file ${candidatePath} has no recognised address column ` +
+        `(saw: ${head.slice(0, 120)}) — falling back to observe rather than writing an empty list`,
+      reason: 'auto-import header check failed',
+    };
+  }
+
+  return { path: candidatePath, reason: 'auto-import from config' };
+}
+
+/* ------------------------------------------------------------------ *
  * Main
  * ------------------------------------------------------------------ */
 
-export async function syncTopWhales({ importPath = null, dryRun = false, reportOnly = false } = {}) {
+export async function syncTopWhales({ importPath = null, dryRun = false, reportOnly = false, forceObserve = false } = {}) {
   const config = JSON.parse(await readFile(join(HERE, 'config.json'), 'utf8'));
+
+  // Auto-import, resolved BEFORE anything reads importPath. Every downstream
+  // branch — the history cache, the enrichment, the reporting — keys off this
+  // value, so it has to be settled first or a pass would half-behave as an
+  // import and half as an observe.
+  const importSource = await resolveImportSource(config, { explicitPath: importPath, forceObserve });
+  if (importSource.warn) console.warn(`   [CONFIG] ${importSource.warn}`);
+  importPath = importSource.path;
+  if (importPath && !dryRun) {
+    console.log(`   ↳ source: ${importSource.reason} — ${importPath}`);
+    // Said on every import pass, not once in a config file nobody re-reads.
+    // Rules 4 and 5 are the on-chain half of this engine, and a run that
+    // waives them should say so where the operator is actually looking.
+    console.log(
+      '     imported rows carry providerMetrics, which WAIVES Rule 4 (on-chain win rate)'
+    );
+    console.log(
+      '     and Rule 5 (realized net SOL). Entries are admitted on the file\'s own numbers.'
+    );
+  }
 
   // Apply the same .env RPC override the scanner uses. Without this the
   // enrichment step silently ran against the public RPC and got throttled
@@ -2291,42 +2402,58 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
   }
   console.log(`   Rule 3  trades ≥ ${rules.minLifetimeTrades}         → ${evaluated.length - failing.trades} pass`);
 
+  // WAIVED, not PASSED, and the difference is the whole point of these two
+  // rules. Every provider row short-circuits both checks, so the counter reads
+  // "4 pass" on a 4-row import — which is true of the boolean and false of the
+  // claim a reader takes from it. Reporting a waiver as a pass is how an
+  // unverified list comes to look fully vetted.
+  const allProviderRows = evaluated.length > 0 && evaluated.every((c) => c.providerMetrics === true);
+
   if (rules.minAllTimeWinRatePct) {
     console.log(
-      `   Rule 4  on-chain WR ≥ ${rules.minAllTimeWinRatePct}% over ${rules.minAllTimeTrades ?? 0}+ trades → ` +
-        `${evaluated.length - failing.onChainWinRate} pass`
+      allProviderRows
+        ? `   Rule 4  on-chain WR ≥ ${rules.minAllTimeWinRatePct}% → WAIVED for imported rows (provider metrics)`
+        : `   Rule 4  on-chain WR ≥ ${rules.minAllTimeWinRatePct}% over ${rules.minAllTimeTrades ?? 0}+ trades → ` +
+            `${evaluated.length - failing.onChainWinRate} pass`
     );
   }
 
   if (rules.minAllTimeNetSol !== null && rules.minAllTimeNetSol !== undefined) {
-    console.log(
-      `   Rule 5  realized net SOL > ${rules.minAllTimeNetSol} → ${evaluated.length - failing.netSol} pass`
-    );
-    // The same diagnostic Rule 2 carries, for the same reason: a floor that
-    // admits nobody should be visibly a FLOOR problem rather than a mystery.
-    // Only wallets whose history was actually replayed are counted — every
-    // other candidate has no onChain figure at all, and folding those in would
-    // report a spread across thousands of wallets when a few dozen were
-    // measured.
-    const nets = evaluated
-      .map((c) => c.onChain?.netSol)
-      .filter((n) => typeof n === 'number' && Number.isFinite(n))
-      .sort((a, b) => b - a);
-    if (nets.length) {
-      const median = nets[Math.floor(nets.length / 2)];
+    if (allProviderRows) {
       console.log(
-        `           realized SOL across ${nets.length} replayed wallet(s): ` +
-          `best ${nets[0].toFixed(1)} · median ${median.toFixed(1)} · worst ${nets[nets.length - 1].toFixed(1)} · ` +
-          `${nets.filter((n) => n > 0).length} positive`
+        `   Rule 5  realized net SOL > ${rules.minAllTimeNetSol} → WAIVED for imported rows (provider metrics)`
       );
-      if (nets[0] <= rules.minAllTimeNetSol) {
-        console.log(
-          `           the best wallet is ${nets[0].toFixed(1)} SOL against a ${rules.minAllTimeNetSol} SOL floor — ` +
-            `no floor above ${nets[0].toFixed(1)} can admit anyone from this population`
-        );
-      }
+      console.log("           nothing here was checked against chain — the file's numbers are taken as given");
     } else {
-      console.log('           realized SOL: none derived (no Helius key, quota, or every replay failed)');
+      console.log(
+        `   Rule 5  realized net SOL > ${rules.minAllTimeNetSol} → ${evaluated.length - failing.netSol} pass`
+      );
+      // The same diagnostic Rule 2 carries, for the same reason: a floor that
+      // admits nobody should be visibly a FLOOR problem rather than a mystery.
+      // Only wallets whose history was actually replayed are counted — every
+      // other candidate has no onChain figure at all, and folding those in would
+      // report a spread across thousands of wallets when a few dozen were
+      // measured.
+      const nets = evaluated
+        .map((c) => c.onChain?.netSol)
+        .filter((n) => typeof n === 'number' && Number.isFinite(n))
+        .sort((a, b) => b - a);
+      if (nets.length) {
+        const median = nets[Math.floor(nets.length / 2)];
+        console.log(
+          `           realized SOL across ${nets.length} replayed wallet(s): ` +
+            `best ${nets[0].toFixed(1)} · median ${median.toFixed(1)} · worst ${nets[nets.length - 1].toFixed(1)} · ` +
+            `${nets.filter((n) => n > 0).length} positive`
+        );
+        if (nets[0] <= rules.minAllTimeNetSol) {
+          console.log(
+            `           the best wallet is ${nets[0].toFixed(1)} SOL against a ${rules.minAllTimeNetSol} SOL floor — ` +
+              `no floor above ${nets[0].toFixed(1)} can admit anyone from this population`
+          );
+        }
+      } else {
+        console.log('           realized SOL: none derived (no Helius key, quota, or every replay failed)');
+      }
     }
   }
 
@@ -2446,5 +2573,8 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
     importPath: i !== -1 ? argv[i + 1] : null,
     dryRun: argv.includes('--dry-run'),
     reportOnly: argv.includes('--report'),
+    // Escape hatch for a config with auto-import on: rank from Aegis's own
+    // measurements for one pass without editing config.json.
+    forceObserve: argv.includes('--observe'),
   });
 }
