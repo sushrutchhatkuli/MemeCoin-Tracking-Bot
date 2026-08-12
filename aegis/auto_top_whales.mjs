@@ -48,6 +48,40 @@ const HERE = dirname(fileURLToPath(import.meta.url));
  * Composite Elite Ranking
  * ------------------------------------------------------------------ */
 
+/**
+ * eliteWhales keys that are real settings but are NOT rule thresholds, so they
+ * legitimately have no entry in ELITE_RULES. Listed explicitly rather than
+ * pattern-matched: the point of the check below is to catch a NAME that looks
+ * like a rule and is read by nothing, and a loose pattern would wave those
+ * through alongside these.
+ */
+const KNOWN_NON_RULE_KEYS = new Set([
+  'enabled', 'observe', 'syncIntervalHours', 'enrichShortlistCap',
+  'minRepresentativeness', 'profitRule', 'historyPageDelayMs',
+  'pnlMaxPages', 'pnlSwapsOnly', 'pnlDelayMs', 'pnlTimeoutMs',
+]);
+
+/**
+ * Report eliteWhales settings that no rule reads. PURE.
+ *
+ * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+ * A threshold that is not read is worse than a missing one, because the config
+ * file then states a rule the sync does not enforce and the operator has no way
+ * to tell from the outside. It has happened twice here and both are on record:
+ * `allTimeWinRateFloor: 0.50` was requested while the real floor stayed at 70
+ * and the sync kept qualifying nobody, and `minOnChainTrades` / `minTrades`
+ * were requested for a 50-closed-trade bar that actually lives in
+ * `minAllTimeTrades`.
+ *
+ * Comment blocks are excluded — this file's configuration convention is that
+ * anything starting with `_` is documentation.
+ */
+export function findUnreadRuleKeys(eliteWhalesConfig = {}, defaults = ELITE_RULES) {
+  return Object.keys(eliteWhalesConfig ?? {}).filter(
+    (k) => !k.startsWith('_') && !(k in defaults) && !KNOWN_NON_RULE_KEYS.has(k)
+  );
+}
+
 export const ELITE_RULES = {
   minWinRatePct: 75,
   minNetProfitUsd: 50_000,
@@ -1454,6 +1488,24 @@ export async function syncTopWhales({ importPath = null, dryRun = false, reportO
   if (env.rpcOverride) config.rpcUrl = env.rpcOverride;
 
   const rules = { ...ELITE_RULES, ...(config.eliteWhales ?? {}) };
+
+  // A threshold nothing reads is worse than a missing one: the config then
+  // states a rule the sync does not enforce, and nothing about the run reveals
+  // it. Warned rather than thrown — an unknown key is a typo or a stale
+  // setting, neither of which should stop a sync that is otherwise fine.
+  const unread = findUnreadRuleKeys(config.eliteWhales);
+  if (unread.length) {
+    console.warn(`   [CONFIG] ${unread.length} eliteWhales key(s) are read by NO rule: ${unread.join(', ')}`);
+    console.warn('            These are inert. If one was meant to be a threshold, it is not being');
+    console.warn('            enforced — check the name against the rules below:');
+    console.warn('              minWinRatePct       observed win rate, %');
+    console.warn('              minGradedBuys       observed graded buys, count');
+    console.warn('              minNetProfitUsd     realized profit, USD');
+    console.warn('              minLifetimeTrades   SIGNATURES (not trades), count');
+    console.warn('              minAllTimeWinRatePct  on-chain win rate, %');
+    console.warn('              minAllTimeTrades    CLOSED ROUND TRIPS, count');
+    console.warn('              minAllTimeNetSol    realized profit, SOL');
+  }
 
   // Loaded once per sync, written once at the end.
   //
