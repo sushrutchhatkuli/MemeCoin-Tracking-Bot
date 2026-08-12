@@ -1263,6 +1263,42 @@ async function loadJson(path, fallback = null) {
   }
 }
 
+/**
+ * Wipe the terminal, scrollback included, and park the cursor at the top.
+ *
+ *   \x1b[2J  erase the visible screen
+ *   \x1b[3J  erase the SCROLLBACK buffer
+ *   \x1b[H   cursor to row 1, column 1
+ *
+ * ── WHY NOT console.clear() ────────────────────────────────────────────────
+ * Because on the two terminals this dashboard is actually read in, it does not
+ * clear. Node's console.clear() only emits an escape sequence when the stream
+ * is a TTY, and the sequence it emits omits \x1b[3J — so the visible rows are
+ * blanked while the scrollback survives. In the VS Code integrated terminal
+ * and Windows PowerShell that reads as the dashboard scrolling away rather
+ * than being replaced: the old frames are still there, just above the fold.
+ * Erasing the buffer as well is what keeps ONE dashboard fixed at the top.
+ *
+ * \x1b[3J is a widely supported xterm extension rather than part of the
+ * original spec, so a terminal that ignores it degrades to the old behaviour —
+ * a cleared screen with scrollback intact — rather than printing garbage.
+ *
+ * STILL GUARDED ON isTTY. Piped to a file or a pager these bytes are not a
+ * clear, they are three escape sequences written into the output, corrupting
+ * exactly the log someone redirected for.
+ */
+export const CLEAR_SCREEN = '\x1b[2J\x1b[3J\x1b[H';
+
+/**
+ * Should this run wipe the screen between frames? PURE.
+ *
+ * Split out so the guard is testable without a terminal: it is the half that
+ * decides whether escape bytes reach a file, and getting it wrong is silent.
+ */
+export function shouldWipeScreen({ intervalSec = null, isTTY = false } = {}) {
+  return Boolean(intervalSec) && Boolean(isTTY);
+}
+
 /** Open-position table for the dashboard. PURE. */
 export function renderPositions(book, solUsd) {
   const positions = Object.values(book?.positions ?? {});
@@ -1446,9 +1482,9 @@ export async function main(argv = []) {
   const watchIndex = argv.indexOf('--watch');
   const intervalSec = watchIndex !== -1 ? Number(argv[watchIndex + 1]) || 60 : null;
   // A cleared screen is only a dashboard on a terminal. Piped to a file or
-  // through a pager, console.clear() emits escape codes into the output and
-  // destroys exactly the scrollback someone redirecting to a log wanted.
-  const canClear = Boolean(intervalSec) && process.stdout.isTTY;
+  // through a pager, the wipe sequence is not a clear — it is escape bytes
+  // written into the output, corrupting the log someone redirected for.
+  const canClear = shouldWipeScreen({ intervalSec, isTTY: process.stdout.isTTY });
 
   const recent = [];
 
@@ -1514,7 +1550,10 @@ export async function main(argv = []) {
     // scrolling this mode exists to stop.
     while (recent.length > 6) recent.shift();
 
-    if (canClear) console.clear();
+    // Written in one call so the wipe and the redraw cannot be interleaved by
+    // anything else writing to stdout between them, which shows as a flash of
+    // empty terminal on a fast cadence.
+    if (canClear) process.stdout.write(CLEAR_SCREEN);
     console.log(renderScorecard(paperScorecard(book, cfg), { solUsd: spot }));
     console.log(renderPositions(book, spot));
     if (recent.length) {

@@ -7441,3 +7441,35 @@ test('a stale chain buy is not mirrored', async () => {
   });
   assert.deepEqual(r2.opened.map((o) => o.mint), ['NOTIME']);
 });
+
+test('the screen wipe erases the scrollback, not just the visible rows', async () => {
+  const { CLEAR_SCREEN } = await import('../paper_copytrade.mjs');
+
+  // \x1b[2J erases the screen, \x1b[3J erases the SCROLLBACK, \x1b[H homes the
+  // cursor. The middle one is the whole point: console.clear() omits it, which
+  // is why old frames survive above the fold in the VS Code terminal and
+  // Windows PowerShell and the dashboard appears to scroll rather than update.
+  assert.equal(CLEAR_SCREEN, '\x1b[2J\x1b[3J\x1b[H');
+  assert.ok(CLEAR_SCREEN.includes('\x1b[3J'), 'must erase the scrollback buffer');
+  // Home last, so the redraw starts at row 1 rather than wherever the cursor
+  // happened to be when the buffer was wiped.
+  assert.ok(CLEAR_SCREEN.endsWith('\x1b[H'));
+});
+
+test('the screen is only wiped on a watched TTY', async () => {
+  const { shouldWipeScreen } = await import('../paper_copytrade.mjs');
+
+  assert.equal(shouldWipeScreen({ intervalSec: 5, isTTY: true }), true);
+
+  // NEVER when redirected. These bytes are not a clear in a file — they are
+  // escape sequences corrupting the log someone piped for, and the corruption
+  // is silent.
+  assert.equal(shouldWipeScreen({ intervalSec: 5, isTTY: false }), false);
+  assert.equal(shouldWipeScreen({ intervalSec: 5, isTTY: undefined }), false);
+
+  // Never on a one-shot run either: there is no previous frame to replace, and
+  // wiping would destroy whatever the operator was already looking at.
+  assert.equal(shouldWipeScreen({ intervalSec: null, isTTY: true }), false);
+  assert.equal(shouldWipeScreen({ intervalSec: 0, isTTY: true }), false);
+  assert.equal(shouldWipeScreen({}), false);
+});
