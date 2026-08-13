@@ -96,7 +96,17 @@ export const BOOK_VERSION = 1;
 export const PAPER_DEFAULTS = {
   budgetSol: 10.0,
   perTradeSol: 1.0,
-  maxOpenPositions: 6,
+  // Raised 6 -> 50. At 6 the book spent nearly its whole life full: an audit
+  // against chain found it holding 6/6 with 0 free balance, mirroring 8 of the
+  // target's 12 swaps and declining the rest. A copy of an arbitrary subset is
+  // not a copy of the strategy, and it biases the result in an unknowable
+  // direction — the declined trades are not a random sample of the good ones.
+  //
+  // The cap is no longer the binding constraint at this budget; free balance is,
+  // and that is the honest one to be bound by. Sizing follows perTradeSol or
+  // --pct-whale, so the way to hold more positions is a smaller share per trade
+  // rather than a bigger cap.
+  maxOpenPositions: 50,
   // Rungs are cumulative gain from ENTRY, each firing at most once.
   takeProfit: [
     { gainPct: 100, sellFraction: 0.5 },
@@ -1055,6 +1065,49 @@ export function impliedEntryPriceUsd(trade, { solUsd = null, minSpendSol = 0.05 
 }
 
 /**
+ * The price the target actually sold at, per token, in USD. PURE.
+ *
+ * solReceived / |tokenDelta| out of the sell transaction — the exit twin of
+ * impliedEntryPriceUsd, and for the same reasons.
+ *
+ * ── MEASURED, BECAUSE THE ENTRY FIGURE WAS NOT AND THAT COST A BOOK ────────
+ * Live socket, DexScreener sampled 469-499ms after each of the target's sells
+ * landed, compared against their own implied fill:
+ *   +1.1%   -3.6%   -26.6%   +60.3%        median +1.1%
+ * There is NO systematic drag: the price a tick would have used is not
+ * reliably below the target's sell. What there is, is enormous variance —
+ * a ±30-60% spread on four samples.
+ *
+ * That variance is the reason to prefer this number. DexScreener is a lagging
+ * cross-pool aggregate, so on a thin memecoin the price it reports at an
+ * arbitrary tick moment can sit tens of percent from where the token actually
+ * traded a moment earlier. Sampling it made every exit a coin flip while
+ * entries were exact — an asymmetry that shows up as unexplained P&L rather
+ * than as an obvious bug.
+ *
+ * WHAT IT ASSUMES, stated plainly: that we exit at the target's own price. We
+ * would really sell ~700ms later, into a market their sell just moved. The
+ * measurement above says that is not systematically worse at this latency, but
+ * four samples is thin evidence and the honest reading is "no measurable bias",
+ * not "no cost". copyImpactPct applies to entries only; there is deliberately
+ * no exit-side penalty invented to sit beside it.
+ *
+ * solReceived is a lamport delta, so it is NET of the network fee — a fraction
+ * of a percent understatement on any real-sized exit, in the conservative
+ * direction.
+ */
+export function impliedExitPriceUsd(trade, { solUsd = null, minReceiveSol = 0.01 } = {}) {
+  if (trade?.kind !== 'SELL') return null;
+  if (!Number.isFinite(solUsd) || solUsd <= 0) return null;
+  const received = trade.solReceived;
+  const tokens = Math.abs(trade.tokenDelta ?? 0);
+  if (!Number.isFinite(received) || received < minReceiveSol) return null;
+  if (!Number.isFinite(tokens) || tokens <= 0) return null;
+  const priceUsd = (received / tokens) * solUsd;
+  return Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : null;
+}
+
+/**
  * The target's recent trades, newest signature first.
  *
  * `sinceSignature` stops the walk as soon as a known signature is seen, so a
@@ -1674,7 +1727,15 @@ export async function runPaperTick({
       if (!sellsEnabled) continue;
       const p = book.positions[t.mint];
       if (!p) continue;
-      const price = prices.get(t.mint) ?? p.markPriceUsd;
+      // THE TARGET'S OWN SELL PRICE FIRST. A tick-sampled DexScreener quote
+      // showed no systematic bias against it but a ±30-60% spread, which made
+      // every exit a coin flip while entries were exact. The pair feed remains
+      // the fallback for a sell too small to imply a price, or when no SOL rate
+      // is available to convert one.
+      const price =
+        impliedExitPriceUsd(t, { solUsd, minReceiveSol: cfg.impliedMinSpendSol }) ??
+        prices.get(t.mint) ??
+        p.markPriceUsd;
       if (!Number.isFinite(price) || price <= 0) continue;
       const fraction = Number.isFinite(t.sellFraction) ? t.sellFraction : 1;
       const res = applyPaperExit(book, t.mint, {

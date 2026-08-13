@@ -8445,3 +8445,103 @@ test('copy impact defaults to 0 rather than an unvalidated guess', async () => {
   assert.equal(paperConfig({ copyImpactPct: 5 }).copyImpactPct, 5);
   assert.equal(paperConfig({ copyImpactPct: -3 }).copyImpactPct, 0);
 });
+/* ------------------------------------------------------------------ *
+ * Exit-side price alignment
+ * ------------------------------------------------------------------ */
+
+test('the implied exit price is the target fill out of the sell', async () => {
+  const { impliedExitPriceUsd } = await import('../paper_copytrade.mjs');
+
+  // 2 SOL back for 1,000,000 tokens at $75/SOL -> $1.5e-4 each.
+  const sell = { kind: 'SELL', solReceived: 2, tokenDelta: -1_000_000 };
+  assert.ok(Math.abs(impliedExitPriceUsd(sell, { solUsd: 75 }) - 1.5e-4) < 1e-12);
+
+  // tokenDelta is negative on a sell; its magnitude is what was sold.
+  assert.equal(
+    impliedExitPriceUsd({ kind: 'SELL', solReceived: 1, tokenDelta: -1000 }, { solUsd: 100 }),
+    impliedExitPriceUsd({ kind: 'SELL', solReceived: 1, tokenDelta: 1000 }, { solUsd: 100 })
+  );
+
+  // Buys carry no exit price.
+  assert.equal(impliedExitPriceUsd({ kind: 'BUY', solSpent: 1, tokenDelta: 1000 }, { solUsd: 75 }), null);
+
+  // No SOL rate means SKIP, not guess — a fabricated rate would book a wrong
+  // exit and every closed P&L is measured against it.
+  assert.equal(impliedExitPriceUsd(sell, { solUsd: null }), null);
+  assert.equal(impliedExitPriceUsd(sell, { solUsd: 0 }), null);
+
+  // A dust sell is refused: solReceived is net of the network fee, which
+  // distorts a tiny exit the way it distorts a tiny entry.
+  assert.equal(impliedExitPriceUsd({ kind: 'SELL', solReceived: 0.001, tokenDelta: -10 }, { solUsd: 75, minReceiveSol: 0.01 }), null);
+
+  assert.equal(impliedExitPriceUsd({ kind: 'SELL', solReceived: 1, tokenDelta: 0 }, { solUsd: 75 }), null);
+  assert.equal(impliedExitPriceUsd(null, { solUsd: 75 }), null);
+});
+
+test('a whale sell exits at their price, not at a tick-sampled quote', async () => {
+  const { createBook, runPaperTick, openPaperPosition, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+  openPaperPosition(book, { mint: 'M', priceUsd: 1, cfg, now: now - 1000 });
+
+  // The pair feed says $0.50 while the target actually sold at $2.00. MEASURED
+  // live, a tick-sampled quote ran -26.6% to +60.3% against the target's own
+  // fill with a median of +1.1% — no systematic bias, enormous variance. Taking
+  // the quote made every exit a coin flip while entries were exact.
+  await runPaperTick({
+    book,
+    observations: { wallets: {} },
+    watchlist: { wallets: [{ address: 'W' }] },
+    cfg,
+    now,
+    solUsd: 100,
+    priceFetcher: async () => new Map([['M', 0.5]]),
+    tradeFetcher: async () => ({
+      ok: true,
+      newestSignature: 'S1',
+      trades: [{ kind: 'SELL', mint: 'M', sellFraction: 1, solReceived: 2, tokenDelta: -100, blockTime: now, signature: 'S1' }],
+    }),
+  });
+
+  // 2 SOL / 100 tokens x $100 = $2.00 exit against a $1.00 entry -> +100%,
+  // not the -50% the quote would have booked.
+  assert.equal(book.closed.length, 1);
+  assert.ok(book.closed[0].pnlPct > 99 && book.closed[0].pnlPct < 101, `got ${book.closed[0].pnlPct}`);
+});
+
+test('a sell too small to imply a price falls back to the quote', async () => {
+  const { createBook, runPaperTick, openPaperPosition, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0, impliedMinSpendSol: 0.05 });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'W' } });
+  openPaperPosition(book, { mint: 'M', priceUsd: 1, cfg, now: now - 1000 });
+
+  await runPaperTick({
+    book,
+    observations: { wallets: {} },
+    watchlist: { wallets: [{ address: 'W' }] },
+    cfg,
+    now,
+    solUsd: 100,
+    priceFetcher: async () => new Map([['M', 3]]),
+    tradeFetcher: async () => ({
+      ok: true,
+      newestSignature: 'S1',
+      trades: [{ kind: 'SELL', mint: 'M', sellFraction: 1, solReceived: 0.001, tokenDelta: -100, blockTime: now, signature: 'S1' }],
+    }),
+  });
+
+  // Fee distortion makes a dust sell's implied price unusable, so the quote is
+  // used: $3.00 against a $1.00 entry.
+  assert.ok(book.closed[0].pnlPct > 199 && book.closed[0].pnlPct < 201, `got ${book.closed[0].pnlPct}`);
+});
+
+test('the position cap no longer binds before the balance does', async () => {
+  const { paperConfig } = await import('../paper_copytrade.mjs');
+  // At 6 an audit found the book holding 6/6 with 0 free balance, mirroring 8
+  // of the target's 12 swaps. A copy of an arbitrary subset is not a copy of
+  // the strategy, and the declined trades are not a random sample.
+  assert.equal(paperConfig({}).maxOpenPositions, 50);
+  assert.equal(paperConfig({ maxOpenPositions: 6 }).maxOpenPositions, 6);
+});
