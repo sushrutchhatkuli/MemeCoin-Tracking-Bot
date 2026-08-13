@@ -8545,3 +8545,62 @@ test('the position cap no longer binds before the balance does', async () => {
   assert.equal(paperConfig({}).maxOpenPositions, 50);
   assert.equal(paperConfig({ maxOpenPositions: 6 }).maxOpenPositions, 6);
 });
+
+test('the socket retries a signature it could not read, then recovers it', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+
+  // AUDITED FAILURE: a BUY the target made "never reached the book", against a
+  // FEED line reading "1 notified, 0 resolved". The notification is the only
+  // time a signature is offered — the poll runs only while catching up — so a
+  // read that lost the race dropped the trade permanently.
+  let readable = false;
+  const s = createWhaleSocket({
+    wallet: 'W',
+    rpcUrl: 'https://n/r',
+    WebSocketImpl: FakeWS,
+    cfg: { lookupRetries: 0, lookupRetryDelayMs: 0, retryAttempts: 3 },
+    rpcImpl: async (_u, _m, params) =>
+      readable ? { ok: true, result: wsSwapTx(params[0], 'W') } : { ok: false, error: 'not found yet' },
+  });
+  made[0].open();
+
+  await made[0].notify({ signature: 'SLOW', err: null });
+  assert.equal(s.status().stats.failed, 1);
+  assert.equal((await s.drain()).trades.length, 0, 'still unreadable');
+  assert.equal(s.status().pendingRetry.length, 1, 'queued, not dropped');
+
+  // It becomes readable a moment later, as a confirmed read catching up with a
+  // processed notification does — measured at 396-779ms and 2-3 attempts.
+  readable = true;
+  const out = await s.drain();
+  assert.deepEqual(out.trades.map((t) => t.signature), ['SLOW'], 'recovered');
+  assert.equal(s.status().stats.recovered, 1);
+  assert.equal(s.status().pendingRetry.length, 0);
+  s.close();
+});
+
+test('a permanently unreadable signature is abandoned, not retried forever', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+  let calls = 0;
+  const s = createWhaleSocket({
+    wallet: 'W',
+    rpcUrl: 'https://n/r',
+    WebSocketImpl: FakeWS,
+    cfg: { lookupRetries: 0, lookupRetryDelayMs: 0, retryAttempts: 3 },
+    rpcImpl: async () => {
+      calls++;
+      return { ok: false, error: 'gone' };
+    },
+  });
+  made[0].open();
+  await made[0].notify({ signature: 'DEAD', err: null });
+
+  for (let i = 0; i < 6; i++) await s.drain();
+  assert.equal(s.status().pendingRetry.length, 0, 'queue drains');
+  assert.equal(s.status().stats.abandoned, 1);
+  // Bounded: one on notify plus a couple of drains, not one per tick forever.
+  assert.ok(calls <= 3, `bounded attempts, got ${calls}`);
+  s.close();
+});

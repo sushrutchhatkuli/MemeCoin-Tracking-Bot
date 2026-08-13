@@ -1233,8 +1233,11 @@ export function createWhaleSocket({
     wallet,
     connected: false,
     buffer: [],
+    // Signatures the socket saw but could not read yet. Retried on later
+    // drains — see the failure path below for why dropping them lost trades.
+    pendingRetry: [],
     newestSignature: null,
-    stats: { notifications: 0, resolved: 0, failed: 0, reconnects: 0, duplicates: 0 },
+    stats: { notifications: 0, resolved: 0, failed: 0, recovered: 0, abandoned: 0, reconnects: 0, duplicates: 0 },
     lastError: null,
     closed: false,
   };
@@ -1320,6 +1323,21 @@ export function createWhaleSocket({
         state.stats.resolved++;
         log(`   socket ${trade.kind} ${trade.mint.slice(0, 8)}…`);
       } else {
+        // ── A FAILED RESOLUTION USED TO LOSE THE TRADE OUTRIGHT ────────────
+        // The notification is the only time this signature is ever offered:
+        // the poll runs only while catching up, so once it is caught up
+        // nothing goes back for a signature the socket could not read. An
+        // audit found exactly that — a BUY the target made that "never
+        // reached the book", against a FEED line reading "1 notified, 0
+        // resolved".
+        //
+        // The cause is timing, not corruption. A `processed` notification can
+        // arrive before a `confirmed` read can see it, measured at 396-779ms
+        // needing 2-3 attempts, so a slower one simply outruns the retries
+        // inside resolve(). Queued for another attempt on subsequent drains
+        // rather than dropped, and given up on only after retryAttempts, so a
+        // genuinely unreadable signature cannot be retried forever.
+        state.pendingRetry.push({ signature, attempts: 1 });
         state.stats.failed++;
       }
     };
@@ -1353,6 +1371,29 @@ export function createWhaleSocket({
      * poll path has.
      */
     drain: async () => {
+      // Retry anything the notification path could not read. Cheap — one
+      // getTransaction per outstanding signature — and it runs on the tick
+      // rather than in the socket handler so it cannot delay a live event.
+      if (state.pendingRetry.length) {
+        const queue = state.pendingRetry.splice(0, state.pendingRetry.length);
+        for (const item of queue) {
+          const trade = await resolve(item.signature);
+          if (trade) {
+            state.buffer.push(trade);
+            state.newestSignature = item.signature;
+            state.stats.resolved++;
+            state.stats.recovered++;
+            continue;
+          }
+          if (item.attempts + 1 >= (cfg.retryAttempts ?? 5)) {
+            // Genuinely unreadable — a signature cannot be retried forever.
+            state.stats.abandoned++;
+            continue;
+          }
+          state.pendingRetry.push({ signature: item.signature, attempts: item.attempts + 1 });
+        }
+      }
+
       const trades = state.buffer.splice(0, state.buffer.length);
       return {
         ok: state.connected || trades.length > 0,
@@ -2387,7 +2428,12 @@ export async function main(argv = []) {
       console.log(
         `  FEED   ${feed}` +
           (s ? ` · ${s.stats.notifications} notified, ${s.stats.resolved} resolved` : '') +
-          (s?.stats.failed ? `, ${s.stats.failed} unresolved` : '') +
+          // Retrying and abandoned are different facts: one is in flight, the
+          // other is a trade this book will never see. Only the second is a
+          // hole in the mirror, so they are never merged into one counter.
+          (s?.pendingRetry?.length ? `, ${s.pendingRetry.length} retrying` : '') +
+          (s?.stats.recovered ? `, ${s.stats.recovered} recovered` : '') +
+          (s?.stats.abandoned ? `, ${s.stats.abandoned} ABANDONED` : '') +
           (s?.stats.reconnects ? ` · ${s.stats.reconnects} reconnect(s)` : '') +
           (!socket?.isConnected() && s?.lastError ? ` · ${s.lastError}` : '')
       );
