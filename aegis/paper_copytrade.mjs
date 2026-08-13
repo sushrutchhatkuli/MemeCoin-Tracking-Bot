@@ -1065,6 +1065,31 @@ export function impliedEntryPriceUsd(trade, { solUsd = null, minSpendSol = 0.05 
 }
 
 /**
+ * The target's most recent signature, whatever it is.
+ *
+ * Used to anchor a fresh book to NOW. Without it a reset is only half a reset:
+ * the book is empty but the cursor is null, so the first poll reads a whole
+ * page of history and mirrors trades the target made minutes ago. Those entries
+ * are priced at fills that are already stale, and the "fresh" book opens
+ * holding positions from a window it did not observe.
+ *
+ * The newest signature is taken even if that transaction FAILED. It is a
+ * bookmark, not a trade: fetchWhaleTrades breaks on a signature match before it
+ * checks for an error, so an errored signature anchors exactly as well as a
+ * successful one — and skipping it would leave a gap for every trade between it
+ * and the next good one.
+ */
+export async function fetchLatestSignature({ wallet, rpcUrl = PUBLIC_SOLANA_RPC, rpcImpl = solanaRpc } = {}) {
+  if (!wallet) return { ok: false, error: 'no target wallet' };
+  const res = await rpcImpl(rpcUrl, 'getSignaturesForAddress', [wallet, { limit: 1 }]);
+  if (!res.ok) return { ok: false, error: res.error };
+  const signature = Array.isArray(res.result) ? (res.result[0]?.signature ?? null) : null;
+  // A wallet with no history at all anchors to null, which is correct: there is
+  // nothing behind it to skip.
+  return { ok: true, signature };
+}
+
+/**
  * The price the target actually sold at, per token, in USD. PURE.
  *
  * solReceived / |tokenDelta| out of the sell transaction — the exit twin of
@@ -1431,7 +1456,37 @@ export async function loadBook(path = BOOK_PATH) {
 
 export async function saveBook(book, path = BOOK_PATH) {
   await mkdir(dirname(path), { recursive: true });
+  // Stamped so a second instance can be detected. See detectConcurrentWriter.
+  book.writerPid = process.pid;
+  book.writerAt = Date.now();
   await writeFile(path, JSON.stringify(book, null, 2), 'utf8');
+}
+
+/**
+ * Is another instance writing this book? PURE.
+ *
+ * ── WHY THIS EXISTS ────────────────────────────────────────────────────────
+ * A running --watch holds the book in memory and rewrites it every tick, so
+ * anything another process does to the file is silently undone on the next
+ * one. That has now produced three separate false diagnoses in this codebase:
+ * a --reset that appeared not to work, a fresh book that appeared to replay
+ * history, and settings changes that appeared to have no effect — each time
+ * because a dashboard started earlier was overwriting the file, and each time
+ * it looked like a bug in the engine rather than a second writer.
+ *
+ * It also keeps whatever module code it started with, so a long-running
+ * instance silently ignores every fix made since it launched.
+ *
+ * A timestamp and a pid are enough: if the book was written by a DIFFERENT
+ * process within the staleness window, one is live right now.
+ */
+export function detectConcurrentWriter(book, { pid = process.pid, now = Date.now(), withinMs = 30_000 } = {}) {
+  const writer = book?.writerPid;
+  const at = book?.writerAt;
+  if (!Number.isFinite(writer) || !Number.isFinite(at)) return null;
+  if (writer === pid) return null;
+  if (now - at > withinMs) return null;
+  return { pid: writer, secondsAgo: (now - at) / 1000 };
 }
 
 /**
@@ -2135,16 +2190,60 @@ export async function main(argv = []) {
       ? createBook({ budgetUsd, solUsd })
       : createBook({ budgetSol: cfg.budgetSol, ...(solUsd ? { budgetUsd: null } : {}) });
 
+  // Checked BEFORE anything is written, because a reset performed underneath a
+  // running instance is undone on its next tick and reports success meanwhile.
+  const existing = await loadBook();
+  const rival = existing ? detectConcurrentWriter(existing) : null;
+  if (rival) {
+    console.warn(`   [WARN] another paper_copytrade instance is running (pid ${rival.pid}, wrote ${rival.secondsAgo.toFixed(0)}s ago).`);
+    console.warn('          It holds the book in memory and rewrites it every tick, so anything');
+    console.warn('          done here — a --reset especially — will be silently overwritten.');
+    console.warn('          It also still runs the module code it started with. Stop it first.');
+    console.warn('');
+  }
+
   if (argv.includes('--reset')) {
     const fresh = freshBook();
     const resolved = resolveTarget(watchlist, null);
     fresh.target = resolved.target ? { ...resolved.target, since: Date.now() } : null;
+
+    // ANCHOR THE CURSOR TO NOW, so a reset is actually a reset. Without this
+    // the book is empty but the cursor is null, and the first poll walks back
+    // through a whole page of history — opening positions from trades the
+    // target made minutes ago, at fills that are already stale. The book then
+    // reports itself as fresh while holding a window it never observed.
+    //
+    // The socket needs no equivalent: a subscription only ever delivers what
+    // happens after it opens. This closes the poll half.
+    if (fresh.target?.address) {
+      const anchor = await fetchLatestSignature({
+        wallet: fresh.target.address,
+        rpcUrl: cfg.rpcMirror.url,
+      });
+      if (anchor.ok) {
+        fresh.lastSignature = anchor.signature;
+        console.log(
+          anchor.signature
+            ? `Anchored at ${anchor.signature.slice(0, 12)}… — everything before it is ignored.`
+            : 'Target has no transaction history yet — nothing to anchor past.'
+        );
+      } else {
+        // Said loudly rather than swallowed: an unanchored reset silently
+        // replays history, which is exactly what anchoring exists to stop, and
+        // it looks identical to a working fresh book.
+        console.warn(`   [WARN] could not read the latest signature (${anchor.error}).`);
+        console.warn('          This book will replay recent history on its first tick.');
+        console.warn('          Re-run --reset once the node answers to start genuinely clean.');
+      }
+    }
+
     await saveBook(fresh);
     console.log(
       budgetUsd !== null
         ? `Fresh paper book at ${usd(budgetUsd, { sign: false })} (${fresh.budgetSol.toFixed(3)} SOL @ ${usd(solUsd, { sign: false })}/SOL).`
         : `Fresh paper book at ${fresh.budgetSol.toFixed(3)} virtual SOL.`
     );
+    console.log('Waiting for the target to trade — nothing is mirrored until it does.');
     if (!argv.includes('--watch')) {
       console.log(renderScorecard(paperScorecard(fresh, cfg), { solUsd }));
       return;

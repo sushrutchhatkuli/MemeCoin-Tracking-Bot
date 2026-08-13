@@ -8604,3 +8604,119 @@ test('a permanently unreadable signature is abandoned, not retried forever', asy
   assert.ok(calls <= 3, `bounded attempts, got ${calls}`);
   s.close();
 });
+
+/* ------------------------------------------------------------------ *
+ * Reset cursor anchoring
+ * ------------------------------------------------------------------ */
+
+test('fetchLatestSignature returns the newest signature, errored or not', async () => {
+  const { fetchLatestSignature } = await import('../paper_copytrade.mjs');
+
+  const got = await fetchLatestSignature({
+    wallet: 'W',
+    rpcImpl: async (_u, method, params) => {
+      assert.equal(method, 'getSignaturesForAddress');
+      // Only one is needed — this is a bookmark, not a scan.
+      assert.equal(params[1].limit, 1);
+      return { ok: true, result: [{ signature: 'NEWEST' }, { signature: 'older' }] };
+    },
+  });
+  assert.deepEqual(got, { ok: true, signature: 'NEWEST' });
+
+  // A FAILED transaction anchors just as well: fetchWhaleTrades breaks on a
+  // signature match BEFORE it checks for an error, and skipping it would leave
+  // a gap covering every trade between it and the next good one.
+  const errored = await fetchLatestSignature({
+    wallet: 'W',
+    rpcImpl: async () => ({ ok: true, result: [{ signature: 'FAILED_TX', err: { x: 1 } }] }),
+  });
+  assert.equal(errored.signature, 'FAILED_TX');
+
+  // A wallet with no history anchors to null — there is nothing behind it.
+  assert.deepEqual(
+    await fetchLatestSignature({ wallet: 'W', rpcImpl: async () => ({ ok: true, result: [] }) }),
+    { ok: true, signature: null }
+  );
+
+  // Failures are reported, never silently treated as "no history" — that
+  // distinction decides whether the book replays a page of stale trades.
+  const down = await fetchLatestSignature({ wallet: 'W', rpcImpl: async () => ({ ok: false, error: 'HTTP 429' }) });
+  assert.equal(down.ok, false);
+  assert.match(down.error, /429/);
+  assert.equal((await fetchLatestSignature({})).ok, false);
+});
+
+test('an anchored cursor makes the first poll mirror nothing', async () => {
+  const { fetchWhaleTrades } = await import('../paper_copytrade.mjs');
+
+  // A page of the target's recent history, newest first.
+  const sigs = ['S5', 'S4', 'S3', 'S2', 'S1'].map((signature) => ({ signature }));
+  const body = (sig) => ({
+    blockTime: 1700,
+    transaction: { signatures: [sig], message: { accountKeys: [{ pubkey: 'W' }] } },
+    meta: {
+      err: null,
+      preBalances: [10e9],
+      postBalances: [9e9],
+      preTokenBalances: [],
+      postTokenBalances: [{ mint: sig, owner: 'W', uiTokenAmount: { uiAmount: 1 } }],
+    },
+  });
+  const rpcImpl = async (_u, method, params) =>
+    method === 'getSignaturesForAddress' ? { ok: true, result: sigs } : { ok: true, result: body(params[0]) };
+
+  // UNANCHORED: a "fresh" book replays the whole page and opens five positions
+  // from trades the target made minutes ago, at fills that are already stale.
+  const unanchored = await fetchWhaleTrades({ wallet: 'W', rpcImpl, delayMs: 0 });
+  assert.equal(unanchored.trades.length, 5);
+
+  // ANCHORED to the newest signature: nothing before it is mirrored.
+  const anchored = await fetchWhaleTrades({ wallet: 'W', sinceSignature: 'S5', rpcImpl, delayMs: 0 });
+  assert.deepEqual(anchored.trades, []);
+  assert.equal(anchored.scanned, 0);
+
+  // And a genuinely new trade after the anchor still lands.
+  sigs.unshift({ signature: 'S6' });
+  const after = await fetchWhaleTrades({ wallet: 'W', sinceSignature: 'S5', rpcImpl, delayMs: 0 });
+  assert.deepEqual(after.trades.map((t) => t.mint), ['S6']);
+});
+
+test('a reset book starts flat: no positions, no history, cursor set', async () => {
+  const { createBook, paperScorecard, paperConfig } = await import('../paper_copytrade.mjs');
+  const cfg = paperConfig({});
+  const book = createBook({ budgetUsd: 1000, solUsd: 100 });
+  book.lastSignature = 'ANCHOR';
+
+  const card = paperScorecard(book, cfg);
+  assert.equal(card.activePositions, 0);
+  assert.equal(card.closedPositions, 0);
+  assert.equal(card.balanceSol, card.budgetSol, '100% uninvested');
+  assert.equal(card.equitySol, 10, '$1000 at $100/SOL');
+  assert.equal(card.realisedPnlSol, 0);
+  assert.equal(card.totalPnlSol, 0);
+  // null, not 0% — nothing has resolved, which is not the same as losing.
+  assert.equal(card.winRatePct, null);
+  assert.equal(book.lastSignature, 'ANCHOR');
+});
+
+test('the book detects a second instance writing it', async () => {
+  const { detectConcurrentWriter } = await import('../paper_copytrade.mjs');
+  const now = 1_000_000_000;
+
+  // A running --watch holds the book in memory and rewrites it every tick, so
+  // anything another process does is undone on the next one. That produced
+  // three false diagnoses here: a --reset that looked broken, a fresh book
+  // that looked like it replayed history, and settings that looked ignored.
+  const rival = { writerPid: 999, writerAt: now - 2000 };
+  const d = detectConcurrentWriter(rival, { pid: 111, now });
+  assert.equal(d.pid, 999);
+  assert.ok(Math.abs(d.secondsAgo - 2) < 0.01);
+
+  // Our own writes are not a conflict.
+  assert.equal(detectConcurrentWriter({ writerPid: 111, writerAt: now }, { pid: 111, now }), null);
+  // A pid that wrote long ago is a finished run, not a live one.
+  assert.equal(detectConcurrentWriter({ writerPid: 999, writerAt: now - 120000 }, { pid: 111, now }), null);
+  // Books written before stamping existed must not trip it.
+  assert.equal(detectConcurrentWriter({}, { pid: 111, now }), null);
+  assert.equal(detectConcurrentWriter(null, { pid: 111, now }), null);
+});
