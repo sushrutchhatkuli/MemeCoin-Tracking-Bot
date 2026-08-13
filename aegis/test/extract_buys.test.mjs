@@ -8428,3 +8428,20 @@ test('a sell for something never held is still ignored', async () => {
   assert.equal(r.exits.length, 0);
   assert.equal(book.closed.length, 0);
 });
+
+test('copy impact defaults to 0 rather than an unvalidated guess', async () => {
+  const { paperConfig } = await import('../paper_copytrade.mjs');
+
+  // The 9 that used to be here came from comparing the target fill against
+  // DexScreener MINUTES later, which measured price drift, not the cost of
+  // arriving late. Re-measured at the real ~500ms latency the median was
+  // -8.9% — the opposite sign — across a ±40% spread on five samples.
+  // Replaying 119 real closed trades at 9 vs 0 was -13.12 SOL vs -6.44 SOL,
+  // so the constant alone was half the wipeout.
+  assert.equal(paperConfig({}).copyImpactPct, 0);
+
+  // Still settable, because it is the right knob — it just has to be
+  // calibrated per target rather than assumed.
+  assert.equal(paperConfig({ copyImpactPct: 5 }).copyImpactPct, 5);
+  assert.equal(paperConfig({ copyImpactPct: -3 }).copyImpactPct, 0);
+});

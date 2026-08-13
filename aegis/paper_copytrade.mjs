@@ -128,10 +128,34 @@ export const PAPER_DEFAULTS = {
   // IMPLIED ENTRY. Price a mirrored buy from the swap itself rather than
   // waiting on a pair lookup — see impliedEntryPriceUsd for what that costs.
   useImpliedEntry: true,
-  // What arriving after the target costs, on top of slippagePct. MEASURED at
-  // ~9% against this target; set to 0 to book at their fill and see the
-  // optimistic version.
-  copyImpactPct: 9,
+  // What arriving after the target costs, on top of slippagePct.
+  //
+  // ── DEFAULTED TO 0 BECAUSE THE 9 THAT WAS HERE WAS MEASURED WRONG ─────────
+  // The original figure came from comparing the target's implied fill against
+  // DexScreener 0.6-3.7 MINUTES later and reading the ~-9% cluster as impact.
+  // That window is hundreds of times our actual latency, so it measured
+  // ordinary price drift over minutes, not the cost of arriving late.
+  //
+  // RE-MEASURED at the real latency — live socket, price fetched 410-575ms
+  // after each buy landed:
+  //   -41.1%  +43.3%  -13.2%  -8.9%  +15.5%     median -8.9%
+  // The median is NEGATIVE: the quoted price shortly after the target buys is
+  // typically BELOW their own effective fill, because their fill already
+  // contains the spread and impact they paid to cross it. A copier is not
+  // reliably worse off on entry at all.
+  //
+  // Five samples with a ±40% spread is not a number to hard-code in either
+  // direction, which is exactly why it is 0 now rather than some smaller
+  // positive guess. slippagePct still charges the spread on both legs.
+  //
+  // WHAT THE OLD 9 DID TO THE BOOK: entry x1.09 x1.015 against an exit x0.985
+  // is -10.97% on a round trip where the price never moved. Replaying the same
+  // 119 closed trades at 0 instead of 9 turns -13.12 SOL into -6.44 SOL and the
+  // win rate from 12.6% into 29.4%. Half the wipeout was this constant.
+  //
+  // Calibrate it per target rather than trusting a default: it is the single
+  // most sensitive number in the model.
+  copyImpactPct: 0,
   // Below this the fee and rent inside solSpent distort the implied price
   // enough to matter, so the pair lookup is used instead.
   impliedMinSpendSol: 0.05,
