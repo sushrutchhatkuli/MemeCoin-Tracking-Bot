@@ -195,9 +195,21 @@ export const PAPER_DEFAULTS = {
   // ledger. Sees sells too, which the ledger never recorded.
   // How many sub-wallets a position is split across, each with its own exit
   // ladder. 1 is NOT "off": it is the scalper alone, which exits everything at
-  // +50% and mirrors nothing. Set subWallets to 0 to keep the single-position
-  // pure-mirror behaviour every measurement in this repo was taken under.
-  subWallets: 3,
+  // +50% and mirrors nothing. 0 is off.
+  //
+  // ── DEFAULT 0, DELIBERATELY ─────────────────────────────────────────────
+  // Splitting is opt-in because it changes what the book MEASURES, not just
+  // how it trades. Round-trip drag is our return minus the target's on the
+  // same token, which only means something while both sides exit the same way.
+  // At three sub-wallets two thirds of capital exits on our ladder instead, so
+  // only the moonshot share stays a valid calibration sample and the n=20
+  // effort collects at a third of the rate.
+  //
+  // The economics point the same way at current sizing: 0.01 SOL split three
+  // ways is 0.0033 each against 0.00204 of ATA rent plus fees — 91% overhead,
+  // against the ~5% exit drag the split is meant to work around. Pass
+  // --sub-wallets 3 when trade size makes that arithmetic work.
+  subWallets: 0,
 
   rpcMirror: {
     enabled: true,

@@ -9192,6 +9192,36 @@ test('a split sums exactly back to the whole', async () => {
   assert.equal(resolveSubWallets(1).profiles[0].pureMirror, false);
 });
 
+test('splitting is off by default, because it changes what the book measures', async () => {
+  const { PAPER_DEFAULTS, paperConfig, createBook, openPaperPosition } = await PC();
+
+  // ── WHY THE DEFAULT IS 0 AND NOT 3 ──────────────────────────────────────
+  // Splitting changes what the book MEASURES, not only how it trades.
+  // Round-trip drag is our return minus the target's on the same token, which
+  // means something only while both sides exit the same way. At three
+  // sub-wallets two thirds of capital exits on our own ladder, so only the
+  // moonshot share stays a valid calibration sample and the n=20 effort
+  // collects at a third of the rate.
+  //
+  // The economics agree at current sizing: 0.01 SOL split three ways carries
+  // 91% overhead against the ~5% exit drag the split exists to work around.
+  assert.equal(PAPER_DEFAULTS.subWallets, 0, 'splitting must be opt-in');
+  assert.equal(paperConfig({}).subWallets, 0);
+
+  // A position opened under the default has no sub-positions at all — not an
+  // array of one, which would still route through the split code path.
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1 });
+  const book = createBook({ budgetSol: 10 });
+  openPaperPosition(book, { mint: 'M', symbol: 'M', priceUsd: 1, cfg, now: 1000 });
+  assert.equal(book.positions.M.subs, undefined, 'pure mirror keeps one undivided position');
+
+  // Opting in still works.
+  const split = paperConfig({ budgetSol: 10, perTradeSol: 3, subWallets: 3 });
+  const book2 = createBook({ budgetSol: 10 });
+  openPaperPosition(book2, { mint: 'M', symbol: 'M', priceUsd: 1, cfg: split, now: 1000 });
+  assert.equal(book2.positions.M.subs.length, 3);
+});
+
 test('each sub-wallet exits on its own ladder, and only the moonshot holds', async () => {
   const { resolveSubWallets, subWalletCfg } = await SW();
   const { evaluatePaperExits, paperConfig } = await PC();

@@ -1985,9 +1985,16 @@ export async function main(argv = []) {
   // repoRoot is the parent of aegis/, so a keyfile anywhere in the working
   // tree is refused.
   // ── Sub-wallets ─────────────────────────────────────────────────────────
+  // Off unless asked for. Splitting changes what a shadow run measures — two
+  // thirds of capital would stop mirroring, and drag against the target then
+  // reports a strategy difference rather than a copying cost.
   const swIdx = argv.indexOf('--sub-wallets');
-  const subWallets = resolveSubWallets(swIdx !== -1 ? argv[swIdx + 1] : 3);
-  if (subWallets.clamped && swIdx !== -1) {
+  const swRequested = swIdx !== -1 ? Number(argv[swIdx + 1]) : 0;
+  const subWalletsOff = !(swRequested > 0);
+  const subWallets = subWalletsOff
+    ? { count: 0, clamped: false, reason: null, profiles: [] }
+    : resolveSubWallets(argv[swIdx + 1]);
+  if (subWallets.clamped) {
     console.error(`  --sub-wallets ${argv[swIdx + 1]} is ${subWallets.reason}; using ${subWallets.count}.`);
   }
 
@@ -1998,7 +2005,7 @@ export async function main(argv = []) {
     if (!keyfiles.length) {
       console.error('--live requires --keyfile <path-to-keypair.json>, outside this repository.');
       console.error('Use a DEDICATED hot wallet funded only with what you can afford to lose.');
-      console.error(`With --sub-wallets ${subWallets.count}, pass --keyfile once per sub-wallet, in profile order.`);
+      if (!subWalletsOff) console.error(`With --sub-wallets ${subWallets.count}, pass --keyfile once per sub-wallet, in profile order.`);
       process.exitCode = 1;
       return;
     }
@@ -2006,8 +2013,11 @@ export async function main(argv = []) {
     // put two exit profiles on one token balance: the scalper's +50% sale and
     // the moonshot's hold would fight over the same tokens, and whichever ran
     // first would silently decide the other's outcome.
-    if (keyfiles.length !== subWallets.count) {
-      console.error(`  ${keyfiles.length} keyfile(s) for ${subWallets.count} sub-wallet(s).`);
+    //
+    // With splitting off there is one wallet, so one keyfile.
+    const wanted = subWalletsOff ? 1 : subWallets.count;
+    if (keyfiles.length !== wanted) {
+      console.error(`  ${keyfiles.length} keyfile(s) for ${wanted} wallet(s).`);
       console.error('  Each sub-wallet needs its own wallet — sharing one would put two exit');
       console.error('  profiles on a single token balance, and the first to fire would decide both.');
       process.exitCode = 1;
@@ -2057,20 +2067,26 @@ export async function main(argv = []) {
   console.log(`  sizing        ${paperCfg.pctWhale ? paperCfg.pctWhale + '% of target' : paperCfg.perTradeSol + ' SOL flat'}`);
 
   // ── Sub-wallets, and what splitting costs ───────────────────────────────
-  const econ = subWalletEconomics({
-    totalTradeSol: cfg.maxTradeSol,
-    count: subWallets.count,
-    priorityFeeSol: (cfg.priorityFeeMaxLamports ?? 0) / LAMPORTS,
-    jitoTipSol: (cfg.jitoTipLamports ?? 0) / LAMPORTS,
-  });
-  console.log(`  sub-wallets   ${subWallets.count} · ${subWallets.profiles.map((p) => p.name).join(' / ')}`);
-  for (const p of subWallets.profiles) console.log(`     ${p.id}. ${p.name.padEnd(11)} ${p.note}`);
-  console.log(`  split         ${econ.perWalletSol.toFixed(5)} SOL each at the ${cfg.maxTradeSol} SOL cap`);
-  console.log(`  overhead      ${econ.totalOverheadSol.toFixed(5)} SOL (${econ.overheadPct.toFixed(0)}% of the trade) — ATA rent, fees, tip`);
-  if (econ.warning) {
-    console.log(`  ⚠  ${econ.warning}`);
-    console.log(`     Position size divides by ${subWallets.count}; rent and fees do not. Raise --max-trade-sol`);
-    console.log(`     or use fewer sub-wallets before running this live.`);
+  if (subWalletsOff) {
+    console.log(`  sub-wallets   off — pure mirror, one position per trade`);
+  } else {
+    const econ = subWalletEconomics({
+      totalTradeSol: cfg.maxTradeSol,
+      count: subWallets.count,
+      priorityFeeSol: (cfg.priorityFeeMaxLamports ?? 0) / LAMPORTS,
+      jitoTipSol: (cfg.jitoTipLamports ?? 0) / LAMPORTS,
+    });
+    console.log(`  sub-wallets   ${subWallets.count} · ${subWallets.profiles.map((p) => p.name).join(' / ')}`);
+    for (const p of subWallets.profiles) console.log(`     ${p.id}. ${p.name.padEnd(11)} ${p.note}`);
+    console.log(`  split         ${econ.perWalletSol.toFixed(5)} SOL each at the ${cfg.maxTradeSol} SOL cap`);
+    console.log(`  overhead      ${econ.totalOverheadSol.toFixed(5)} SOL (${econ.overheadPct.toFixed(0)}% of the trade) — ATA rent, fees, tip`);
+    if (econ.warning) {
+      console.log(`  ⚠  ${econ.warning}`);
+      console.log(`     Position size divides by ${subWallets.count}; rent and fees do not. Raise --max-trade-sol`);
+      console.log(`     or use fewer sub-wallets before running this live.`);
+    }
+    console.log(`  ⚠  only the moonshot share still mirrors — calibration drag from the`);
+    console.log(`     other ${subWallets.count - 1} measures a strategy difference, not a copying cost.`);
   }
   if (live) {
     console.log(`  hot wallet    ${signer.publicKey}`);
