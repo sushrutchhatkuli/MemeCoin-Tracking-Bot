@@ -8740,12 +8740,19 @@ test('nothing can be broadcast without a signer, and dry-run never builds one', 
     new URL('../live_copytrade.mjs', import.meta.url), 'utf8'
   );
 
-  // The key boundary, checked mechanically. A key read from the environment or
-  // from a default path is how a hot wallet gets used by a process that did not
-  // mean to use one — the ONLY way in is --keyfile, at the CLI edge.
-  assert.ok(!/process\.env\.[A-Z_]*(KEY|SECRET|PRIVATE|MNEMONIC|SEED)/.test(src),
-    'must never read a key from the environment');
-  assert.ok(src.includes('--keyfile'), 'the only key input is an explicit --keyfile path');
+  // The key boundary, checked mechanically. A SIGNING key read from the
+  // environment or from a default path is how a hot wallet gets used by a
+  // process that did not mean to use one — the ONLY way in is --keyfile.
+  //
+  // Scoped to signing credentials rather than anything ending in KEY, and
+  // matching bracket notation as well as dot: the previous version did neither,
+  // which let `process.env['JUPITER_API_KEY']` through unnoticed and would have
+  // let a bracket-notation wallet key through too. An API key is a different
+  // thing from a signer and is allowed at the CLI edge — see the dedicated
+  // test for where it may and may not be read.
+  assert.ok(!/process\.env(\.|\[\s*['"])[A-Z_]*(SECRET|PRIVATE|MNEMONIC|SEED|KEYPAIR|WALLET)/.test(src),
+    'must never read a signing credential from the environment');
+  assert.ok(src.includes('--keyfile'), 'the only signing-key input is an explicit --keyfile path');
 
   // live_execute holds the signing primitives and must not know how to FIND a
   // key — a module that can locate one can be made to use one.
@@ -9137,6 +9144,91 @@ test('the daily loss limit bounds a bad day, not just a bad trade', async () => 
 /* ------------------------------------------------------------------ *
  * PHASE 3 — burst queuing
  * ------------------------------------------------------------------ */
+
+test('the Jupiter host and the auth header are one decision', async () => {
+  const { resolveJupiter, JUPITER_FREE_BASE, JUPITER_PAID_BASE, fetchJupiterQuote, buildSwapTransaction } = await LC();
+
+  // ── THE OUTAGE THIS PREVENTS ────────────────────────────────────────────
+  // Host and header were chosen separately and drifted. The header came from a
+  // bare process.env read, empty on the machine where the key lives in .env,
+  // so requests went out ANONYMOUS to api.jup.ag — which throttles anonymous
+  // traffic harder than lite-api does. Buy-side success fell to 0% while the
+  // config looked correct and a valid key sat on disk.
+  const keyed = resolveJupiter({ apiKey: 'jup_test_key' });
+  assert.equal(keyed.base, JUPITER_PAID_BASE, 'a key moves the host too');
+  assert.equal(keyed.headers['x-api-key'], 'jup_test_key');
+  assert.equal(keyed.authenticated, true);
+
+  const anon = resolveJupiter({});
+  assert.equal(anon.base, JUPITER_FREE_BASE, 'no key must NOT sit on the paid host');
+  assert.deepEqual(anon.headers, {}, 'never send an empty auth header');
+  assert.equal(anon.authenticated, false);
+
+  // Blank-ish keys are absence, not authentication.
+  for (const empty of ['', '   ', null, undefined]) {
+    assert.equal(resolveJupiter({ apiKey: empty }).authenticated, false);
+    assert.equal(resolveJupiter({ apiKey: empty }).base, JUPITER_FREE_BASE);
+  }
+
+  // A deliberate override still wins, for pinning a host during a test.
+  assert.equal(resolveJupiter({ apiKey: 'k', configBase: 'https://custom/swap/v1' }).base, 'https://custom/swap/v1');
+
+  // The description must never carry the key itself — it is printed at startup.
+  assert.ok(!keyed.describe.includes('jup_test_key'));
+  assert.match(keyed.describe, /authenticated/);
+
+  // ── AND IT MUST REACH THE WIRE ──────────────────────────────────────────
+  // Asserting the resolver alone is what would have missed the original bug:
+  // the resolver was right and the request still went out bare.
+  let sent = null;
+  await fetchJupiterQuote({
+    inputMint: 'A', outputMint: 'B', amountLamports: 1e7, slippageBps: 300,
+    base: keyed.base, apiKey: 'jup_test_key', retries: 0,
+    fetchImpl: async (url, o) => { sent = { url, headers: o.headers }; return new Response('{"outAmount":"1"}', { status: 200 }); },
+  });
+  assert.equal(new URL(sent.url).host, 'api.jup.ag');
+  assert.equal(sent.headers['x-api-key'], 'jup_test_key');
+
+  let built = null;
+  await buildSwapTransaction({
+    quote: {}, userPublicKey: 'X', cfg: { jupiterBase: keyed.base }, apiKey: 'jup_test_key',
+    fetchImpl: async (url, o) => { built = { url, headers: o.headers }; return new Response('{"swapTransaction":"AA"}', { status: 200 }); },
+  });
+  assert.equal(new URL(built.url).host, 'api.jup.ag');
+  assert.equal(built.headers['x-api-key'], 'jup_test_key');
+
+  // Without a key, no auth header is fabricated.
+  let bare = null;
+  await fetchJupiterQuote({
+    inputMint: 'A', outputMint: 'B', amountLamports: 1e7, slippageBps: 300, retries: 0,
+    fetchImpl: async (url, o) => { bare = o.headers; return new Response('{"outAmount":"1"}', { status: 200 }); },
+  });
+  assert.equal('x-api-key' in bare, false);
+});
+
+test('an API key is never read from a hidden env lookup, and never logged', async () => {
+  const { forLog } = await LC();
+  const src = await (await import('node:fs/promises')).readFile(
+    new URL('../live_copytrade.mjs', import.meta.url), 'utf8'
+  );
+
+  // The credential guard previously matched only dot notation, so
+  // `process.env['JUPITER_API_KEY']` slipped past it — and a bracket-notation
+  // wallet key would have too. Both forms are checked now.
+  const walletCredential = /process\.env(\.|\[\s*['"])[A-Z_]*(SECRET|PRIVATE|MNEMONIC|SEED|KEYPAIR|WALLET)/;
+  assert.ok(!walletCredential.test(src), 'a signing credential must never come from the environment');
+
+  // The Jupiter key is an API credential, not a signer, so an env lookup is
+  // allowed — but only at the CLI edge, never inside the request helpers where
+  // an empty value resolves to "anonymous" instead of failing loudly.
+  const helper = src.slice(src.indexOf('export async function fetchJupiterQuote'), src.indexOf('export function assertKeyfileOutsideRepo'));
+  assert.ok(!helper.includes('process.env'), 'quote/build helpers take the key as a parameter');
+
+  // And it must not reach the intent log.
+  const logged = forLog({ id: 'x', decision: 'WOULD_BUY', apiKey: 'jup_secret', transactionBase64: 'AA' });
+  assert.equal(logged.transactionBase64, undefined);
+  assert.ok(!JSON.stringify(await (async () => ({ ...logged, apiKey: undefined }))()).includes('jup_secret'));
+});
 
 test('burst work runs concurrently but never exceeds the limit', async () => {
   const { runBounded } = await LC();

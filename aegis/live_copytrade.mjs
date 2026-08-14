@@ -347,6 +347,49 @@ export function evaluateSafetyGate(security, { venue = 'unknown', cfg = LIVE_DEF
  * network failure or a rate limit. Measured on this target it was 0/12, but
  * that is a fact about today rather than a guarantee.
  */
+export const JUPITER_FREE_BASE = 'https://lite-api.jup.ag/swap/v1';
+export const JUPITER_PAID_BASE = 'https://api.jup.ag/swap/v1';
+
+/**
+ * Pick the Jupiter host and auth header together. PURE.
+ *
+ * ── HOST AND HEADER ARE ONE DECISION, NOT TWO ───────────────────────────────
+ * They were separate and drifted apart, which is how the buy side reached a 0%
+ * success rate while the config looked right: the header was set from a bare
+ * `process.env.JUPITER_API_KEY`, empty on this machine because the key lives in
+ * .env, so every request went out anonymous — and anonymous requests to
+ * api.jup.ag are throttled HARDER than to lite-api. The two halves have to be
+ * chosen in one place or the failure is silent.
+ *
+ * MEASURED, 12 simultaneous quotes per host, run in both orders to rule out
+ * quota carry-over between tests:
+ *
+ *   lite-api,   no key            12/12   (idle; collapses under sustained load)
+ *   api.jup.ag, no key             5/12
+ *   api.jup.ag, Authorization      5/12   <- identical to anonymous
+ *   api.jup.ag, x-api-key         10/12
+ *
+ * So `x-api-key` is the header that authenticates and Bearer silently does
+ * not — it returns 200s, just at the anonymous rate, which is exactly the kind
+ * of failure that looks like success.
+ *
+ * Note 10/12, not 12/12: the key RAISES the limit, it does not remove it. Real
+ * use is paced at cfg.quotePaceMs rather than fired in bursts, so this is ample
+ * — but "unthrottled" would be the wrong word for it.
+ */
+export function resolveJupiter({ apiKey = null, configBase = null } = {}) {
+  const key = typeof apiKey === 'string' && apiKey.trim() ? apiKey.trim() : null;
+  // An explicit config base always wins; otherwise the host follows the key.
+  const base = configBase || (key ? JUPITER_PAID_BASE : JUPITER_FREE_BASE);
+  return {
+    base,
+    headers: key ? { 'x-api-key': key } : {},
+    authenticated: Boolean(key),
+    // For logging. Never expose the key itself.
+    describe: `${new URL(base).host}${key ? ' (authenticated)' : ' (anonymous)'}`,
+  };
+}
+
 export async function fetchJupiterQuote(
   {
     inputMint,
@@ -354,6 +397,7 @@ export async function fetchJupiterQuote(
     amountLamports,
     slippageBps,
     base = LIVE_DEFAULTS.jupiterBase,
+    apiKey = null,
     fetchImpl = fetch,
     retries = 1,
     retryDelayMs = 1200,
@@ -363,9 +407,9 @@ export async function fetchJupiterQuote(
     `${base}/quote?inputMint=${inputMint}&outputMint=${outputMint}` +
     `&amount=${Math.floor(amountLamports)}&slippageBps=${slippageBps}`;
 
-  const headers = {};
-  const apiKey = process.env['JUPITER_API_KEY'];
-  if (apiKey) headers['x-api-key'] = apiKey;
+  // Passed in explicitly. A hidden environment read here is what broke this
+  // once already, because it silently resolves to "no key" rather than failing.
+  const headers = apiKey ? { 'x-api-key': apiKey } : {};
 
   let last = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -430,11 +474,10 @@ export async function fetchJupiterQuote(
  * discarded; nothing signs it.
  */
 export async function buildSwapTransaction(
-  { quote, userPublicKey, cfg = LIVE_DEFAULTS, fetchImpl = fetch } = {}
+  { quote, userPublicKey, cfg = LIVE_DEFAULTS, apiKey = null, fetchImpl = fetch } = {}
 ) {
   try {
     const headers = { 'content-type': 'application/json' };
-    const apiKey = process.env['JUPITER_API_KEY'];
     if (apiKey) headers['x-api-key'] = apiKey;
 
     const res = await fetchImpl(`${cfg.jupiterBase}/swap`, {
@@ -600,6 +643,7 @@ export async function planIntent(
     decimalsFor = async () => null,
     quoteFn = fetchJupiterQuote,
     buildFn = buildSwapTransaction,
+    jupiterKey = null,
     now = Date.now(),
   } = {}
 ) {
@@ -658,6 +702,7 @@ export async function planIntent(
     amountLamports: sized.sizeSol * LAMPORTS,
     slippageBps: cfg.slippageBps,
     base: cfg.jupiterBase,
+    apiKey: jupiterKey,
   });
   if (!quoted.ok) {
     return {
@@ -720,7 +765,7 @@ export async function planIntent(
     return { ...base, ...measured, decision: 'BLOCKED', reason: gate.reasons.join('; ') };
   }
 
-  const built = await buildFn({ quote: quoted.quote, userPublicKey, cfg });
+  const built = await buildFn({ quote: quoted.quote, userPublicKey, cfg, apiKey: jupiterKey });
 
   return {
     ...base,
@@ -757,7 +802,7 @@ export function forLog(intent) {
  */
 export async function planLiveSell(
   trade,
-  { cfg, book, holdings, decimalsFor, quoteFn = fetchJupiterQuote, buildFn = buildSwapTransaction, userPublicKey, slippageBps, now = Date.now() } = {}
+  { cfg, book, holdings, decimalsFor, quoteFn = fetchJupiterQuote, buildFn = buildSwapTransaction, userPublicKey, slippageBps, jupiterKey = null, now = Date.now() } = {}
 ) {
   const base = { id: intentId(trade.signature, 'SELL'), at: now, side: 'SELL', mint: trade.mint, targetSignature: trade.signature ?? null };
   const heldTokens = holdings?.get?.(trade.mint) ?? book?.positions?.[trade.mint]?.tokens ?? 0;
@@ -774,12 +819,13 @@ export async function planLiveSell(
     amountLamports: Math.floor(sellTokens * 10 ** decimals),
     slippageBps: slippageBps ?? cfg.slippageBps,
     base: cfg.jupiterBase,
+    apiKey: jupiterKey,
   });
   if (!quoted.ok) {
     return { ...base, decision: quoted.noRoute ? 'NO_ROUTE' : quoted.throttled ? 'THROTTLED' : 'QUOTE_FAILED', reason: quoted.error, sellTokens };
   }
 
-  const built = await buildFn({ quote: quoted.quote, userPublicKey, cfg });
+  const built = await buildFn({ quote: quoted.quote, userPublicKey, cfg, apiKey: jupiterKey });
   return {
     ...base,
     decision: built.ok ? 'WOULD_SELL' : 'BUILD_FAILED',
@@ -1493,7 +1539,7 @@ export function calibrationVerdict(summary, { minRoundTrips = 20 } = {}) {
  * their size would measure price impact at a depth we would never trade.
  */
 export async function shadowSellQuote(
-  trade, { ledger, cfg, solUsd, decimalsFor, quoteFn = fetchJupiterQuote, paperCfg = {} } = {}
+  trade, { ledger, cfg, solUsd, decimalsFor, quoteFn = fetchJupiterQuote, paperCfg = {}, jupiterKey = null } = {}
 ) {
   const open = ledger?.open?.get(trade.mint);
   const targetFillUsd = impliedExitPriceUsd(trade, { solUsd, minReceiveSol: paperCfg.impliedMinSpendSol });
@@ -1510,6 +1556,7 @@ export async function shadowSellQuote(
     amountLamports: Math.floor(tokens * 10 ** decimals),
     slippageBps: cfg.slippageBps,
     base: cfg.jupiterBase,
+    apiKey: jupiterKey,
   });
   if (!quoted.ok) return { ourFillUsd: null, targetFillUsd, exitGapPct: null, reason: quoted.error };
 
@@ -1696,6 +1743,22 @@ export async function main(argv = []) {
 
   const { loadEnv } = await import('./telegram.mjs');
   const dotenv = await loadEnv(join(HERE, '.env')).catch(() => ({}));
+
+  // ── Jupiter auth, resolved once and passed down explicitly ──────────────
+  // configBase is only honoured when it was deliberately overridden; the
+  // shipped default is the free host, and letting it win would pin an
+  // authenticated run to the anonymous endpoint.
+  const configuredBase = config.live?.jupiterBase ?? null;
+  const jupiter = resolveJupiter({
+    apiKey: process.env.JUPITER_API_KEY || dotenv.jupiterKey || null,
+    configBase: configuredBase && configuredBase !== JUPITER_FREE_BASE ? configuredBase : null,
+  });
+  const jupiterKey = jupiter.authenticated ? (process.env.JUPITER_API_KEY || dotenv.jupiterKey) : null;
+  // The host follows the key. Leaving cfg on the free default while sending an
+  // authenticated header is the half-configured state that caused the outage:
+  // the key was set and the requests still went to the anonymous endpoint.
+  cfg.jupiterBase = jupiter.base;
+
   const rpcUrl = resolveChainRpc({
     envUrl: process.env.SOLANA_RPC_URL || dotenv.rpcOverride || null,
     configUrl: config.rpcMirror?.url ?? null,
@@ -1769,7 +1832,7 @@ export async function main(argv = []) {
   console.log('═'.repeat(64));
   console.log(`  target        ${target.address.slice(0, 16)}…`);
   console.log(`  node          ${new URL(rpcUrl).host}`);
-  console.log(`  jupiter       ${new URL(cfg.jupiterBase).host}`);
+  console.log(`  jupiter       ${jupiter.describe}`);
   console.log(`  sizing        ${paperCfg.pctWhale ? paperCfg.pctWhale + '% of target' : paperCfg.perTradeSol + ' SOL flat'}`);
   if (live) {
     console.log(`  hot wallet    ${signer.publicKey}`);
@@ -1883,13 +1946,13 @@ export async function main(argv = []) {
 
         if (live && t.kind === 'SELL') {
           const holdings = await fetchHoldings({ owner: signer.publicKey, rpcUrl, rpcImpl });
-          return planLiveSell(t, { cfg, book, holdings: holdings.holdings, decimalsFor, userPublicKey, now: Date.now() });
+          return planLiveSell(t, { cfg, book, holdings: holdings.holdings, decimalsFor, userPublicKey, jupiterKey, now: Date.now() });
         }
         return planIntent(t, {
           cfg, paperCfg, book, solUsd, userPublicKey, nativeSolBalance,
           // In-flight size counts against the cap, so concurrent buys cannot
           // each read the same stale exposure and all decide they fit.
-          exposureSol: exposure.inFlight, securityFor, decimalsFor, now: Date.now(),
+          exposureSol: exposure.inFlight, securityFor, decimalsFor, jupiterKey, now: Date.now(),
         });
       });
       intent.seeded = seeded;
@@ -1905,7 +1968,7 @@ export async function main(argv = []) {
       } else if (t.kind === 'SELL' && calibration.open.has(t.mint)) {
         // The exit half, previously NOTED but never priced — which is why the
         // exit sample stood at 4 against 18 for entries.
-        const ex = await shadowSellQuote(t, { ledger: calibration, cfg, solUsd, decimalsFor, paperCfg });
+        const ex = await shadowSellQuote(t, { ledger: calibration, cfg, solUsd, decimalsFor, paperCfg, jupiterKey });
         intent.ourFillUsd = ex.ourFillUsd;
         intent.targetFillUsd = ex.targetFillUsd;
         intent.exitGapPct = ex.exitGapPct;
@@ -1948,7 +2011,7 @@ export async function main(argv = []) {
                 intent, signer, rpcUrl, rpcImpl, cfg,
                 onSent: ({ signature }) => updateIntent(intent.id, { sentSignature: signature }),
                 requote: async ({ slippageBps }) => {
-                  const re = await planLiveSell(t, { cfg, book, holdings: null, decimalsFor, userPublicKey, slippageBps, now: Date.now() });
+                  const re = await planLiveSell(t, { cfg, book, holdings: null, decimalsFor, userPublicKey, slippageBps, jupiterKey, now: Date.now() });
                   return { ok: Boolean(re.transactionBase64), transactionBase64: re.transactionBase64, error: re.reason };
                 },
               });

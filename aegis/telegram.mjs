@@ -81,6 +81,12 @@ export async function loadEnv(path) {
     // and the key in practice lives in .env — a bare process.env read would
     // find nothing on a machine that has it configured.
     gmgnKey: pick('GMGN_API_KEY'),
+    // Same reason, and it cost a measurement to learn: live_copytrade set the
+    // x-api-key header from a bare process.env read, which is empty on this
+    // machine because the key lives in .env. Every quote therefore went out
+    // anonymous, and the buy side throttled to a 0% success rate while the
+    // config looked correct.
+    jupiterKey: pick('JUPITER_API_KEY'),
   };
 }
 
