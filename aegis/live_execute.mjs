@@ -446,6 +446,168 @@ export function panicEscalation(attempt, cfg = {}) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Multi-signer support
+ * ------------------------------------------------------------------ */
+
+/**
+ * Build one signer per sub-wallet, from bytes the CALLER already read.
+ *
+ * Same boundary as createSigner and for the same reason: this takes raw bytes,
+ * never a path and never an environment name. The array shape does not relax
+ * that — each entry is bytes the CLI edge obtained and is responsible for.
+ *
+ * ── DISTINCTNESS IS CHECKED, NOT ASSUMED ────────────────────────────────────
+ * The same keyfile passed twice would produce two signers for ONE wallet. The
+ * partition would still divide by N, the bundle would still contain N
+ * transactions, and every log line would look correct — while that wallet
+ * silently took a double share and the sub-wallet exit profiles collided on a
+ * single token balance. Nothing downstream can detect it, so it is rejected
+ * here.
+ */
+export function createSigners(secretKeys = [], { expectPublicKeys = null } = {}) {
+  if (!Array.isArray(secretKeys) || secretKeys.length === 0) {
+    throw new Error('createSigners needs at least one secret key');
+  }
+  const signers = secretKeys.map((secretKey, i) =>
+    createSigner({ secretKey, expectPublicKey: expectPublicKeys?.[i] ?? null })
+  );
+
+  const seen = new Map();
+  for (const [i, s] of signers.entries()) {
+    if (seen.has(s.publicKey)) {
+      throw new Error(
+        `sub-wallets ${seen.get(s.publicKey) + 1} and ${i + 1} are the same wallet (${s.publicKey.slice(0, 8)}…) — ` +
+          'a duplicate would take a double share while every log line looked correct'
+      );
+    }
+    seen.set(s.publicKey, i);
+  }
+  return signers;
+}
+
+/* ------------------------------------------------------------------ *
+ * Jito bundles
+ * ------------------------------------------------------------------ */
+
+export const JITO_BUNDLE_ENDPOINT = 'https://mainnet.block-engine.jito.wtf/api/v1/bundles';
+
+/**
+ * Jito accepts at most five transactions in one bundle.
+ *
+ * This is why --sub-wallets is capped at 5: a sixth sub-wallet could not land
+ * atomically with the others, which would defeat the only reason to bundle.
+ */
+export const JITO_MAX_BUNDLE_SIZE = 5;
+
+/**
+ * Assemble a bundle from already-signed transactions. PURE.
+ *
+ * ── WHAT A BUNDLE DOES AND DOES NOT DO ──────────────────────────────────────
+ * A Jito bundle is executed atomically, in order, within a single slot: either
+ * every transaction lands or none does. For sub-wallet entries that is exactly
+ * the property wanted — N wallets buying the same token in the same block at
+ * the same price, rather than in sequence at N different prices, which would
+ * make the sub-wallets' entries incomparable before their exits ever diverge.
+ *
+ * It is worth being accurate about the threat model, since it changes what to
+ * expect. Solana has no public pending-transaction mempool of the Ethereum
+ * kind, so this is not protection from someone reading an unconfirmed
+ * transaction. What it does provide is that the bundle's transactions cannot be
+ * interleaved with a third party's inside the block, which is what stops a
+ * sandwich forming between our own buys. Leader-level ordering is still an
+ * auction: a bundle competes on tip, and losing the auction means the bundle
+ * simply does not land that slot.
+ *
+ * The tip itself is not added here. Jupiter builds it into the swap when the
+ * swap request carries prioritizationFeeLamports.jitoTipLamports — VERIFIED
+ * against the live API, which returns a 735-byte transaction with the tip
+ * against 698 without. Constructing a transfer by hand would mean building a
+ * transaction from scratch rather than signing one, and every extra byte we
+ * author is a byte that can authorise something unintended.
+ */
+export function buildJitoBundle(signedTransactions = [], { encoding = 'base64' } = {}) {
+  const txs = signedTransactions.filter(Boolean);
+  if (txs.length === 0) return { ok: false, error: 'bundle is empty' };
+  if (txs.length > JITO_MAX_BUNDLE_SIZE) {
+    return { ok: false, error: `bundle holds ${txs.length}, Jito accepts at most ${JITO_MAX_BUNDLE_SIZE}` };
+  }
+  for (const [i, t] of txs.entries()) {
+    if (typeof t !== 'string' || !t.length) return { ok: false, error: `transaction ${i} is not an encoded string` };
+  }
+  return {
+    ok: true,
+    // Order is preserved and is meaningful: Jito executes the bundle in the
+    // order given, so the tip-bearing transaction must not be last if an
+    // earlier one can fail the whole bundle.
+    payload: {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'sendBundle',
+      params: [txs, { encoding }],
+    },
+    size: txs.length,
+    encoding,
+  };
+}
+
+/**
+ * Submit a bundle to the Jito block engine.
+ *
+ * `allowSend` defaults to FALSE. Every other send path in this codebase is
+ * reachable only with an explicit --live and a signer; a bundle submitter that
+ * broadcast by default would be the one way real money could move without that
+ * chain of consent. It has to be opted into at the call site.
+ */
+export async function submitJitoBundle(
+  { bundle, endpoint = JITO_BUNDLE_ENDPOINT, fetchImpl = fetch, allowSend = false, timeoutMs = 10_000 } = {}
+) {
+  if (!bundle?.ok) return { ok: false, error: bundle?.error ?? 'no bundle' };
+  if (!allowSend) {
+    return { ok: false, blocked: true, error: 'submitJitoBundle requires allowSend:true — refusing to broadcast by default' };
+  }
+  try {
+    const res = await fetchImpl(endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(bundle.payload),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+    const body = await res.json();
+    if (body?.error) return { ok: false, error: body.error?.message ?? JSON.stringify(body.error).slice(0, 120) };
+    // The bundle id is not a signature and cannot be looked up with
+    // getSignatureStatuses; the transactions inside carry their own.
+    return { ok: true, bundleId: body?.result ?? null };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Sign every sub-wallet's transaction for one atomic entry. PURE-ish.
+ *
+ * Each transaction is signed by ITS OWN wallet — signer i signs transaction i.
+ * They are paired by index, and a mismatch is rejected rather than signed:
+ * signing wallet A's transaction with wallet B's key produces a transaction the
+ * network rejects, which at bundle scale means all N entries silently fail to
+ * land together.
+ */
+export function signBundleTransactions({ transactions = [], signers = [] } = {}) {
+  if (transactions.length !== signers.length) {
+    return { ok: false, error: `${transactions.length} transactions against ${signers.length} signers — they pair by index` };
+  }
+  const signed = [];
+  for (const [i, tx] of transactions.entries()) {
+    try {
+      signed.push(signTransaction({ transactionBase64: tx, signer: signers[i] }));
+    } catch (err) {
+      return { ok: false, error: `sub-wallet ${i + 1} (${signers[i]?.publicKey?.slice(0, 8)}…): ${err.message}` };
+    }
+  }
+  return { ok: true, signed, encoded: signed.map((s) => s.signedBase64), signatures: signed.map((s) => s.signature) };
+}
+
+/* ------------------------------------------------------------------ *
  * Orchestration
  * ------------------------------------------------------------------ */
 

@@ -79,6 +79,11 @@ import {
 
 import {
   createSigner,
+  createSigners,
+  buildJitoBundle,
+  submitJitoBundle,
+  signBundleTransactions,
+  JITO_MAX_BUNDLE_SIZE,
   executeTransaction,
   confirmWithinSlots,
   unresolvedIntents,
@@ -87,6 +92,15 @@ import {
   diffHoldings,
   panicEscalation,
 } from './live_execute.mjs';
+
+import {
+  resolveSubWallets,
+  partitionSizeSol,
+  subWalletEconomics,
+  subWalletCfg,
+  createSubPositions,
+  summariseSubPositions,
+} from './sub_wallets.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const INTENT_LOG_PATH = join(HERE, '.state', 'live_intents.json');
@@ -631,6 +645,23 @@ export function assertKeyfileOutsideRepo(keyfilePath, repoRoot) {
  * and the array is not retained: the only surviving reference is the closure
  * inside the signer.
  */
+/**
+ * Collect every --keyfile argument. PURE.
+ *
+ * Repeated rather than comma-separated: a path may contain a comma, and a
+ * split that silently halves a path would look like a missing file rather than
+ * a parsing bug. Repetition also makes the sub-wallet ORDER explicit, which
+ * matters because order selects the exit profile — the first keyfile is the
+ * scalper, the third the moonshot.
+ */
+export function collectKeyfileArgs(argv = []) {
+  const paths = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--keyfile' && argv[i + 1] && !argv[i + 1].startsWith('--')) paths.push(argv[++i]);
+  }
+  return paths;
+}
+
 export async function readKeyfileBytes(keyfilePath, { repoRoot, readFileImpl = readFile } = {}) {
   const safe = repoRoot ? assertKeyfileOutsideRepo(keyfilePath, repoRoot) : resolve(keyfilePath);
   let parsed;
@@ -918,6 +949,93 @@ export async function planLiveSell(
     transactionBase64: built.transactionBase64 ?? null,
     transactionBytes: built.bytes ?? null,
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * Sub-wallet atomic entry
+ * ------------------------------------------------------------------ */
+
+/**
+ * Quote and build one swap per sub-wallet for a single target buy.
+ *
+ * Each sub-wallet gets its own quote at its own size, because price impact is
+ * not linear: three 0.0033 SOL swaps do not quote as one 0.01 SOL swap, and
+ * pricing all three off a single quote would misstate every entry.
+ *
+ * Built SEQUENTIALLY through the shared rate limiter rather than in parallel.
+ * Parallel would be faster by roughly a second, and would also be the same
+ * mistake that held the collector at a 1% success rate — the limiter would
+ * serialise them anyway, just after they had already spent their retries.
+ */
+export async function buildSubWalletEntries(
+  { trade, parts, signers, cfg, slippageBps, jupiterKey, quoteFn = fetchJupiterQuote, buildFn = buildSwapTransaction } = {}
+) {
+  if (parts.length !== signers.length) {
+    return { ok: false, error: `${parts.length} parts against ${signers.length} signers` };
+  }
+  const legs = [];
+  for (const [i, sizeSol] of parts.entries()) {
+    const quoted = await quoteFn({
+      inputMint: WSOL_MINT,
+      outputMint: trade.mint,
+      amountLamports: Math.floor(sizeSol * LAMPORTS),
+      slippageBps: slippageBps ?? cfg.slippageBps,
+      base: cfg.jupiterBase,
+      apiKey: jupiterKey,
+    });
+    if (!quoted.ok) {
+      // One leg failing kills the whole entry. A bundle is atomic, so a partial
+      // set would either be rejected wholesale or — worse, if submitted as
+      // singles — leave the sub-wallets holding unequal shares of a position
+      // whose exit profiles assume they are equal.
+      return { ok: false, error: `sub-wallet ${i + 1}: ${quoted.error}`, failedLeg: i, throttled: quoted.throttled };
+    }
+    const built = await buildFn({
+      quote: quoted.quote,
+      userPublicKey: signers[i].publicKey,
+      cfg,
+      apiKey: jupiterKey,
+    });
+    if (!built.ok) return { ok: false, error: `sub-wallet ${i + 1} build: ${built.error}`, failedLeg: i };
+    legs.push({
+      subId: i + 1,
+      wallet: signers[i].publicKey,
+      sizeSol,
+      transactionBase64: built.transactionBase64,
+      outAmount: Number(quoted.quote.outAmount),
+      priceImpactPct: Number(quoted.quote.priceImpactPct ?? 0),
+    });
+  }
+  return { ok: true, legs };
+}
+
+/**
+ * Sign every leg and land them together, or land none of them.
+ *
+ * ── WHY ATOMICITY IS THE POINT ──────────────────────────────────────────────
+ * Sent as separate transactions, N sub-wallet buys land across different slots
+ * at different prices. The staggered exit profiles then compare against N
+ * different entries, so "sub-wallet 1 exited at +50%" and "sub-wallet 3 is
+ * still holding" would not be measuring the same trade — the divergence the
+ * design is meant to create would be contaminated by an entry spread nobody
+ * chose. One slot, one price, and the only difference between sub-wallets is
+ * the exit rule, which is the whole experiment.
+ */
+export async function submitSubWalletBundle(
+  { legs, signers, endpoint, fetchImpl, allowSend = false } = {}
+) {
+  if (!legs?.length) return { ok: false, error: 'nothing to bundle' };
+  if (legs.length > JITO_MAX_BUNDLE_SIZE) {
+    return { ok: false, error: `${legs.length} legs exceeds Jito's ${JITO_MAX_BUNDLE_SIZE}-transaction bundle limit` };
+  }
+  const signed = signBundleTransactions({ transactions: legs.map((l) => l.transactionBase64), signers });
+  if (!signed.ok) return signed;
+
+  const bundle = buildJitoBundle(signed.encoded);
+  if (!bundle.ok) return bundle;
+
+  const sent = await submitJitoBundle({ bundle, endpoint, fetchImpl, allowSend });
+  return { ...sent, signatures: signed.signatures, size: bundle.size };
 }
 
 /* ------------------------------------------------------------------ *
@@ -1866,19 +1984,41 @@ export async function main(argv = []) {
   // ── ITEM 1: the key is read HERE, at the edge, and nowhere else ──────────
   // repoRoot is the parent of aegis/, so a keyfile anywhere in the working
   // tree is refused.
+  // ── Sub-wallets ─────────────────────────────────────────────────────────
+  const swIdx = argv.indexOf('--sub-wallets');
+  const subWallets = resolveSubWallets(swIdx !== -1 ? argv[swIdx + 1] : 3);
+  if (subWallets.clamped && swIdx !== -1) {
+    console.error(`  --sub-wallets ${argv[swIdx + 1]} is ${subWallets.reason}; using ${subWallets.count}.`);
+  }
+
   let signer = null;
+  let signers = [];
   if (live) {
-    const kfIdx = argv.indexOf('--keyfile');
-    const keyfile = kfIdx !== -1 ? argv[kfIdx + 1] : null;
-    if (!keyfile) {
+    const keyfiles = collectKeyfileArgs(argv);
+    if (!keyfiles.length) {
       console.error('--live requires --keyfile <path-to-keypair.json>, outside this repository.');
       console.error('Use a DEDICATED hot wallet funded only with what you can afford to lose.');
+      console.error(`With --sub-wallets ${subWallets.count}, pass --keyfile once per sub-wallet, in profile order.`);
+      process.exitCode = 1;
+      return;
+    }
+    // One key per sub-wallet, no fewer. Reusing a key across sub-wallets would
+    // put two exit profiles on one token balance: the scalper's +50% sale and
+    // the moonshot's hold would fight over the same tokens, and whichever ran
+    // first would silently decide the other's outcome.
+    if (keyfiles.length !== subWallets.count) {
+      console.error(`  ${keyfiles.length} keyfile(s) for ${subWallets.count} sub-wallet(s).`);
+      console.error('  Each sub-wallet needs its own wallet — sharing one would put two exit');
+      console.error('  profiles on a single token balance, and the first to fire would decide both.');
       process.exitCode = 1;
       return;
     }
     try {
-      const bytes = await readKeyfileBytes(keyfile, { repoRoot: resolve(HERE, '..') });
-      signer = createSigner({ secretKey: bytes });
+      const repoRoot = resolve(HERE, '..');
+      const keys = [];
+      for (const kf of keyfiles) keys.push(await readKeyfileBytes(kf, { repoRoot }));
+      signers = createSigners(keys);
+      signer = signers[0];
     } catch (err) {
       console.error(`\n  ${err.message}\n`);
       process.exitCode = 1;
@@ -1915,6 +2055,23 @@ export async function main(argv = []) {
   console.log(`  node          ${new URL(rpcUrl).host}`);
   console.log(`  jupiter       ${jupiter.describe}`);
   console.log(`  sizing        ${paperCfg.pctWhale ? paperCfg.pctWhale + '% of target' : paperCfg.perTradeSol + ' SOL flat'}`);
+
+  // ── Sub-wallets, and what splitting costs ───────────────────────────────
+  const econ = subWalletEconomics({
+    totalTradeSol: cfg.maxTradeSol,
+    count: subWallets.count,
+    priorityFeeSol: (cfg.priorityFeeMaxLamports ?? 0) / LAMPORTS,
+    jitoTipSol: (cfg.jitoTipLamports ?? 0) / LAMPORTS,
+  });
+  console.log(`  sub-wallets   ${subWallets.count} · ${subWallets.profiles.map((p) => p.name).join(' / ')}`);
+  for (const p of subWallets.profiles) console.log(`     ${p.id}. ${p.name.padEnd(11)} ${p.note}`);
+  console.log(`  split         ${econ.perWalletSol.toFixed(5)} SOL each at the ${cfg.maxTradeSol} SOL cap`);
+  console.log(`  overhead      ${econ.totalOverheadSol.toFixed(5)} SOL (${econ.overheadPct.toFixed(0)}% of the trade) — ATA rent, fees, tip`);
+  if (econ.warning) {
+    console.log(`  ⚠  ${econ.warning}`);
+    console.log(`     Position size divides by ${subWallets.count}; rent and fees do not. Raise --max-trade-sol`);
+    console.log(`     or use fewer sub-wallets before running this live.`);
+  }
   if (live) {
     console.log(`  hot wallet    ${signer.publicKey}`);
     console.log(`  balance       ${nativeSolBalance.toFixed(4)} SOL (${usd(nativeSolBalance * solUsd)})`);

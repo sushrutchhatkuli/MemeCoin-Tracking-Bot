@@ -79,6 +79,14 @@ import { dirname, join, resolve } from 'node:path';
 import { fetchPairsBatch } from './sources.mjs';
 import { loadObservations } from './wallet_observations.mjs';
 import { websocketUrlFor } from './discovery_daemon.mjs';
+import {
+  resolveSubWallets,
+  partitionSizeSol,
+  createSubPositions,
+  subWalletCfg,
+  summariseSubPositions,
+  subWalletEconomics,
+} from './sub_wallets.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const BOOK_PATH = join(HERE, '.state', 'paper_copytrade.json');
@@ -185,6 +193,12 @@ export const PAPER_DEFAULTS = {
   // LIVE ON-CHAIN MIRROR. Reads the target's own transactions from a free
   // public RPC — 0 Helius credits — instead of waiting for the observation
   // ledger. Sees sells too, which the ledger never recorded.
+  // How many sub-wallets a position is split across, each with its own exit
+  // ladder. 1 is NOT "off": it is the scalper alone, which exits everything at
+  // +50% and mirrors nothing. Set subWallets to 0 to keep the single-position
+  // pure-mirror behaviour every measurement in this repo was taken under.
+  subWallets: 3,
+
   rpcMirror: {
     enabled: true,
     url: 'https://api.mainnet-beta.solana.com',
@@ -468,6 +482,24 @@ export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, no
     initialStakeSol: size,
     realisedSol: 0,
     firedRungs: [],
+    // ── Sub-wallets ──────────────────────────────────────────────────────
+    // Split at OPEN, so every sub-wallet shares one entry price. Splitting at
+    // exit instead would be a different strategy wearing the same name: the
+    // sub-wallets are meant to differ only in when they leave, and giving them
+    // separate entries would contaminate that comparison with an entry spread
+    // nobody chose. cfg.subWallets of 0 keeps the single-position behaviour
+    // that every measurement so far was taken under.
+    ...(cfg.subWallets > 0
+      ? (() => {
+          const { profiles } = resolveSubWallets(cfg.subWallets);
+          const split = partitionSizeSol(size, profiles.length);
+          return split.ok
+            ? { subs: createSubPositions({ parts: split.parts, profiles, entryPriceUsd: fillPriceUsd, now }) }
+            : // Too small to divide above a lamport: held whole rather than
+              // dropped, since a position that cannot split is still a position.
+              { subs: null, subSplitSkipped: split.reason };
+        })()
+      : {}),
     source,
     // Tagged so the scorecard can disclose that a number includes trades that
     // were never mirrored from the target.
@@ -586,6 +618,80 @@ export function applyPaperExit(book, mint, { priceUsd, trigger, sellFraction = 1
     delete book.positions[mint];
   }
   return { ok: true, proceedsSol: proceeds, closed: fullyClosed, trigger };
+}
+
+/**
+ * Sell a fraction of ONE sub-wallet's share. PURE.
+ *
+ * The same arithmetic as applyPaperExit, applied to a sub-position instead of
+ * the whole. Kept as its own function rather than a flag on that one because
+ * the closing behaviour genuinely differs: a sub-wallet reaching zero does NOT
+ * close the position, since the other sub-wallets are still holding. The
+ * position closes when the last of them does.
+ *
+ * Each sub keeps its own firedRungs, so the scalper booking its +50% cannot
+ * advance the mid-runner's ladder — which is the whole reason they are separate
+ * accounts rather than one position with three rules.
+ */
+export function applySubWalletExit(book, mint, subId, { priceUsd, trigger, sellFraction = 1, cfg, now = Date.now(), label = null }) {
+  const p = book.positions[mint];
+  const sub = p?.subs?.find((s) => s.subId === subId);
+  if (!p || !sub) return { ok: false, reason: 'no such sub-position' };
+  if (!Number.isFinite(priceUsd) || priceUsd <= 0) return { ok: false, reason: 'no usable price' };
+  if (!(sub.stakeSol > 0)) return { ok: false, reason: 'already closed' };
+
+  const exitPriceUsd = priceUsd * (1 - cfg.slippagePct / 100);
+  const fraction = Math.min(1, Math.max(0, sellFraction));
+  const costBasisSold = sub.stakeSol * fraction;
+  const proceeds = costBasisSold * (exitPriceUsd / sub.entryPriceUsd);
+
+  book.balanceSol += proceeds - cfg.feeSol;
+  sub.stakeSol -= costBasisSold;
+  sub.realisedSol += proceeds - costBasisSold - cfg.feeSol;
+  if (trigger?.startsWith('TP')) sub.firedRungs.push(trigger);
+
+  // The parent aggregates its children; it is not an independent balance.
+  p.stakeSol = p.subs.reduce((a, s) => a + s.stakeSol, 0);
+  p.realisedSol = p.subs.reduce((a, s) => a + s.realisedSol, 0);
+  p.markPriceUsd = priceUsd;
+  p.lastPricedAt = now;
+
+  const subClosed = sub.stakeSol <= 1e-9 || fraction >= 1;
+  if (subClosed) {
+    sub.stakeSol = 0;
+    sub.closed = true;
+    sub.closedAt = now;
+    sub.exitTrigger = trigger;
+  }
+
+  const allClosed = p.subs.every((s) => s.closed || s.stakeSol <= 1e-9);
+  if (allClosed) {
+    book.closed.push({
+      mint,
+      symbol: p.symbol,
+      openedAt: p.openedAt,
+      closedAt: now,
+      entryPriceUsd: p.entryPriceUsd,
+      exitPriceUsd,
+      stakeSol: p.initialStakeSol,
+      pnlSol: p.realisedSol,
+      pnlPct: p.initialStakeSol > 0 ? (p.realisedSol / p.initialStakeSol) * 100 : 0,
+      // Recorded per sub-wallet: a blended reason would hide that the scalper
+      // took +50% while the moonshot rode the same token to a target sell,
+      // which is precisely what the split exists to compare.
+      reason: trigger,
+      subOutcomes: p.subs.map((s) => ({
+        subId: s.subId, profile: s.profile, realisedSol: s.realisedSol,
+        pnlPct: s.initialStakeSol > 0 ? (s.realisedSol / s.initialStakeSol) * 100 : 0,
+        exitTrigger: s.exitTrigger ?? trigger,
+      })),
+      label,
+      source: p.source,
+      ...(p.demo ? { demo: true } : {}),
+    });
+    delete book.positions[mint];
+  }
+  return { ok: true, proceedsSol: proceeds, subClosed, positionClosed: allClosed, trigger, subId };
 }
 
 /** Mark a position to market and roll its peak. PURE. */
@@ -1834,6 +1940,32 @@ export async function runPaperTick({
         p.markPriceUsd;
       if (!Number.isFinite(price) || price <= 0) continue;
       const fraction = Number.isFinite(t.sellFraction) ? t.sellFraction : 1;
+      const gainPct = p.entryPriceUsd > 0 ? (price / p.entryPriceUsd - 1) * 100 : null;
+
+      if (p.subs?.length) {
+        // A target sell closes EVERY sub-wallet still holding, moonshot
+        // included — mirroring the exit is the moonshot's only exit rule, and
+        // the ladder profiles treat it as an early close of whatever remains.
+        // Iterated over a copy: applySubWalletExit deletes the position once
+        // the last sub closes, and mutating the array being walked would skip
+        // the sub after it.
+        for (const sub of [...p.subs]) {
+          if (sub.closed || !(sub.stakeSol > 0)) continue;
+          const res = applySubWalletExit(book, t.mint, sub.subId, {
+            priceUsd: price, trigger: 'WHALE_SELL', sellFraction: fraction, cfg, now,
+            label: `target sold ${(fraction * 100).toFixed(0)}% of its bag`,
+          });
+          if (res.ok) {
+            report.exits.push({
+              mint: t.mint, symbol: p.symbol, trigger: 'WHALE_SELL',
+              label: `target sold ${(fraction * 100).toFixed(0)}%`,
+              gainPct, subId: sub.subId, profile: sub.profile,
+            });
+          }
+        }
+        continue;
+      }
+
       const res = applyPaperExit(book, t.mint, {
         priceUsd: price,
         trigger: 'WHALE_SELL',
@@ -1848,7 +1980,7 @@ export async function runPaperTick({
           symbol: p.symbol,
           trigger: 'WHALE_SELL',
           label: `target sold ${(fraction * 100).toFixed(0)}%`,
-          gainPct: p.entryPriceUsd > 0 ? (price / p.entryPriceUsd - 1) * 100 : null,
+          gainPct,
         });
       }
       continue;
@@ -1895,10 +2027,32 @@ export async function runPaperTick({
       }
       continue;
     }
-    for (const exit of evaluatePaperExits(p, price, cfg)) {
-      if (!book.positions[mint]) break;
-      const res = applyPaperExit(book, mint, { priceUsd: price, ...exit, cfg, now });
-      if (res.ok) report.exits.push({ mint, symbol: p.symbol, trigger: exit.trigger, label: exit.label, gainPct: exit.gainPct });
+    if (p.subs?.length) {
+      // Each sub-wallet is evaluated under its OWN ladder. The scalper can book
+      // +50% on the same tick the moonshot holds, which is the entire point of
+      // the split — so a shared exit list would defeat it.
+      const { profiles } = resolveSubWallets(p.subs.length);
+      for (const sub of p.subs) {
+        if (sub.closed || !(sub.stakeSol > 0)) continue;
+        const profile = profiles.find((pr) => pr.id === sub.subId) ?? profiles[profiles.length - 1];
+        sub.peakPriceUsd = Math.max(sub.peakPriceUsd ?? price, price);
+        for (const exit of evaluatePaperExits(sub, price, subWalletCfg(cfg, profile))) {
+          if (!book.positions[mint]) break;
+          const res = applySubWalletExit(book, mint, sub.subId, { priceUsd: price, ...exit, cfg, now });
+          if (res.ok) {
+            report.exits.push({
+              mint, symbol: p.symbol, trigger: exit.trigger, label: exit.label,
+              gainPct: exit.gainPct, subId: sub.subId, profile: sub.profile,
+            });
+          }
+        }
+      }
+    } else {
+      for (const exit of evaluatePaperExits(p, price, cfg)) {
+        if (!book.positions[mint]) break;
+        const res = applyPaperExit(book, mint, { priceUsd: price, ...exit, cfg, now });
+        if (res.ok) report.exits.push({ mint, symbol: p.symbol, trigger: exit.trigger, label: exit.label, gainPct: exit.gainPct });
+      }
     }
   }
 
@@ -2080,12 +2234,33 @@ export function renderPositions(book, solUsd) {
       const valueSol = p.stakeSol * (p.entryPriceUsd > 0 ? p.markPriceUsd / p.entryPriceUsd : 1);
       const mark = Number.isFinite(solUsd) && solUsd > 0 ? usd(valueSol * solUsd, { sign: false }) : `${valueSol.toFixed(3)} SOL`;
       const tp = p.firedRungs?.length ? ` ${p.firedRungs.join(',')}` : '';
-      return (
+      const head =
         `  ${formatTicker(p.symbol, p.mint).padEnd(14).slice(0, 14)}` +
         `${mark.padStart(12)}` +
         `${`${gain >= 0 ? '+' : ''}${gain.toFixed(1)}%`.padStart(10)}` +
-        `${p.demo ? '  [DEMO]' : ''}${tp}`
-      );
+        `${p.demo ? '  [DEMO]' : ''}${tp}`;
+
+      if (!p.subs?.length) return head;
+
+      // ── Per sub-wallet breakdown ──────────────────────────────────────
+      // Indented under the position rather than listed as separate rows: they
+      // are one token at one entry price, and showing three tickers would read
+      // as three positions and treble the apparent open count.
+      const s = summariseSubPositions(p.subs);
+      const lines = s.byProfile.map((b) => {
+        const live = b.stakeSol * (p.entryPriceUsd > 0 ? p.markPriceUsd / p.entryPriceUsd : 1);
+        const value = b.closed
+          ? 'closed'
+          : Number.isFinite(solUsd) && solUsd > 0
+            ? usd(live * solUsd, { sign: false })
+            : `${live.toFixed(4)} SOL`;
+        const booked = b.realisedSol !== 0
+          ? `  booked ${b.realisedSol >= 0 ? '+' : ''}${(Number.isFinite(solUsd) && solUsd > 0 ? b.realisedSol * solUsd : b.realisedSol).toFixed(2)}${Number.isFinite(solUsd) && solUsd > 0 ? '' : ' SOL'}`
+          : '';
+        const rungs = b.rungs ? `  ${b.rungs} rung${b.rungs > 1 ? 's' : ''}` : '';
+        return `      ${String(b.subId)}. ${b.profile.padEnd(11)}${value.padStart(11)}${rungs}${booked}`;
+      });
+      return [head, ...lines].join('\n');
     });
   // Built from the same widths the rows use, so widening the ticker column
   // cannot leave the header pointing at the wrong place.
@@ -2101,6 +2276,19 @@ export async function main(argv = []) {
   // --budget and --starting-balance are the same thing; both names are accepted
   // because both were asked for and silently honouring one would be worse than
   // accepting two.
+  // --sub-wallets N splits each entry across N ladders. 0 keeps the single
+  // position every measurement in this repo was taken under.
+  const swIdx = argv.indexOf('--sub-wallets');
+  if (swIdx !== -1) {
+    const raw = Number(argv[swIdx + 1]);
+    if (raw === 0) cfg.subWallets = 0;
+    else {
+      const r = resolveSubWallets(argv[swIdx + 1]);
+      if (r.clamped) console.error(`  --sub-wallets ${argv[swIdx + 1]} is ${r.reason}; using ${r.count}.`);
+      cfg.subWallets = r.count;
+    }
+  }
+
   const budgetFlag = numericFlag(argv, '--budget');
   const startFlag = numericFlag(argv, '--starting-balance');
   for (const f of [budgetFlag, startFlag]) {

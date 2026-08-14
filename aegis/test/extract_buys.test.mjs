@@ -6076,7 +6076,7 @@ test('a paper entry debits virtual balance and prices in slippage', async () => 
 
 test('take-profit ladder sells fractions and leaves the rest running', async () => {
   const { createBook, openPaperPosition, evaluatePaperExits, applyPaperExit, paperConfig } = await PC();
-  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, subWallets: 0, /* single-position arithmetic; see the sub-wallet tests for the split */ });
   const book = createBook({ budgetSol: 10 });
   openPaperPosition(book, { mint: 'M', priceUsd: 100, cfg, now: 0 });
 
@@ -6230,6 +6230,7 @@ test('a paper tick marks, exits and enters against injected prices', async () =>
   // Ledger path: this test predates the live chain mirror and is about the
   // mark/exit/enter ordering, not about where the buys came from.
   const cfg = paperConfig({
+    subWallets: 0, // single-position arithmetic; the split has its own tests
     budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, trailingStopPct: 30,
     rpcMirror: { enabled: false },
   });
@@ -7252,7 +7253,7 @@ test('a tick mirrors live chain buys at proportional size', async () => {
 
 test('a whale sell closes the paper position proportionally', async () => {
   const { createBook, runPaperTick, openPaperPosition, paperConfig } = await import('../paper_copytrade.mjs');
-  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, subWallets: 0, /* single-position arithmetic; see the sub-wallet tests for the split */ });
   const now = 1_000_000_000;
   const book = createBook({ budgetSol: 10, target: { address: 'W' } });
   openPaperPosition(book, { mint: 'M', symbol: 'M', priceUsd: 1, cfg, now: now - 1000 });
@@ -7293,7 +7294,7 @@ test('a whale sell closes the paper position proportionally', async () => {
 
 test('a whale sell and the paper ladder can both act in one tick', async () => {
   const { createBook, runPaperTick, openPaperPosition, paperConfig } = await import('../paper_copytrade.mjs');
-  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, subWallets: 0, /* single-position arithmetic; see the sub-wallet tests for the split */ });
   const now = 1_000_000_000;
   const book = createBook({ budgetSol: 10, target: { address: 'W' } });
   openPaperPosition(book, { mint: 'M', symbol: 'M', priceUsd: 1, cfg, now: now - 1000 });
@@ -7532,7 +7533,7 @@ test('pure mirror forces the chain feed on, since it is the only exit path', asy
 
 test('in pure mirror only the whale opens and only the whale closes', async () => {
   const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
-  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, pureMirror: true });
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, pureMirror: true, subWallets: 0, /* single-position arithmetic; see the sub-wallet tests for the split */ });
   const now = 1_000_000_000;
   const book = createBook({ budgetSol: 10, target: { address: 'W' } });
 
@@ -7646,7 +7647,7 @@ test('readQuote accepts a bare price or a full quote', async () => {
 
 test('a chain-mirrored position learns its ticker from the mark', async () => {
   const { createBook, runPaperTick, renderPositions, paperConfig } = await import('../paper_copytrade.mjs');
-  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0 });
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, subWallets: 0, /* single-position arithmetic; see the sub-wallet tests for the split */ });
   const now = 1_000_000_000;
   const book = createBook({ budgetSol: 10, target: { address: 'W' } });
 
@@ -8127,7 +8128,7 @@ test('the copy-impact premium is applied on top of the whale fill', async () => 
 
 test('open positions are still marked from the pair feed', async () => {
   const { createBook, runPaperTick, openPaperPosition, paperConfig } = await import('../paper_copytrade.mjs');
-  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0 });
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0, subWallets: 0, /* single-position arithmetic; see the sub-wallet tests for the split */ });
   const now = 1_000_000_000;
   const book = createBook({ budgetSol: 10, target: { address: 'W' } });
   openPaperPosition(book, { mint: 'HELD', priceUsd: 1, cfg, now: now - 1000 });
@@ -8316,7 +8317,7 @@ const reEntryArgs = (book, cfg, trades, now, price = 1) => ({
 
 test('the target re-buying a token we already closed opens it again', async () => {
   const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
-  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0 });
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0, subWallets: 0, /* single-position arithmetic; see the sub-wallet tests for the split */ });
   const now = 1_000_000_000;
   const book = createBook({ budgetSol: 10, target: { address: 'W' } });
 
@@ -8362,7 +8363,7 @@ test('re-entry can be turned off for one lifetime position per mint', async () =
 
 test('trades apply in the order the target made them, not buys-then-sells', async () => {
   const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
-  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0 });
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0, subWallets: 0, /* single-position arithmetic; see the sub-wallet tests for the split */ });
   const now = 1_000_000_000;
   const book = createBook({ budgetSol: 10, target: { address: 'W' } });
 
@@ -8390,7 +8391,7 @@ test('trades apply in the order the target made them, not buys-then-sells', asyn
 
 test('a buy/sell/buy cycle in one batch ends holding exactly one position', async () => {
   const { createBook, runPaperTick, paperConfig } = await import('../paper_copytrade.mjs');
-  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0 });
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0, subWallets: 0, /* single-position arithmetic; see the sub-wallet tests for the split */ });
   const now = 1_000_000_000;
   const book = createBook({ budgetSol: 10, target: { address: 'W' } });
 
@@ -8480,7 +8481,7 @@ test('the implied exit price is the target fill out of the sell', async () => {
 
 test('a whale sell exits at their price, not at a tick-sampled quote', async () => {
   const { createBook, runPaperTick, openPaperPosition, paperConfig } = await import('../paper_copytrade.mjs');
-  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0 });
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0, subWallets: 0, /* single-position arithmetic; see the sub-wallet tests for the split */ });
   const now = 1_000_000_000;
   const book = createBook({ budgetSol: 10, target: { address: 'W' } });
   openPaperPosition(book, { mint: 'M', priceUsd: 1, cfg, now: now - 1000 });
@@ -9144,6 +9145,410 @@ test('the daily loss limit bounds a bad day, not just a bad trade', async () => 
 /* ------------------------------------------------------------------ *
  * PHASE 3 — burst queuing
  * ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ *
+ * Sub-wallets: partitioning and staggered exits
+ * ------------------------------------------------------------------ */
+
+const SW = () => import('../sub_wallets.mjs');
+
+test('a split sums exactly back to the whole', async () => {
+  const { partitionSizeSol, resolveSubWallets, clampSubWalletCount } = await SW();
+
+  // ── WHY INTEGER LAMPORTS ────────────────────────────────────────────────
+  // 0.01/3 in floats recombines to 0.009999999999999998. A partition whose
+  // parts do not re-sum is a slow leak through every downstream total,
+  // including the exposure cap that is supposed to bound real money.
+  for (const [total, n] of [[0.01, 3], [1, 3], [0.1, 7], [2.5, 4], [0.000000123, 2]]) {
+    const { ok, parts } = partitionSizeSol(total, n);
+    if (!ok) continue;
+    assert.equal(parts.length, n);
+    const lamports = parts.reduce((a, p) => a + Math.round(p * 1e9), 0);
+    assert.equal(lamports, Math.round(total * 1e9), `${total} split ${n} ways must re-sum exactly`);
+    // Never off by more than the one lamport the remainder distributes.
+    assert.ok(Math.max(...parts) - Math.min(...parts) <= 1 / 1e9 + 1e-12);
+  }
+
+  // 0.01 SOL three ways is the shipped Phase 2 cap.
+  const cap = partitionSizeSol(0.01, 3);
+  assert.deepEqual(cap.parts.map((p) => Math.round(p * 1e9)), [3333334, 3333333, 3333333]);
+
+  // Indivisible or nonsensical inputs are refused, not silently rounded to zero.
+  assert.equal(partitionSizeSol(0.000000002, 5).ok, false);
+  assert.equal(partitionSizeSol(0, 3).ok, false);
+  assert.equal(partitionSizeSol(-1, 3).ok, false);
+
+  // 1..5, clamped at both ends. Five is Jito's bundle ceiling, not a taste.
+  assert.equal(clampSubWalletCount(0).count, 1);
+  assert.equal(clampSubWalletCount(9).count, 5);
+  assert.equal(clampSubWalletCount(3).clamped, false);
+  assert.equal(clampSubWalletCount('nonsense').count, 1);
+  assert.equal(resolveSubWallets(3).profiles.length, 3);
+  assert.deepEqual(resolveSubWallets(3).profiles.map((p) => p.name), ['scalper', 'mid-runner', 'moonshot']);
+
+  // n=1 is the SCALPER, not "off" — it exits everything at +50% and mirrors
+  // nothing, which is more aggressive than the default, not less.
+  assert.equal(resolveSubWallets(1).profiles[0].name, 'scalper');
+  assert.equal(resolveSubWallets(1).profiles[0].pureMirror, false);
+});
+
+test('each sub-wallet exits on its own ladder, and only the moonshot holds', async () => {
+  const { resolveSubWallets, subWalletCfg } = await SW();
+  const { evaluatePaperExits, paperConfig } = await PC();
+  const cfg = paperConfig({ trailingStopPct: 30, hardStopPct: 40, slippagePct: 0, feeSol: 0 });
+  const { profiles } = resolveSubWallets(3);
+  const at = (gain) => ({ entryPriceUsd: 1, peakPriceUsd: Math.max(1, 1 + gain / 100), firedRungs: [] });
+
+  const fires = (profile, gainPct) =>
+    evaluatePaperExits({ ...at(gainPct) }, 1 + gainPct / 100, subWalletCfg(cfg, profile)).map((e) => e.trigger);
+
+  // Scalper: whole position at +50%, nothing before.
+  assert.deepEqual(fires(profiles[0], 49), []);
+  assert.deepEqual(fires(profiles[0], 50), ['TP1']);
+  assert.equal(evaluatePaperExits(at(50), 1.5, subWalletCfg(cfg, profiles[0]))[0].sellFraction, 1);
+
+  // Mid-runner: half at +100%, and at +200% BOTH rungs are due at once
+  // because neither has fired yet — the ladder is evaluated, not stepped.
+  assert.deepEqual(fires(profiles[1], 99), []);
+  assert.deepEqual(fires(profiles[1], 100), ['TP1']);
+  assert.deepEqual(fires(profiles[1], 200), ['TP1', 'TP2']);
+  const mid = subWalletCfg(cfg, profiles[1]);
+  assert.deepEqual(mid.takeProfit.map((r) => r.sellFraction), [0.5, 0.5]);
+  // Having fired TP1, only TP2 remains.
+  assert.deepEqual(
+    evaluatePaperExits({ ...at(200), firedRungs: ['TP1'] }, 3, mid).map((e) => e.trigger), ['TP2']
+  );
+
+  // ── MOONSHOT HOLDS THROUGH EVERYTHING ───────────────────────────────────
+  // No ladder AND no stops. Leaving the hard stop in would silently defeat it:
+  // a 40% retrace is routine on the way to a 5x, so the one share meant to
+  // still be holding would be the first one stopped out.
+  for (const gain of [50, 100, 400, 900, -35, -60, -95]) {
+    assert.deepEqual(fires(profiles[2], gain), [], `moonshot must hold at ${gain}%`);
+  }
+  assert.equal(subWalletCfg(cfg, profiles[2]).pureMirror, true);
+
+  // The non-mirror profiles keep the global stops — a scalper with no downside
+  // protection is just a moonshot that sells early.
+  assert.deepEqual(fires(profiles[0], -45), ['HARD_STOP']);
+  assert.deepEqual(fires(profiles[1], -45), ['HARD_STOP']);
+});
+
+test('a split position books each ladder independently and closes only when all are out', async () => {
+  const { createBook, openPaperPosition, applySubWalletExit, paperConfig } = await PC();
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 3, slippagePct: 0, feeSol: 0, subWallets: 3 });
+  const book = createBook({ budgetSol: 10 });
+  openPaperPosition(book, { mint: 'M', symbol: 'M', priceUsd: 1, cfg, now: 1000 });
+
+  const p = book.positions.M;
+  assert.equal(p.subs.length, 3);
+  assert.deepEqual(p.subs.map((s) => s.profile), ['scalper', 'mid-runner', 'moonshot']);
+  const lamports = p.subs.reduce((a, s) => a + Math.round(s.stakeSol * 1e9), 0);
+  assert.equal(lamports, Math.round(p.initialStakeSol * 1e9), 'the split re-sums to the stake');
+
+  // Scalper takes its +50% and closes. The position stays open.
+  const one = applySubWalletExit(book, 'M', 1, { priceUsd: 1.5, trigger: 'TP1', sellFraction: 1, cfg, now: 2000 });
+  assert.equal(one.subClosed, true);
+  assert.equal(one.positionClosed, false, 'two sub-wallets are still holding');
+  assert.ok(book.positions.M, 'the position must not close on one ladder');
+  assert.equal(book.positions.M.subs[0].stakeSol, 0);
+
+  // ── LADDERS ARE INDEPENDENT ─────────────────────────────────────────────
+  // The scalper firing TP1 must not advance the mid-runner's ladder; that is
+  // the whole reason they are separate accounts rather than one position
+  // wearing three rules.
+  assert.deepEqual(book.positions.M.subs[1].firedRungs, []);
+  assert.deepEqual(book.positions.M.subs[0].firedRungs, ['TP1']);
+
+  // Aggregates track the children rather than keeping their own balance.
+  assert.ok(Math.abs(book.positions.M.stakeSol - book.positions.M.subs.reduce((a, s) => a + s.stakeSol, 0)) < 1e-12);
+
+  // Mid-runner takes half at +100%, then the rest.
+  applySubWalletExit(book, 'M', 2, { priceUsd: 2, trigger: 'TP1', sellFraction: 0.5, cfg, now: 3000 });
+  assert.ok(book.positions.M.subs[1].stakeSol > 0, 'half of the mid-runner remains');
+  applySubWalletExit(book, 'M', 2, { priceUsd: 3, trigger: 'TP2', sellFraction: 1, cfg, now: 4000 });
+  assert.equal(book.positions.M.subs[1].closed, true);
+  assert.ok(book.positions.M, 'the moonshot is still holding');
+
+  // The moonshot closing last closes the position, and the record keeps every
+  // sub-wallet's outcome — a blended reason would hide that the scalper took
+  // +50% while the moonshot rode the same token to 5x, which is exactly the
+  // comparison the split exists to make.
+  const last = applySubWalletExit(book, 'M', 3, { priceUsd: 6, trigger: 'WHALE_SELL', sellFraction: 1, cfg, now: 5000 });
+  assert.equal(last.positionClosed, true);
+  assert.equal(book.positions.M, undefined);
+  const closed = book.closed.at(-1);
+  assert.equal(closed.subOutcomes.length, 3);
+  assert.deepEqual(closed.subOutcomes.map((o) => o.profile), ['scalper', 'mid-runner', 'moonshot']);
+  assert.equal(closed.subOutcomes[0].exitTrigger, 'TP1');
+  assert.equal(closed.subOutcomes[2].exitTrigger, 'WHALE_SELL');
+  // The moonshot rode 1 -> 6 and must show the largest gain of the three.
+  assert.ok(closed.subOutcomes[2].pnlPct > closed.subOutcomes[0].pnlPct);
+
+  // Selling a closed sub-wallet is refused rather than double-counted.
+  assert.equal(applySubWalletExit(book, 'M', 1, { priceUsd: 2, trigger: 'TP1', cfg }).ok, false);
+});
+
+test('a target sell closes every sub-wallet, moonshot included', async () => {
+  const { createBook, runPaperTick, openPaperPosition, paperConfig } = await PC();
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 3, slippagePct: 0, feeSol: 0, subWallets: 3 });
+  const book = createBook({ budgetSol: 10 });
+  openPaperPosition(book, { mint: 'M', symbol: 'M', priceUsd: 1, cfg, now: 1000 });
+
+  // Mirroring the exit is the moonshot's ONLY exit rule, so a target sell has
+  // to reach it — otherwise that share would never close at all.
+  const now = 1_000_000_000;
+  book.target = { address: 'W' };
+  const report = await runPaperTick({
+    book, observations: { wallets: {} }, watchlist: { wallets: [{ address: 'W' }] }, cfg, now,
+    priceFetcher: async () => new Map([['M', 2]]),
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S1',
+      trades: [{ kind: 'SELL', mint: 'M', sellFraction: 1, blockTime: now }],
+    }),
+  });
+
+  assert.equal(book.positions.M, undefined, 'every sub-wallet exits on a target sell');
+  const exits = report.exits.filter((e) => e.trigger === 'WHALE_SELL');
+  assert.equal(exits.length, 3, 'one exit recorded per sub-wallet');
+  assert.deepEqual(exits.map((e) => e.subId).sort(), [1, 2, 3]);
+  assert.equal(book.closed.at(-1).subOutcomes.length, 3);
+});
+
+test('splitting divides the position but not the fixed costs', async () => {
+  const { subWalletEconomics, ATA_RENT_SOL } = await SW();
+
+  // ── THE ARITHMETIC THAT DECIDES WHETHER THIS IS WORTH RUNNING ───────────
+  // Position size divides by N. Account rent and per-signature fees do not.
+  // At the shipped 0.01 SOL cap, three ways is 0.0033 each against 0.00204 of
+  // rent per wallet — the overhead exceeds the trade itself.
+  const tiny = subWalletEconomics({ totalTradeSol: 0.01, count: 3, priorityFeeSol: 0.001 });
+  assert.ok(Math.abs(tiny.perWalletSol - 0.01 / 3) < 1e-12);
+  // 91% at the shipped cap: 0.00204 rent + 0.001 priority + fee, three times
+  // over, against a 0.01 trade. Not quite the whole trade, and far past the
+  // ~5% exit drag the split is meant to work around.
+  assert.ok(tiny.overheadPct > 85, `expected overhead near the whole trade, got ${tiny.overheadPct.toFixed(0)}%`);
+  assert.equal(tiny.viable, false);
+  assert.match(tiny.warning, /larger than the measured exit drag/);
+
+  // A genuinely absurd size does trip the stronger wording.
+  assert.match(subWalletEconomics({ totalTradeSol: 0.005, count: 5, priorityFeeSol: 0.001 }).warning, /EXCEEDS the trade/);
+
+  // Overhead scales with the count, so more sub-wallets is strictly more cost.
+  const one = subWalletEconomics({ totalTradeSol: 0.01, count: 1, priorityFeeSol: 0.001 });
+  assert.ok(one.totalOverheadSol < tiny.totalOverheadSol);
+  assert.ok(subWalletEconomics({ totalTradeSol: 0.01, count: 5, priorityFeeSol: 0.001 }).totalOverheadSol > tiny.totalOverheadSol);
+
+  // At a size where the split is defensible, it reports so.
+  const real = subWalletEconomics({ totalTradeSol: 1.0, count: 3, priorityFeeSol: 0.001 });
+  assert.ok(real.overheadPct < 33);
+  assert.equal(real.viable, true);
+  assert.equal(real.warning, null);
+
+  // ATA rent is recoverable on close, and nothing here closes them — reported
+  // separately so it is not mistaken for a sunk cost either way.
+  assert.ok(Math.abs(real.recoverableSol - ATA_RENT_SOL * 3) < 1e-12);
+
+  // A Jito tip is charged once per bundle, not once per sub-wallet.
+  const tipped = subWalletEconomics({ totalTradeSol: 1.0, count: 3, priorityFeeSol: 0.001, jitoTipSol: 0.0001 });
+  assert.ok(Math.abs(tipped.totalOverheadSol - real.totalOverheadSol - 0.0001) < 1e-12);
+});
+
+test('the dashboard breaks a position down by sub-wallet', async () => {
+  const { createBook, openPaperPosition, applySubWalletExit, renderPositions, paperConfig } = await PC();
+  const cfg = paperConfig({ budgetSol: 10, perTradeSol: 3, slippagePct: 0, feeSol: 0, subWallets: 3 });
+  const book = createBook({ budgetSol: 10 });
+  openPaperPosition(book, { mint: 'MINTAAA', symbol: 'AAA', priceUsd: 1, cfg, now: 1000 });
+  book.positions.MINTAAA.markPriceUsd = 2;
+  applySubWalletExit(book, 'MINTAAA', 1, { priceUsd: 1.5, trigger: 'TP1', sellFraction: 1, cfg, now: 2000 });
+
+  const out = renderPositions(book, 100);
+  for (const name of ['scalper', 'mid-runner', 'moonshot']) {
+    assert.ok(out.includes(name), `dashboard must name the ${name} share`);
+  }
+  assert.ok(out.includes('closed'), 'a finished sub-wallet reads as closed');
+  assert.ok(out.includes('AAA'), 'the parent ticker still appears');
+
+  // One token at one entry is ONE row with children, not three positions —
+  // three tickers would treble the apparent open count.
+  assert.equal(out.split('\n').filter((l) => l.includes('AAA')).length, 1);
+
+  // An unsplit position renders exactly as before.
+  const plain = createBook({ budgetSol: 10 });
+  openPaperPosition(plain, { mint: 'MINTBBB', symbol: 'BBB', priceUsd: 1, cfg: paperConfig({ subWallets: 0, budgetSol: 10, perTradeSol: 1 }), now: 1000 });
+  const plainOut = renderPositions(plain, 100);
+  assert.ok(!plainOut.includes('scalper'));
+  assert.equal(plainOut.split('\n').length, 2, 'header plus one row');
+});
+
+/* ------------------------------------------------------------------ *
+ * Sub-wallets: multi-signer and Jito bundles
+ * ------------------------------------------------------------------ */
+
+const freshKey = async () => {
+  const { generateKeyPairSync } = await import('node:crypto');
+  return Uint8Array.from(generateKeyPairSync('ed25519').privateKey.export({ format: 'der', type: 'pkcs8' }).subarray(-32));
+};
+
+test('sub-wallet signers must be distinct wallets', async () => {
+  const { createSigners } = await import('../live_execute.mjs');
+  const a = await freshKey(), b = await freshKey(), c = await freshKey();
+
+  const signers = createSigners([a, b, c]);
+  assert.equal(signers.length, 3);
+  assert.equal(new Set(signers.map((s) => s.publicKey)).size, 3);
+
+  // ── WHY A DUPLICATE IS FATAL AND INVISIBLE ──────────────────────────────
+  // The same keyfile passed twice makes two signers for ONE wallet. The split
+  // still divides by N, the bundle still holds N transactions, every log line
+  // still looks right — while that wallet takes a double share and two exit
+  // profiles collide on a single token balance. Nothing downstream can detect
+  // it, so it is rejected here.
+  assert.throws(() => createSigners([a, b, a]), /same wallet/i);
+  assert.throws(() => createSigners([a, a]), /sub-wallets 1 and 2/);
+  assert.throws(() => createSigners([]), /at least one/);
+
+  // The secrets stay unreachable, exactly as for a single signer.
+  assert.ok(!JSON.stringify(signers).includes(Buffer.from(a).toString('hex')));
+  assert.ok(JSON.stringify(signers).includes('[redacted]'));
+
+  // Expected public keys are checked per position, so a mis-ordered set of
+  // keyfiles fails before it can trade from the wrong wallet.
+  assert.throws(
+    () => createSigners([a, b], { expectPublicKeys: [signers[1].publicKey, signers[0].publicKey] }),
+    /wrong wallet/i
+  );
+});
+
+test('every --keyfile is collected in order, since order picks the profile', async () => {
+  const { collectKeyfileArgs } = await LC();
+
+  // Repeated rather than comma-separated: a path may contain a comma, and a
+  // split that halved one would look like a missing file, not a parse bug.
+  assert.deepEqual(collectKeyfileArgs(['--live', '--keyfile', 'a.json', '--keyfile', 'b.json', '--watch', '1']), ['a.json', 'b.json']);
+  assert.deepEqual(collectKeyfileArgs(['--keyfile', 'C:/keys/my,wallet.json']), ['C:/keys/my,wallet.json']);
+  assert.deepEqual(collectKeyfileArgs([]), []);
+
+  // A flag immediately after --keyfile is a missing value, not a path.
+  assert.deepEqual(collectKeyfileArgs(['--keyfile', '--watch', '1']), []);
+  assert.deepEqual(collectKeyfileArgs(['--keyfile']), []);
+
+  // Order is preserved: first keyfile is sub-wallet 1, the scalper.
+  assert.deepEqual(collectKeyfileArgs(['--keyfile', 'x', '--keyfile', 'y', '--keyfile', 'z']), ['x', 'y', 'z']);
+});
+
+test('a Jito bundle serialises in order and refuses to broadcast by default', async () => {
+  const { buildJitoBundle, submitJitoBundle, signBundleTransactions, createSigners, JITO_MAX_BUNDLE_SIZE } =
+    await import('../live_execute.mjs');
+
+  const bundle = buildJitoBundle(['dHgx', 'dHgy', 'dHgz']);
+  assert.equal(bundle.ok, true);
+  assert.equal(bundle.payload.method, 'sendBundle');
+  assert.equal(bundle.payload.jsonrpc, '2.0');
+  // Order is preserved and meaningful — Jito executes a bundle in the order
+  // given, so a reordering here would change which transaction can fail first.
+  assert.deepEqual(bundle.payload.params[0], ['dHgx', 'dHgy', 'dHgz']);
+  assert.equal(bundle.payload.params[1].encoding, 'base64');
+  assert.equal(bundle.size, 3);
+
+  // Five is Jito's ceiling, and the reason --sub-wallets stops at 5: a sixth
+  // could not land atomically with the others, which is the only reason to bundle.
+  assert.equal(buildJitoBundle(new Array(JITO_MAX_BUNDLE_SIZE).fill('dHg')).ok, true);
+  assert.equal(buildJitoBundle(new Array(JITO_MAX_BUNDLE_SIZE + 1).fill('dHg')).ok, false);
+  assert.match(buildJitoBundle(new Array(6).fill('dHg')).error, /at most 5/);
+  assert.equal(buildJitoBundle([]).ok, false);
+  assert.equal(buildJitoBundle([null, undefined]).ok, false);
+  assert.match(buildJitoBundle(['ok', 42]).error, /not an encoded string/);
+
+  // ── DEFAULT IS REFUSE ───────────────────────────────────────────────────
+  // Every other send path needs --live plus a signer. A bundle submitter that
+  // broadcast by default would be the one way real money could move without
+  // that chain of consent.
+  let called = false;
+  const spy = async () => { called = true; return new Response('{"result":"id"}', { status: 200 }); };
+  const blocked = await submitJitoBundle({ bundle, fetchImpl: spy });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.blocked, true);
+  assert.equal(called, false, 'nothing may reach the network without allowSend');
+
+  const sent = await submitJitoBundle({ bundle, fetchImpl: spy, allowSend: true });
+  assert.equal(called, true);
+  assert.equal(sent.ok, true);
+  assert.equal(sent.bundleId, 'id');
+
+  const errored = await submitJitoBundle({
+    bundle, allowSend: true,
+    fetchImpl: async () => new Response('{"error":{"message":"bundle dropped"}}', { status: 200 }),
+  });
+  assert.equal(errored.ok, false);
+  assert.match(errored.error, /bundle dropped/);
+
+  // ── SIGNERS PAIR WITH TRANSACTIONS BY INDEX ─────────────────────────────
+  // Signing wallet A's transaction with wallet B's key yields something the
+  // network rejects — and at bundle scale that means all N entries silently
+  // fail to land together.
+  const signers = createSigners([await freshKey(), await freshKey()]);
+  const tx = () => Buffer.concat([Buffer.from([1]), Buffer.alloc(64), Buffer.from('msg')]).toString('base64');
+  const mismatch = signBundleTransactions({ transactions: [tx()], signers });
+  assert.equal(mismatch.ok, false);
+  assert.match(mismatch.error, /pair by index/);
+
+  const good = signBundleTransactions({ transactions: [tx(), tx()], signers });
+  assert.equal(good.ok, true);
+  assert.equal(good.encoded.length, 2);
+  assert.equal(good.signatures.length, 2);
+  assert.notEqual(good.signatures[0], good.signatures[1], 'different wallets produce different signatures');
+  // Each is a real bundle input.
+  assert.equal(buildJitoBundle(good.encoded).ok, true);
+});
+
+test('a bundled entry quotes each sub-wallet separately and fails whole', async () => {
+  const { buildSubWalletEntries, submitSubWalletBundle } = await LC();
+  const { createSigners } = await import('../live_execute.mjs');
+  const signers = createSigners([await freshKey(), await freshKey(), await freshKey()]);
+  const cfg = { slippageBps: 300, jupiterBase: 'https://x' };
+  const parts = [0.0033, 0.0033, 0.0034];
+
+  // Price impact is not linear, so three small swaps do not quote as one large
+  // swap; pricing all three off a single quote would misstate every entry.
+  const asked = [];
+  const quoteFn = async ({ amountLamports, outputMint }) => {
+    asked.push({ amountLamports, outputMint });
+    return { ok: true, quote: { outAmount: '1000', priceImpactPct: '0.01' } };
+  };
+  // A signable shape: one empty signature slot then a message. A stub too
+  // short to split would fail at signing rather than exercising the bundle.
+  const signable = () => Buffer.concat([Buffer.from([1]), Buffer.alloc(64), Buffer.from('msg')]).toString('base64');
+  const buildFn = async ({ userPublicKey }) => ({ ok: true, transactionBase64: signable(), bytes: 68, userPublicKey });
+
+  const out = await buildSubWalletEntries({ trade: { mint: 'M' }, parts, signers, cfg, quoteFn, buildFn });
+  assert.equal(out.ok, true);
+  assert.equal(out.legs.length, 3);
+  assert.equal(asked.length, 3, 'one quote per sub-wallet');
+  assert.deepEqual(asked.map((a) => a.amountLamports), [3300000, 3300000, 3400000]);
+  // Each leg is built for ITS OWN wallet.
+  assert.deepEqual(out.legs.map((l) => l.wallet), signers.map((s) => s.publicKey));
+  assert.equal(new Set(out.legs.map((l) => l.wallet)).size, 3);
+
+  // ── ONE LEG FAILING KILLS THE ENTRY ─────────────────────────────────────
+  // A bundle is atomic; a partial set submitted as singles would leave the
+  // sub-wallets holding unequal shares of a position whose exit profiles all
+  // assume they are equal.
+  let n = 0;
+  const flaky = async () => (++n === 2 ? { ok: false, error: 'rate limited', throttled: true } : { ok: true, quote: { outAmount: '1' } });
+  const partial = await buildSubWalletEntries({ trade: { mint: 'M' }, parts, signers, cfg, quoteFn: flaky, buildFn });
+  assert.equal(partial.ok, false);
+  assert.equal(partial.failedLeg, 1);
+  assert.equal(partial.throttled, true);
+
+  // Mismatched counts never reach the network.
+  assert.equal((await buildSubWalletEntries({ trade: { mint: 'M' }, parts: [0.01], signers, cfg, quoteFn, buildFn })).ok, false);
+
+  // And the bundle path still refuses to broadcast without allowSend.
+  const held = await submitSubWalletBundle({ legs: out.legs, signers, fetchImpl: async () => new Response('{}', { status: 200 }) });
+  assert.equal(held.ok, false);
+  assert.equal(held.blocked, true);
+});
 
 test('every Jupiter request spends from one shared budget', async () => {
   const { createRateLimiter, fetchJupiterQuote, buildSwapTransaction, jupiterLimiter } = await LC();
