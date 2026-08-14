@@ -1234,37 +1234,117 @@ export function createCalibrationLedger() {
  */
 export const CALIBRATION_PATH = join(HERE, '.state', 'calibration.json');
 
+/**
+ * Give an untagged legacy sample a stable identity. PURE.
+ *
+ * ── WHY THIS IS NOT COSMETIC ────────────────────────────────────────────────
+ * Merging dedupes by signature. Samples written before signatures existed are
+ * bare numbers with no identity, so every merge re-appends them: an observed
+ * 6 exit samples became 13 after a single save, and would keep doubling. An
+ * inflated count is worse than a lost one here — the tier gate opens on sample
+ * size, so a doubling sample would unlock real capital on imaginary evidence.
+ *
+ * The tag is derived from position and value, which every reader of the same
+ * file computes identically, so independent processes agree without
+ * coordinating. Once merged and saved, the rows carry it permanently.
+ */
+export function tagLegacySample(s, index) {
+  if (typeof s !== 'number') return s;
+  return { sig: `legacy:${index}:${s.toFixed(6)}`, pct: s };
+}
+
 export async function loadCalibration(path = CALIBRATION_PATH) {
   try {
     const raw = JSON.parse(await readFile(path, 'utf8'));
+    const arr = (v) => (Array.isArray(v) ? v : []);
     return {
       // `open` is a Map at runtime and an object on disk.
       open: new Map(Object.entries(raw.open ?? {})),
-      pairs: Array.isArray(raw.pairs) ? raw.pairs : [],
-      entryGaps: Array.isArray(raw.entryGaps) ? raw.entryGaps : [],
-      exitGaps: Array.isArray(raw.exitGaps) ? raw.exitGaps : [],
+      pairs: arr(raw.pairs),
+      entryGaps: arr(raw.entryGaps).map(tagLegacySample),
+      exitGaps: arr(raw.exitGaps).map(tagLegacySample),
     };
   } catch {
     return createCalibrationLedger();
   }
 }
 
+/**
+ * Union two sample lists, keeping one entry per signature. PURE.
+ *
+ * The target's own signature is the identity: the same observed trade always
+ * carries the same one, so two processes that both saw it contribute one
+ * sample, not two. Samples without a signature are legacy rows from before
+ * this schema and are kept as-is rather than dropped.
+ */
+export function mergeSamples(mine = [], theirs = []) {
+  const out = [];
+  const seen = new Set();
+  for (const s of [...theirs, ...mine]) {
+    const sig = typeof s === 'object' && s !== null ? s.sig : null;
+    if (sig) {
+      if (seen.has(sig)) continue;
+      seen.add(sig);
+    }
+    out.push(s);
+  }
+  return out;
+}
+
+/**
+ * Persist by MERGING with what is on disk, not by overwriting it.
+ *
+ * ── FOUND RUNNING, NOT IMAGINED ─────────────────────────────────────────────
+ * Three --dry-run instances were observed running at once (pids 20824, 36600,
+ * 34624). Each had loaded the ledger at startup, accumulated privately, and
+ * rewritten the whole file on every pair — so each save silently discarded
+ * whatever the other two had gathered since. Samples that take hours of the
+ * target's activity to produce were being destroyed as fast as they appeared,
+ * and nothing in the output would have shown it.
+ *
+ * Overwriting is the wrong primitive for an append-only measurement. Merging by
+ * signature makes concurrent writers ADDITIVE and idempotent instead: running
+ * three collectors is now merely wasteful of API quota rather than destructive.
+ *
+ * Read-modify-write is not atomic, so a merge can still lose a sample to an
+ * interleaving. That is acceptable in a way that clobbering is not — the loss
+ * is bounded by one write rather than by a whole session.
+ */
 export async function saveCalibration(ledger, path = CALIBRATION_PATH, limit = 5000) {
+  const onDisk = await loadCalibration(path);
+
+  // Pairs are keyed by the exit that closed them.
+  const pairs = [];
+  const seenPairs = new Set();
+  for (const p of [...onDisk.pairs, ...ledger.pairs]) {
+    const key = p?.exitSig ?? `${p?.mint}:${p?.heldMs}:${p?.dragPct}`;
+    if (seenPairs.has(key)) continue;
+    seenPairs.add(key);
+    pairs.push(p);
+  }
+
+  // Open entries: ours wins, since a pair we just closed must not be revived by
+  // another process's stale open record.
+  const open = new Map(onDisk.open);
+  for (const [mint] of open) if (!ledger.open.has(mint) && ledger.pairs.some((p) => p.mint === mint)) open.delete(mint);
+  for (const [mint, v] of ledger.open) open.set(mint, v);
+
+  const merged = {
+    open: Object.fromEntries(open),
+    pairs: pairs.slice(-limit),
+    entryGaps: mergeSamples(ledger.entryGaps, onDisk.entryGaps).slice(-limit),
+    exitGaps: mergeSamples(ledger.exitGaps, onDisk.exitGaps).slice(-limit),
+  };
+
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(
-    path,
-    JSON.stringify(
-      {
-        open: Object.fromEntries(ledger.open),
-        pairs: ledger.pairs.slice(-limit),
-        entryGaps: ledger.entryGaps.slice(-limit),
-        exitGaps: ledger.exitGaps.slice(-limit),
-      },
-      null,
-      2
-    ),
-    'utf8'
-  );
+  await writeFile(path, JSON.stringify(merged, null, 2), 'utf8');
+
+  // The in-memory ledger adopts the merged view, so this process's own summary
+  // reflects everything gathered rather than only its own share.
+  ledger.pairs = merged.pairs;
+  ledger.entryGaps = merged.entryGaps;
+  ledger.exitGaps = merged.exitGaps;
+  ledger.open = open;
   return ledger;
 }
 
@@ -1291,7 +1371,11 @@ export function pruneCalibration(ledger, { maxAgeMs = 7 * 24 * 3600e3, now = Dat
 export function recordShadowEntry(ledger, intent) {
   const { mint, ourFillUsd, targetFillUsd, ourTokens, sizeSol } = intent ?? {};
   if (!mint || !(ourFillUsd > 0) || !(targetFillUsd > 0)) return null;
-  if (Number.isFinite(intent.quoteGapPct) && !intent.seeded) ledger.entryGaps.push(intent.quoteGapPct);
+  // Tagged with the target's own signature so two collectors that both saw
+  // this trade contribute one sample rather than two.
+  if (Number.isFinite(intent.quoteGapPct) && !intent.seeded) {
+    ledger.entryGaps.push({ sig: intent.targetSignature ?? null, pct: intent.quoteGapPct });
+  }
   // Scale-ins overwrite rather than average: the pairing is a round-trip
   // measurement, not a position, and blending two entries with different
   // token counts would make the exit quote size meaningless.
@@ -1321,13 +1405,17 @@ export function recordShadowExit(ledger, intent) {
   if (!open || !(ourFillUsd > 0) || !(targetFillUsd > 0)) return null;
   ledger.open.delete(mint);
   const seeded = open.seeded || intent.seeded === true;
-  if (Number.isFinite(intent.exitGapPct) && !seeded) ledger.exitGaps.push(intent.exitGapPct);
+  if (Number.isFinite(intent.exitGapPct) && !seeded) {
+    ledger.exitGaps.push({ sig: intent.targetSignature ?? null, pct: intent.exitGapPct });
+  }
 
   const ourReturnPct = (ourFillUsd / open.ourEntryUsd - 1) * 100;
   const targetReturnPct = (targetFillUsd / open.targetEntryUsd - 1) * 100;
   const pair = {
     mint,
     seeded,
+    // The identity a merge dedupes on: the exit that closed this round trip.
+    exitSig: intent.targetSignature ?? null,
     ourReturnPct,
     targetReturnPct,
     // Negative means copying cost us relative to the target on this token.
@@ -1339,7 +1427,15 @@ export function recordShadowExit(ledger, intent) {
   return pair;
 }
 
-const median = (a) => (a.length ? [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)] : null);
+/** Gap samples are `{sig, pct}` now and bare numbers in files written before that. PURE. */
+export function samplePct(s) {
+  return typeof s === 'number' ? s : (s?.pct ?? null);
+}
+
+const median = (a) => {
+  const nums = a.map(samplePct).filter((n) => Number.isFinite(n));
+  return nums.length ? nums.sort((x, y) => x - y)[Math.floor(nums.length / 2)] : null;
+};
 
 /**
  * Round-trip calibration, as measured. PURE.

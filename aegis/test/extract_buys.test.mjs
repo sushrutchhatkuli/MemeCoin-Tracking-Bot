@@ -9398,6 +9398,95 @@ test('calibration survives a restart, or the scaling gate is unreachable', async
   await rm(tmp, { force: true });
 });
 
+test('concurrent collectors merge instead of clobbering each other', async () => {
+  const { loadCalibration, saveCalibration, createCalibrationLedger, mergeSamples, tagLegacySample,
+          samplePct, calibrationSummary, recordShadowEntry, recordShadowExit } = await LC();
+  const { rm } = await import('node:fs/promises');
+  const tmp = new URL('./.tmp-merge.json', import.meta.url).pathname.slice(1);
+  await rm(tmp, { force: true });
+
+  // ── FOUND RUNNING, NOT IMAGINED ─────────────────────────────────────────
+  // Three --dry-run instances were observed live (pids 20824, 36600, 34624).
+  // Each loaded the ledger at startup, accumulated privately, and rewrote the
+  // WHOLE file on every pair — so each save discarded what the other two had
+  // gathered. Samples costing hours of the target's activity were destroyed as
+  // fast as they appeared, and nothing in the output would have revealed it.
+
+  // Collector A sees one round trip.
+  const a = createCalibrationLedger();
+  recordShadowEntry(a, { mint: 'A', ourFillUsd: 1, targetFillUsd: 1, ourTokens: 10, quoteGapPct: 1, targetSignature: 'sigA1', at: 0 });
+  recordShadowExit(a, { mint: 'A', ourFillUsd: 2, targetFillUsd: 2, exitGapPct: -3, targetSignature: 'sigA2', at: 10 });
+  await saveCalibration(a, tmp);
+
+  // Collector B started earlier, so it never saw A's work, and sees a
+  // different trade. Under overwrite semantics this save would erase A.
+  const b = createCalibrationLedger();
+  recordShadowEntry(b, { mint: 'B', ourFillUsd: 1, targetFillUsd: 1, ourTokens: 10, quoteGapPct: 2, targetSignature: 'sigB1', at: 0 });
+  recordShadowExit(b, { mint: 'B', ourFillUsd: 3, targetFillUsd: 3, exitGapPct: -5, targetSignature: 'sigB2', at: 10 });
+  await saveCalibration(b, tmp);
+
+  const both = await loadCalibration(tmp);
+  const s = calibrationSummary(both);
+  assert.equal(s.roundTrips, 2, "B's save must not erase A's round trip");
+  assert.equal(s.exitSamples, 2);
+  assert.equal(s.entrySamples, 2);
+
+  // The saving process also ADOPTS the merged view, so its own summary reports
+  // everything gathered rather than only its private share — otherwise each
+  // collector would under-report and the scaling gate would never open.
+  assert.equal(calibrationSummary(b).roundTrips, 2);
+
+  // ── IDEMPOTENT ──────────────────────────────────────────────────────────
+  // All three collectors watch the SAME wallet, so they all see every trade.
+  // Without dedup, merging would treble the sample and make the 20-round-trip
+  // gate open on 7 real ones.
+  const dup = createCalibrationLedger();
+  recordShadowEntry(dup, { mint: 'A', ourFillUsd: 1, targetFillUsd: 1, ourTokens: 10, quoteGapPct: 1, targetSignature: 'sigA1', at: 0 });
+  recordShadowExit(dup, { mint: 'A', ourFillUsd: 2, targetFillUsd: 2, exitGapPct: -3, targetSignature: 'sigA2', at: 10 });
+  await saveCalibration(dup, tmp);
+  assert.equal(calibrationSummary(await loadCalibration(tmp)).roundTrips, 2, 'the same trade seen twice is one sample');
+
+  // Re-saving unchanged must not grow the file either.
+  await saveCalibration(await loadCalibration(tmp), tmp);
+  assert.equal(calibrationSummary(await loadCalibration(tmp)).roundTrips, 2);
+
+  // Dedup is by signature.
+  assert.equal(mergeSamples([{ sig: 'x', pct: 1 }], [{ sig: 'x', pct: 1 }]).length, 1);
+  assert.equal(mergeSamples([{ sig: 'x', pct: 1 }], [{ sig: 'y', pct: 2 }]).length, 2);
+
+  // ── LEGACY ROWS MUST NOT DOUBLE ─────────────────────────────────────────
+  // Samples written before signatures existed are bare numbers with no
+  // identity, so an untagged merge re-appends them every time: 6 exit samples
+  // became 13 after ONE save, and would keep doubling. Inflation is worse than
+  // loss here — the tier gate opens on sample size, so a doubling sample
+  // unlocks real capital on imaginary evidence.
+  const legacyFile = { open: {}, pairs: [], entryGaps: [], exitGaps: [-7.59, -7.44, -4.46] };
+  await (await import('node:fs/promises')).writeFile(tmp, JSON.stringify(legacyFile), 'utf8');
+
+  const l1 = await loadCalibration(tmp);
+  assert.equal(l1.exitGaps.length, 3);
+  assert.ok(l1.exitGaps.every((s) => typeof s === 'object' && s.sig.startsWith('legacy:')), 'tagged on load');
+
+  // Repeated merges must not grow it, and two readers of the same file must
+  // derive identical tags without coordinating.
+  for (let i = 0; i < 4; i++) await saveCalibration(await loadCalibration(tmp), tmp);
+  assert.equal(calibrationSummary(await loadCalibration(tmp)).exitSamples, 3, 'stable across repeated merges');
+  assert.equal(calibrationSummary(await loadCalibration(tmp)).medianExitGapPct, -7.44, 'values preserved');
+
+  assert.deepEqual(tagLegacySample(-7.59, 0), { sig: 'legacy:0:-7.590000', pct: -7.59 });
+  assert.equal(tagLegacySample({ sig: 'kept', pct: 1 }, 0).sig, 'kept', 'already-tagged rows pass through');
+
+  // Old files stored bare numbers; medians must read both shapes or a schema
+  // change would silently zero the history.
+  assert.equal(samplePct(4.2), 4.2);
+  assert.equal(samplePct({ sig: 'z', pct: -1.5 }), -1.5);
+  assert.equal(samplePct(null), null);
+  const mixed = { open: new Map(), pairs: [], entryGaps: [1, { sig: 'a', pct: 3 }, 5], exitGaps: [] };
+  assert.equal(calibrationSummary(mixed).medianEntryGapPct, 3);
+
+  await rm(tmp, { force: true });
+});
+
 test('the scaling verdict refuses seeded evidence and heavy drag', async () => {
   const { calibrationVerdict } = await LC();
 
