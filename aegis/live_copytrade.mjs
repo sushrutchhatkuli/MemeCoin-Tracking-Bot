@@ -84,6 +84,9 @@ export const LIVE_DEFAULTS = {
   slippageBps: 300,
   priorityFeeMaxLamports: 1_000_000,
   jitoTipLamports: 0,
+  // Minimum spacing between Jupiter calls. See the throttle note in
+  // fetchJupiterQuote for why this is not politeness but measurement hygiene.
+  quotePaceMs: 400,
 
   // ── GAS RESERVE ──────────────────────────────────────────────────────────
   // Native SOL that is never spent on tokens. An ATA costs ~0.00204 SOL of
@@ -290,25 +293,59 @@ export function evaluateSafetyGate(security, { venue = 'unknown', cfg = LIVE_DEF
  * that is a fact about today rather than a guarantee.
  */
 export async function fetchJupiterQuote(
-  { inputMint, outputMint, amountLamports, slippageBps, base = LIVE_DEFAULTS.jupiterBase, fetchImpl = fetch } = {}
+  {
+    inputMint,
+    outputMint,
+    amountLamports,
+    slippageBps,
+    base = LIVE_DEFAULTS.jupiterBase,
+    fetchImpl = fetch,
+    retries = 1,
+    retryDelayMs = 1200,
+  } = {}
 ) {
   const url =
     `${base}/quote?inputMint=${inputMint}&outputMint=${outputMint}` +
     `&amount=${Math.floor(amountLamports)}&slippageBps=${slippageBps}`;
-  try {
-    const res = await fetchImpl(url, { signal: AbortSignal.timeout(12_000) });
-    const text = await res.text();
-    if (res.status === 404) return { ok: false, noRoute: true, error: 'no route' };
-    if (!res.ok) {
-      const noRoute = /no route|not tradable|could not find any route/i.test(text);
-      return { ok: false, noRoute, error: `HTTP ${res.status}${noRoute ? ' (no route)' : ''}` };
+
+  let last = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, retryDelayMs * attempt));
+    try {
+      const res = await fetchImpl(url, { signal: AbortSignal.timeout(12_000) });
+      const text = await res.text();
+
+      if (res.ok) {
+        const quote = JSON.parse(text);
+        if (quote?.outAmount) return { ok: true, quote, attempts: attempt + 1 };
+        last = { ok: false, noRoute: true, error: 'quote returned no outAmount' };
+        continue;
+      }
+
+      // ── A THROTTLE IS NOT A ROUTING FAILURE, AND IT LOOKED LIKE ONE ────────
+      // The free tier answers HTTP 400 under load with a body that matches the
+      // same wording a genuine no-route uses. Taken at face value it produced a
+      // 50% "no-route rate" in a live run — and EVERY mint in it quoted HTTP
+      // 200 when retried individually seconds later. That figure would have
+      // justified building a direct Pump.fun fallback for a problem that does
+      // not exist, which is the same shape of error as copyImpactPct 9.
+      //
+      // So a refusal is retried before it is believed. A 404 is taken at face
+      // value — that one is unambiguous — but a 400/429 only becomes NO_ROUTE
+      // if it survives a retry.
+      const worded = /no route|not tradable|could not find any route/i.test(text);
+      if (res.status === 404) return { ok: false, noRoute: true, error: 'no route (404)', attempts: attempt + 1 };
+      last = {
+        ok: false,
+        noRoute: worded,
+        throttled: res.status === 429 || res.status === 400,
+        error: `HTTP ${res.status}${worded ? ' (no route)' : ''}`,
+      };
+    } catch (err) {
+      last = { ok: false, noRoute: false, error: err.message };
     }
-    const quote = JSON.parse(text);
-    if (!quote?.outAmount) return { ok: false, noRoute: true, error: 'quote returned no outAmount' };
-    return { ok: true, quote };
-  } catch (err) {
-    return { ok: false, noRoute: false, error: err.message };
   }
+  return { ...last, attempts: retries + 1, retried: retries > 0 };
 }
 
 /**
@@ -478,7 +515,11 @@ export async function planIntent(
   if (!quoted.ok) {
     return {
       ...base,
-      decision: quoted.noRoute ? 'NO_ROUTE' : 'QUOTE_FAILED',
+      // A refusal that survived a retry AND is throttle-shaped is reported as
+      // THROTTLED, not NO_ROUTE. Pooling them overstates unroutability, which
+      // is the number that decides whether a direct-program fallback is worth
+      // building at all.
+      decision: quoted.noRoute ? 'NO_ROUTE' : quoted.throttled ? 'THROTTLED' : 'QUOTE_FAILED',
       reason: quoted.error,
       sizeSol: sized.sizeSol,
     };
@@ -557,6 +598,7 @@ function renderIntent(i) {
     SKIP: '· skip      ',
     BLOCKED: '⛔ BLOCKED   ',
     NO_ROUTE: '⚠ NO ROUTE  ',
+    THROTTLED: '⏳ throttled  ',
     QUOTE_FAILED: '⚠ quote fail',
     BUILD_FAILED: '⚠ build fail',
   }[i.decision] ?? i.decision;
@@ -630,7 +672,7 @@ export async function main(argv = []) {
   console.log('═'.repeat(64));
 
   const lock = createMintLock();
-  const stats = { WOULD_BUY: 0, WOULD_SELL: 0, SKIP: 0, BLOCKED: 0, NO_ROUTE: 0, QUOTE_FAILED: 0, BUILD_FAILED: 0 };
+  const stats = { WOULD_BUY: 0, WOULD_SELL: 0, SKIP: 0, BLOCKED: 0, NO_ROUTE: 0, THROTTLED: 0, QUOTE_FAILED: 0, BUILD_FAILED: 0 };
   const gaps = [];
   const seededGaps = [];
   let exposureSol = 0;
@@ -682,6 +724,9 @@ export async function main(argv = []) {
       if (intent.decision === 'WOULD_BUY') exposureSol += intent.sizeSol;
       if (Number.isFinite(intent.quoteGapPct)) (seeded ? seededGaps : gaps).push(intent.quoteGapPct);
       await appendIntent(intent);
+      // Paced: the free tier throttles under burst, and a throttle masquerading
+      // as a routing failure is exactly what this run has to avoid measuring.
+      await new Promise((r) => setTimeout(r, cfg.quotePaceMs ?? 400));
       console.log(renderIntent(intent));
     }
   };

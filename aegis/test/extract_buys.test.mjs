@@ -8963,3 +8963,44 @@ test('the quote gap uses matching units', async () => {
     assert.ok(Math.abs(r.quoteGapPct) < 1e-6, `decimals ${d} gap ${r.quoteGapPct}`);
   }
 });
+
+test('a throttle is retried before it is called a no-route', async () => {
+  const { fetchJupiterQuote } = await import('../live_copytrade.mjs');
+
+  // MEASURED: a live run reported a 50% "no-route rate", and every mint in it
+  // quoted HTTP 200 when retried individually seconds later. The free tier
+  // answers 400 under burst with a body matching the same wording a genuine
+  // no-route uses. Believing it would have justified building a direct
+  // Pump.fun fallback for a problem that does not exist.
+  let calls = 0;
+  const flaky = await fetchJupiterQuote({
+    retryDelayMs: 1,
+    fetchImpl: async () => {
+      calls++;
+      return calls === 1
+        ? new Response('{"error":"Could not find any route"}', { status: 400 })
+        : new Response('{"outAmount":"1000"}', { status: 200 });
+    },
+  });
+  assert.equal(flaky.ok, true, 'a transient refusal must not become NO_ROUTE');
+  assert.equal(calls, 2);
+
+  // A refusal that SURVIVES the retry is throttle-shaped, and reported as such
+  // rather than pooled with unroutability.
+  const persistent = await fetchJupiterQuote({
+    retryDelayMs: 1,
+    fetchImpl: async () => new Response('{"error":"rate limited"}', { status: 429 }),
+  });
+  assert.equal(persistent.ok, false);
+  assert.equal(persistent.throttled, true);
+  assert.equal(persistent.noRoute, false);
+
+  // A 404 is unambiguous and taken at face value — no retry needed.
+  let c404 = 0;
+  const gone = await fetchJupiterQuote({
+    retryDelayMs: 1,
+    fetchImpl: async () => { c404++; return new Response('', { status: 404 }); },
+  });
+  assert.equal(gone.noRoute, true);
+  assert.equal(c404, 1, '404 must not be retried');
+});
