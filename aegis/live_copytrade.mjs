@@ -708,6 +708,11 @@ export async function planIntent(
     targetFillUsd,
     // Positive means we would pay MORE than the target did.
     quoteGapPct: ourFillUsd && targetFillUsd ? (ourFillUsd / targetFillUsd - 1) * 100 : null,
+    // Tokens the shadow entry would have received. Carried so the matching
+    // shadow EXIT can be quoted at our own size rather than the target's —
+    // ours is a fraction of theirs, and quoting their size would measure
+    // impact at a depth we never trade.
+    ourTokens: Number.isFinite(outTokens) && outTokens > 0 ? outTokens : null,
   };
 
   const gate = evaluateSafetyGate(await securityPromise, { venue, cfg });
@@ -1078,6 +1083,465 @@ export async function executeSellWithPanic(
 }
 
 /* ------------------------------------------------------------------ *
+ * PHASE 3 — burst queuing
+ * ------------------------------------------------------------------ */
+
+/**
+ * Run work concurrently, but never more than `limit` at once. PURE-ish.
+ *
+ * ── WHY BOUNDED AND NOT Promise.all ─────────────────────────────────────────
+ * MEASURED on this target: half of its trades arrive less than three seconds
+ * apart, and the tenth percentile is 184ms. A serial loop makes every trade in
+ * a burst wait for the previous one to confirm and settle, so lateness
+ * compounds across the burst — the fourth trade of a flurry can be seconds
+ * behind on a signal whose edge decays in about one.
+ *
+ * Unbounded is the opposite mistake and a worse one. Jupiter's free tier
+ * throttles under burst, and that was already misdiagnosed once as a 50%
+ * no-route rate: an 8-request burst returned 8x HTTP 400 from lite-api and
+ * 5x400 + 3x429 from api.jup.ag. Firing an entire flurry at once would recreate
+ * exactly that, and the failures would look like unroutable tokens rather than
+ * like the rate limit they are.
+ *
+ * Results keep INPUT order regardless of completion order, so the caller's
+ * bookkeeping does not depend on scheduling.
+ */
+export async function runBounded(items, { limit = 4, worker } = {}) {
+  const list = [...items];
+  const results = new Array(list.length);
+  let next = 0;
+  const runner = async () => {
+    for (;;) {
+      // `next++` is a single synchronous step, so two runners can never take
+      // the same index. That is the whole locking story on one thread.
+      const i = next++;
+      if (i >= list.length) return;
+      try {
+        results[i] = await worker(list[i], i);
+      } catch (err) {
+        results[i] = { error: err?.message ?? String(err) };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, list.length)) }, runner));
+  return results;
+}
+
+/**
+ * Exposure accounting that survives concurrency.
+ *
+ * ── THE RACE THIS EXISTS TO CLOSE ───────────────────────────────────────────
+ * Serially, `exposureSol += size` after a fill is fine. Concurrently it is not:
+ * two buys that plan at the same time both read the OLD exposure, both decide
+ * they fit under the cap, and both proceed — and the cap is breached by exactly
+ * the amount that made it a cap. With five in flight the breach is fivefold.
+ *
+ * So room is RESERVED before the first await and released or committed after.
+ * `reserve` performs its check and its increment with no await between them,
+ * which on one thread is atomic. In-flight size counts against the cap, so the
+ * cap bounds what CAN be spent rather than what has already been.
+ */
+export function createExposureLedger({ maxExposureSol = 0.1 } = {}) {
+  let committed = 0;
+  let reserved = 0;
+
+  return {
+    get committed() { return committed; },
+    get reserved() { return reserved; },
+    get inFlight() { return committed + reserved; },
+    get available() { return maxExposureSol - committed - reserved; },
+
+    reserve(sizeSol) {
+      if (!(sizeSol > 0)) return { ok: false, reason: 'non-positive size' };
+      // Float tolerance: 0.01 * 10 is 0.09999999999999999, and a cap that
+      // rejects its own tenth trade for being 1e-17 over is just a bug.
+      if (committed + reserved + sizeSol > maxExposureSol + 1e-9) {
+        return {
+          ok: false,
+          reason: `exposure cap ${maxExposureSol} SOL (${(committed + reserved).toFixed(4)} in flight, wanted ${sizeSol.toFixed(4)})`,
+        };
+      }
+      reserved += sizeSol;
+      let settled = false;
+      return {
+        ok: true,
+        sizeSol,
+        /**
+         * The trade landed. Commit the ACTUAL spend, which slippage makes differ.
+         *
+         * The actual can EXCEED the reservation and is recorded anyway, not
+         * clamped: solSpent comes from the wallet's balance delta and so
+         * includes the transaction fee, and that SOL really did leave. Clamping
+         * to make a number fit under a cap would be lying about exposure to the
+         * one component whose job is knowing it. The cap is enforced where it
+         * can be — at reservation time — and an overspend correctly tightens
+         * what the next trade may reserve. STRESS-TESTED: 200 trials x 40
+         * concurrent grants zero reservations past the cap.
+         */
+        commit(actualSol) {
+          if (settled) return;
+          settled = true;
+          reserved -= sizeSol;
+          committed += Number.isFinite(actualSol) ? actualSol : sizeSol;
+        },
+        /** It did not land. Give the room back, or the cap ratchets shut on nothing. */
+        release() {
+          if (settled) return;
+          settled = true;
+          reserved -= sizeSol;
+        },
+      };
+    },
+
+    /** A position closed; its capital is free again. */
+    releaseCommitted(sol) {
+      committed = Math.max(0, committed - (Number.isFinite(sol) ? sol : 0));
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * PHASE 3 — shadow calibration
+ * ------------------------------------------------------------------ */
+
+/**
+ * Pairs shadow entries with shadow exits to measure ROUND-TRIP drag.
+ *
+ * ── THE NUMBER THIS EXISTS TO PRODUCE ───────────────────────────────────────
+ * Entry impact is measured at n=18 (median +0.3%). The exit side is measured at
+ * n=4, spanning -26.6% to +60.3% — a range so wide it is barely a measurement,
+ * and the paper book's +31% rests entirely on it. That asymmetry is the single
+ * biggest hole in the whole thesis.
+ *
+ * It exists because shadow mode quoted entries and merely NOTED exits. Quoting
+ * the exit too closes it, and costs nothing but a Jupiter call. What comes out
+ * is DRAG: our round trip minus the target's own round trip on the same token
+ * over the same window. Drag is the honest figure, because it cancels the
+ * token's move — if it doubled, both of us caught the double, and what remains
+ * is purely what copying cost.
+ */
+export function createCalibrationLedger() {
+  return { open: new Map(), pairs: [], entryGaps: [], exitGaps: [] };
+}
+
+/**
+ * Calibration PERSISTS, because the thing it measures takes days to gather.
+ *
+ * Held only in memory, every restart would reset the sample to zero — and the
+ * gate that matters (20+ live round trips before capital scales) would then be
+ * unreachable by construction, since no single session lasts that long. A
+ * measurement that cannot accumulate is not a measurement.
+ */
+export const CALIBRATION_PATH = join(HERE, '.state', 'calibration.json');
+
+export async function loadCalibration(path = CALIBRATION_PATH) {
+  try {
+    const raw = JSON.parse(await readFile(path, 'utf8'));
+    return {
+      // `open` is a Map at runtime and an object on disk.
+      open: new Map(Object.entries(raw.open ?? {})),
+      pairs: Array.isArray(raw.pairs) ? raw.pairs : [],
+      entryGaps: Array.isArray(raw.entryGaps) ? raw.entryGaps : [],
+      exitGaps: Array.isArray(raw.exitGaps) ? raw.exitGaps : [],
+    };
+  } catch {
+    return createCalibrationLedger();
+  }
+}
+
+export async function saveCalibration(ledger, path = CALIBRATION_PATH, limit = 5000) {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(
+    path,
+    JSON.stringify(
+      {
+        open: Object.fromEntries(ledger.open),
+        pairs: ledger.pairs.slice(-limit),
+        entryGaps: ledger.entryGaps.slice(-limit),
+        exitGaps: ledger.exitGaps.slice(-limit),
+      },
+      null,
+      2
+    ),
+    'utf8'
+  );
+  return ledger;
+}
+
+/**
+ * Drop entries that were never sold. PURE.
+ *
+ * The target does not exit everything, and an entry left open forever both
+ * grows the file without bound and makes `openPositions` meaningless. Age is
+ * measured from the entry, and the default is generous: a position genuinely
+ * held for two days is real, one open for a week is abandoned.
+ */
+export function pruneCalibration(ledger, { maxAgeMs = 7 * 24 * 3600e3, now = Date.now() } = {}) {
+  let dropped = 0;
+  for (const [mint, open] of ledger.open) {
+    if (now - (open.at ?? now) > maxAgeMs) {
+      ledger.open.delete(mint);
+      dropped++;
+    }
+  }
+  return { dropped, remaining: ledger.open.size };
+}
+
+/** Remember a shadow entry so the matching exit can be paired to it. PURE. */
+export function recordShadowEntry(ledger, intent) {
+  const { mint, ourFillUsd, targetFillUsd, ourTokens, sizeSol } = intent ?? {};
+  if (!mint || !(ourFillUsd > 0) || !(targetFillUsd > 0)) return null;
+  if (Number.isFinite(intent.quoteGapPct) && !intent.seeded) ledger.entryGaps.push(intent.quoteGapPct);
+  // Scale-ins overwrite rather than average: the pairing is a round-trip
+  // measurement, not a position, and blending two entries with different
+  // token counts would make the exit quote size meaningless.
+  //
+  // `seeded` rides along with the ENTRY and taints the whole round trip. A
+  // seeded entry was quoted against a trade minutes old, so its gap is price
+  // drift as much as copy cost — the precise error that produced
+  // copyImpactPct 9 and cost a book. A drag built on one is not a measurement
+  // of copying, whichever side the exit came from.
+  ledger.open.set(mint, {
+    ourEntryUsd: ourFillUsd, targetEntryUsd: targetFillUsd, ourTokens, sizeSol,
+    seeded: intent.seeded === true, at: intent.at ?? Date.now(),
+  });
+  return ledger.open.get(mint);
+}
+
+/**
+ * Close a shadow round trip and record the drag. PURE.
+ *
+ * Returns null for an exit with no matching entry — the target sells tokens it
+ * bought before this process started, and inventing an entry for those would
+ * fabricate the very number the ledger exists to measure.
+ */
+export function recordShadowExit(ledger, intent) {
+  const { mint, ourFillUsd, targetFillUsd } = intent ?? {};
+  const open = mint ? ledger.open.get(mint) : null;
+  if (!open || !(ourFillUsd > 0) || !(targetFillUsd > 0)) return null;
+  ledger.open.delete(mint);
+  const seeded = open.seeded || intent.seeded === true;
+  if (Number.isFinite(intent.exitGapPct) && !seeded) ledger.exitGaps.push(intent.exitGapPct);
+
+  const ourReturnPct = (ourFillUsd / open.ourEntryUsd - 1) * 100;
+  const targetReturnPct = (targetFillUsd / open.targetEntryUsd - 1) * 100;
+  const pair = {
+    mint,
+    seeded,
+    ourReturnPct,
+    targetReturnPct,
+    // Negative means copying cost us relative to the target on this token.
+    dragPct: ourReturnPct - targetReturnPct,
+    heldMs: (intent.at ?? Date.now()) - open.at,
+    sizeSol: open.sizeSol ?? null,
+  };
+  ledger.pairs.push(pair);
+  return pair;
+}
+
+const median = (a) => (a.length ? [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)] : null);
+
+/**
+ * Round-trip calibration, as measured. PURE.
+ *
+ * SEEDED pairs are excluded from every headline figure and reported separately.
+ * They are quoted against trades minutes old, so their gap is price drift as
+ * much as copy cost — mixing them in is how copyImpactPct came to be 9 when the
+ * true figure at ~500ms was -8.9%, the opposite sign.
+ */
+export function calibrationSummary(ledger) {
+  const live = ledger.pairs.filter((p) => !p.seeded);
+  const drags = live.map((p) => p.dragPct);
+  const sorted = [...drags].sort((a, b) => a - b);
+  const seededDrags = ledger.pairs.filter((p) => p.seeded).map((p) => p.dragPct);
+  return {
+    roundTrips: live.length,
+    seededRoundTrips: seededDrags.length,
+    seededMedianDragPct: median(seededDrags),
+    entrySamples: ledger.entryGaps.length,
+    exitSamples: ledger.exitGaps.length,
+    medianEntryGapPct: median(ledger.entryGaps),
+    medianExitGapPct: median(ledger.exitGaps),
+    medianDragPct: median(drags),
+    meanDragPct: drags.length ? drags.reduce((a, b) => a + b, 0) / drags.length : null,
+    worstDragPct: sorted.length ? sorted[0] : null,
+    bestDragPct: sorted.length ? sorted[sorted.length - 1] : null,
+    // A round trip we beat the target on. Expected to be a minority; if it is
+    // most of them, the measurement is wrong rather than the edge being real.
+    aheadCount: drags.filter((d) => d > 0).length,
+    openPositions: ledger.open.size,
+  };
+}
+
+/** Would this calibration support scaling capital? PURE. */
+export function calibrationVerdict(summary, { minRoundTrips = 20 } = {}) {
+  if (!summary.roundTrips) {
+    return { ok: false, reason: 'no LIVE round trips yet — seeded pairs do not count' };
+  }
+  if (summary.roundTrips < minRoundTrips) {
+    return { ok: false, reason: `${summary.roundTrips} live round trips, want ${minRoundTrips}` };
+  }
+  // A drag worse than this compounds across every trade at the new size, which
+  // is exactly how a book that looks profitable on paper loses money live.
+  if (summary.medianDragPct !== null && summary.medianDragPct < -5) {
+    return { ok: false, reason: `median drag ${summary.medianDragPct.toFixed(1)}% — copying costs more than the edge` };
+  }
+  return { ok: true, reason: `${summary.roundTrips} live round trips, median drag ${summary.medianDragPct?.toFixed(1)}%` };
+}
+
+/**
+ * Quote the EXIT in shadow mode, so exits are measured rather than assumed.
+ *
+ * Sizes the sale from the tokens the shadow ENTRY would have received, not from
+ * the target's own token count — ours is a fraction of theirs, and quoting
+ * their size would measure price impact at a depth we would never trade.
+ */
+export async function shadowSellQuote(
+  trade, { ledger, cfg, solUsd, decimalsFor, quoteFn = fetchJupiterQuote, paperCfg = {} } = {}
+) {
+  const open = ledger?.open?.get(trade.mint);
+  const targetFillUsd = impliedExitPriceUsd(trade, { solUsd, minReceiveSol: paperCfg.impliedMinSpendSol });
+  if (!open || !(open.ourTokens > 0)) return { ourFillUsd: null, targetFillUsd, exitGapPct: null, reason: 'no shadow entry to sell' };
+
+  const fraction = Math.min(1, Math.max(0, trade.sellFraction ?? 1));
+  const tokens = open.ourTokens * fraction;
+  const decimals = await decimalsFor(trade.mint);
+  if (!Number.isFinite(decimals)) return { ourFillUsd: null, targetFillUsd, exitGapPct: null, reason: 'decimals unknown' };
+
+  const quoted = await quoteFn({
+    inputMint: trade.mint,
+    outputMint: WSOL_MINT,
+    amountLamports: Math.floor(tokens * 10 ** decimals),
+    slippageBps: cfg.slippageBps,
+    base: cfg.jupiterBase,
+  });
+  if (!quoted.ok) return { ourFillUsd: null, targetFillUsd, exitGapPct: null, reason: quoted.error };
+
+  const solOut = Number(quoted.quote.outAmount) / LAMPORTS;
+  const ourFillUsd = tokens > 0 && Number.isFinite(solUsd) ? (solOut * solUsd) / tokens : null;
+  return {
+    ourFillUsd,
+    targetFillUsd,
+    // NEGATIVE means we would receive LESS per token than the target did —
+    // the opposite sign convention to the entry gap, where positive means we
+    // pay more. Both directions are a cost; keeping the raw signs avoids
+    // silently flipping one and reporting a drag that is not there.
+    exitGapPct: ourFillUsd && targetFillUsd ? (ourFillUsd / targetFillUsd - 1) * 100 : null,
+    solOut,
+    tokens,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * PHASE 4 — capital tiers
+ * ------------------------------------------------------------------ */
+
+/**
+ * Capital scales on EVIDENCE, not on elapsed time or on feeling ready.
+ *
+ * ── WHY minExitSamples IS A GATE AND NOT A NOTE ─────────────────────────────
+ * The paper book showed +31% over 1702 trades, and the exits that produced it
+ * were priced at the target's own sell price — an assumption measured on FOUR
+ * samples ranging -26.6% to +60.3%. Scaling on that number would be scaling on
+ * an assumption, and a wrong exit assumption does not fail gently: it is a
+ * per-trade drag applied to every trade at the new size.
+ *
+ * So each tier demands round trips AND non-negative net AND a large enough
+ * exit-side sample. All three, because volume without profit is just an
+ * expensive habit, profit without samples is luck, and samples without either
+ * is measurement rather than a track record.
+ *
+ * Tiers are recomputed from current stats every time, so this DEMOTES as
+ * readily as it promotes: a drawdown that drops net below a floor drops the
+ * caps with it, at the moment they matter most. Nothing latches.
+ */
+export const CAPITAL_TIERS = [
+  {
+    name: 'probe',
+    minRoundTrips: 0, minNetSol: -Infinity, minExitSamples: 0,
+    maxTradeSol: 0.01, maxExposureSol: 0.1, dailyLossLimitSol: 0.05,
+    _note: 'Phase 2. ~$0.75 a trade. The goal is landed transactions to measure, not profit.',
+  },
+  {
+    name: 'micro',
+    minRoundTrips: 30, minNetSol: 0, minExitSamples: 20,
+    maxTradeSol: 0.05, maxExposureSol: 0.5, dailyLossLimitSol: 0.15,
+    _note: 'Exit drag now has a real sample. 5x the trade size, 5x the exposure.',
+  },
+  {
+    name: 'small',
+    minRoundTrips: 100, minNetSol: 0.25, minExitSamples: 60,
+    maxTradeSol: 0.25, maxExposureSol: 2.5, dailyLossLimitSol: 0.5,
+    _note: 'Net positive across 100 round trips, not merely across a good week.',
+  },
+  {
+    name: 'scaled',
+    minRoundTrips: 300, minNetSol: 2.0, minExitSamples: 150,
+    maxTradeSol: 1.0, maxExposureSol: 10.0, dailyLossLimitSol: 2.0,
+    _note: 'Phase 4 proper. Only from here does price impact at our own size start to matter.',
+  },
+];
+
+/**
+ * The highest tier whose every gate is met. PURE.
+ *
+ * Scans downward and takes the first that qualifies, so a stat that fails a
+ * high gate cannot skip past a lower one it also fails.
+ */
+export function resolveTier(stats = {}, tiers = CAPITAL_TIERS) {
+  const roundTrips = stats.roundTrips ?? 0;
+  const netSol = stats.netSol ?? 0;
+  const exitSamples = stats.exitSamples ?? 0;
+
+  for (let i = tiers.length - 1; i >= 0; i--) {
+    const t = tiers[i];
+    if (roundTrips >= t.minRoundTrips && netSol >= t.minNetSol && exitSamples >= t.minExitSamples) {
+      const next = tiers[i + 1] ?? null;
+      return {
+        tier: t.name,
+        index: i,
+        maxTradeSol: t.maxTradeSol,
+        maxExposureSol: t.maxExposureSol,
+        dailyLossLimitSol: t.dailyLossLimitSol,
+        next: next
+          ? {
+              name: next.name,
+              needs: [
+                roundTrips < next.minRoundTrips ? `${next.minRoundTrips - roundTrips} more round trips` : null,
+                netSol < next.minNetSol ? `net ${next.minNetSol} SOL (now ${netSol.toFixed(3)})` : null,
+                exitSamples < next.minExitSamples ? `${next.minExitSamples - exitSamples} more exit samples` : null,
+              ].filter(Boolean),
+            }
+          : null,
+      };
+    }
+  }
+  // Unreachable with the shipped table (probe has no floors), but a tier table
+  // edited to have one must fail CLOSED rather than fall through to no caps.
+  return { tier: 'blocked', index: -1, maxTradeSol: 0, maxExposureSol: 0, dailyLossLimitSol: 0, next: null };
+}
+
+/** Fold a tier's caps into a live config. PURE. */
+export function applyTier(cfg, tier) {
+  return { ...cfg, maxTradeSol: tier.maxTradeSol, maxExposureSol: tier.maxExposureSol, dailyLossLimitSol: tier.dailyLossLimitSol, tier: tier.tier };
+}
+
+/** Track-record stats drawn from the intent log and calibration. PURE. */
+export function trackRecord(intents = [], calibration = null) {
+  const landed = intents.filter((i) => i.outcome === 'LANDED');
+  const netSol = landed.reduce((a, i) => a + (Number.isFinite(i.realisedSol) ? i.realisedSol : 0), 0);
+  const closed = landed.filter((i) => i.side === 'SELL' && Number.isFinite(i.realisedSol));
+  return {
+    // A round trip is a CLOSED position, not a transaction. Fifty buys and no
+    // sells is no evidence at all about exiting, which is the risky half.
+    roundTrips: closed.length,
+    netSol,
+    exitSamples: calibration ? calibration.exitSamples : closed.length,
+    landedCount: landed.length,
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * CLI
  * ------------------------------------------------------------------ */
 
@@ -1266,7 +1730,26 @@ export async function main(argv = []) {
   const stats = { WOULD_BUY: 0, WOULD_SELL: 0, SKIP: 0, BLOCKED: 0, NO_ROUTE: 0, THROTTLED: 0, QUOTE_FAILED: 0, BUILD_FAILED: 0 };
   const gaps = [];
   const seededGaps = [];
-  let exposureSol = 0;
+
+  // ── PHASE 4: caps come from the track record, not from the config ───────
+  // Recomputed from the intent log, so a drawdown demotes as readily as a good
+  // run promotes.
+  // Loaded from disk so samples accumulate across sessions — the 20-round-trip
+  // gate is unreachable otherwise, since no single run lasts that long.
+  const calibration = await loadCalibration();
+  const pruned = pruneCalibration(calibration);
+  const record = trackRecord(await loadIntents(), calibrationSummary(calibration));
+  const tier = resolveTier(record);
+  Object.assign(cfg, applyTier(cfg, tier));
+
+  // ── PHASE 3: exposure that survives concurrency ─────────────────────────
+  const exposure = createExposureLedger({ maxExposureSol: cfg.maxExposureSol });
+
+  // How many trades may be in flight at once. Bounded because Jupiter's free
+  // tier throttles under burst — and that throttle was already misread once as
+  // a 50% no-route rate.
+  const burstIdx = argv.indexOf('--burst');
+  const burstLimit = burstIdx !== -1 ? Math.max(1, Number(argv[burstIdx + 1]) || 4) : 4;
 
   // The real audit, cached per mint: the same token recurs constantly in a
   // seed pass and each audit costs several RPC calls.
@@ -1291,8 +1774,8 @@ export async function main(argv = []) {
     return decimalsCache.get(mint);
   };
 
-  const handle = async (trades, { seeded = false } = {}) => {
-    for (const t of trades) {
+  const handleOne = async (t, { seeded = false } = {}) => {
+    {
       // Serialised per mint: a BUY and an ADD arriving together must not both
       // build a transaction for the same token.
       const intent = await lock.run(t.mint, async () => {
@@ -1308,17 +1791,53 @@ export async function main(argv = []) {
         }
         return planIntent(t, {
           cfg, paperCfg, book, solUsd, userPublicKey, nativeSolBalance,
-          exposureSol, securityFor, decimalsFor, now: Date.now(),
+          // In-flight size counts against the cap, so concurrent buys cannot
+          // each read the same stale exposure and all decide they fit.
+          exposureSol: exposure.inFlight, securityFor, decimalsFor, now: Date.now(),
         });
       });
       intent.seeded = seeded;
       intent.mode = live ? 'live' : 'dry-run';
+      intent.tier = cfg.tier ?? null;
+
+      // ── PHASE 3: shadow calibration ───────────────────────────────────────
+      // Costs nothing but a Jupiter call and produces the number the whole
+      // thesis is thinnest on. Runs in BOTH modes: in live it measures the same
+      // thing alongside the real fills, which is what Phase 3 compares.
+      if (intent.decision === 'WOULD_BUY' && Number.isFinite(intent.ourFillUsd)) {
+        if (recordShadowEntry(calibration, intent)) await saveCalibration(calibration);
+      } else if (t.kind === 'SELL' && calibration.open.has(t.mint)) {
+        // The exit half, previously NOTED but never priced — which is why the
+        // exit sample stood at 4 against 18 for entries.
+        const ex = await shadowSellQuote(t, { ledger: calibration, cfg, solUsd, decimalsFor, paperCfg });
+        intent.ourFillUsd = ex.ourFillUsd;
+        intent.targetFillUsd = ex.targetFillUsd;
+        intent.exitGapPct = ex.exitGapPct;
+        intent.exitQuoteError = ex.reason ?? null;
+        const pair = recordShadowExit(calibration, { ...intent, at: Date.now() });
+        if (pair) {
+          intent.dragPct = pair.dragPct;
+          // Persisted as it closes: a round trip lost to a crash is a sample
+          // that took hours of the target's activity to produce.
+          await saveCalibration(calibration);
+        }
+      }
 
       // ── EXECUTION. Only past this line does anything cost money. ────────
       // Seeded trades are historical replay and are NEVER executed: they are
       // minutes old, and acting on them would buy into moves that have already
       // finished.
       if (live && !seeded && (intent.decision === 'WOULD_BUY' || intent.decision === 'WOULD_SELL')) {
+        // Room is claimed BEFORE the first await of the execution path. Under
+        // concurrency the alternative is two buys both reading the old
+        // exposure, both fitting under the cap, and both going.
+        const slot = intent.side === 'BUY' ? exposure.reserve(intent.sizeSol) : { ok: true, commit() {}, release() {} };
+        if (!slot.ok) {
+          stats.SKIP = (stats.SKIP ?? 0) + 1;
+          console.log(`  · skip       ${formatTicker(null, intent.mint).padEnd(12)}${slot.reason}`);
+          return;
+        }
+
         await appendIntent(forLog({ ...intent, outcome: null }));
 
         const result =
@@ -1377,10 +1896,14 @@ export async function main(argv = []) {
           settleError: fill && !fill.ok ? fill.error : null,
         });
 
-        if (result.status === 'LANDED' && intent.side === 'BUY') {
-          // Actual spend, not the requested size — slippage and fees mean these
-          // differ, and exposure tracked from intent drifts from reality.
-          exposureSol += Number.isFinite(fill?.solSpent) ? fill.solSpent : intent.sizeSol;
+        if (intent.side === 'BUY') {
+          // Commit the ACTUAL spend, or give the room back. A reservation that
+          // is never settled ratchets the cap shut on trades that never happened.
+          if (result.status === 'LANDED') slot.commit(fill?.solSpent);
+          else slot.release();
+        } else if (result.status === 'LANDED' && Number.isFinite(fill?.solReceived)) {
+          // A closed position frees its capital for the next one.
+          exposure.releaseCommitted(fill.solReceived);
         }
 
         // ITEM 5 again, and this is the important one: re-read the chain after
@@ -1404,11 +1927,17 @@ export async function main(argv = []) {
           process.exit(1);
         }
         await new Promise((r) => setTimeout(r, cfg.quotePaceMs ?? 400));
-        continue;
+        return;
       }
 
       stats[intent.decision] = (stats[intent.decision] ?? 0) + 1;
-      if (!live && intent.decision === 'WOULD_BUY') exposureSol += intent.sizeSol;
+      if (!live && intent.decision === 'WOULD_BUY') {
+        // Shadow mode reserves and immediately commits: no transaction settles
+        // it, so a reservation left open would exhaust the cap after a few
+        // trades and make the rest of the run measure nothing.
+        const slot = exposure.reserve(intent.sizeSol);
+        if (slot.ok) slot.commit(intent.sizeSol);
+      }
       if (Number.isFinite(intent.quoteGapPct)) (seeded ? seededGaps : gaps).push(intent.quoteGapPct);
       await appendIntent(forLog(intent));
       // Paced: the free tier throttles under burst, and a throttle masquerading
@@ -1416,6 +1945,22 @@ export async function main(argv = []) {
       await new Promise((r) => setTimeout(r, cfg.quotePaceMs ?? 400));
       console.log(renderIntent(intent));
     }
+  };
+
+  /**
+   * Handle a batch. Concurrent up to the burst limit, per-mint still serialised.
+   *
+   * The seed pass stays SERIAL: it is a cold replay of history with no latency
+   * to save, and running it concurrently would open a burst of Jupiter calls at
+   * the exact moment the free tier is most likely to throttle — poisoning the
+   * measurement the seed exists to produce.
+   */
+  const handle = async (trades, { seeded = false } = {}) => {
+    if (seeded || burstLimit === 1) {
+      for (const t of trades) await handleOne(t, { seeded });
+      return;
+    }
+    await runBounded(trades, { limit: burstLimit, worker: (t) => handleOne(t, { seeded }) });
   };
 
   // A cold pass over recent history, so the first run produces measurements
@@ -1458,6 +2003,37 @@ export async function main(argv = []) {
       console.log(`    no-route rate ${((stats.NO_ROUTE / buys) * 100).toFixed(1)}% of buy attempts`);
       console.log(`    gate rejects  ${((stats.BLOCKED / buys) * 100).toFixed(1)}% of buy attempts`);
     }
+    // ── PHASE 3: the round-trip calibration ────────────────────────────────
+    const cal = calibrationSummary(calibration);
+    const verdict = calibrationVerdict(cal);
+    if (cal.roundTrips || cal.exitSamples || cal.seededRoundTrips) {
+      const pct = (v) => (v === null ? 'n/a' : `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`);
+      console.log('\n  SHADOW CALIBRATION (Phase 3)');
+      console.log(`    entry gap   : ${pct(cal.medianEntryGapPct)} median (n=${cal.entrySamples})   [+ = we pay more]`);
+      console.log(`    exit gap    : ${pct(cal.medianExitGapPct)} median (n=${cal.exitSamples})   [- = we receive less]`);
+      if (cal.roundTrips) {
+        console.log(`    ROUND-TRIP DRAG: ${pct(cal.medianDragPct)} median, ${pct(cal.meanDragPct)} mean (n=${cal.roundTrips})`);
+        console.log(`      our return minus the target's on the SAME token — the token's own move`);
+        console.log(`      cancels, so what is left is purely what copying cost.`);
+        console.log(`      worst ${pct(cal.worstDragPct)} · best ${pct(cal.bestDragPct)} · ahead on ${cal.aheadCount}/${cal.roundTrips}`);
+      }
+      if (cal.seededRoundTrips) {
+        console.log(`    seeded drag : ${pct(cal.seededMedianDragPct)} (n=${cal.seededRoundTrips}) — EXCLUDED from the above`);
+        console.log(`      quoted against trades minutes old, so this is price drift as much as`);
+        console.log(`      copy cost. Mixing it in is how copyImpactPct came to be 9 when the`);
+        console.log(`      true figure at ~500ms was -8.9%. Do NOT calibrate from it.`);
+      }
+      if (cal.openPositions) console.log(`    ${cal.openPositions} entr(ies) still open — their drag is not counted yet`);
+      console.log(`    scaling verdict: ${verdict.ok ? 'OK' : 'NOT YET'} — ${verdict.reason}`);
+    }
+
+    // ── PHASE 4: where the track record puts the caps ──────────────────────
+    console.log(`\n  CAPITAL TIER: ${tier.tier}  (max trade ${tier.maxTradeSol} SOL · exposure ${tier.maxExposureSol} · daily loss ${tier.dailyLossLimitSol})`);
+    console.log(`    evidence    : ${record.roundTrips} round trips · net ${record.netSol.toFixed(3)} SOL · ${record.exitSamples} exit samples`);
+    if (tier.next) {
+      console.log(`    to reach '${tier.next.name}': ${tier.next.needs.length ? tier.next.needs.join(', ') : 'all gates met — rerun to promote'}`);
+    }
+
     console.log(`  intents logged to .state/live_intents.json (${total} this run)`);
     if (live) {
       const landed = stats.LANDED ?? 0;
@@ -1485,11 +2061,26 @@ export async function main(argv = []) {
   book.lastSignature = (await fetchLatestSignature({ wallet: target.address, rpcUrl })).signature ?? null;
   console.log(`\n  watching every ${intervalSec}s — Ctrl+C to stop\n`);
 
-  process.on('SIGINT', () => {
+  // SIGINT (Ctrl+C) works everywhere. SIGTERM is registered for Linux and
+  // containers, where a task manager or `docker stop` sends TERM.
+  //
+  // VERIFIED: on Windows SIGTERM CANNOT be caught at all — a handler does not
+  // run even for a self-sent process.kill(pid, 'SIGTERM'), and GNU `timeout`
+  // terminates the process abruptly. So this handler is not a safety net on
+  // this machine, and calibration is persisted as each pair CLOSES rather than
+  // at shutdown. That per-pair write is the only thing that survives a hard
+  // kill here, which is why it is not merely an optimisation.
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    await saveCalibration(calibration).catch(() => {});
     summary();
     socket.close();
     process.exit(0);
-  });
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 
   // eslint-disable-next-line no-constant-condition
   while (true) {

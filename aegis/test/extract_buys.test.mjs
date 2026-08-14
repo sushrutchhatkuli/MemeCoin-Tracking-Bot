@@ -9134,6 +9134,451 @@ test('the daily loss limit bounds a bad day, not just a bad trade', async () => 
   assert.equal(dailyLossState([...losses, { at: today, outcome: 'LANDED', realisedSol: 0.5 }], cfg, now).tripped, false);
 });
 
+/* ------------------------------------------------------------------ *
+ * PHASE 3 — burst queuing
+ * ------------------------------------------------------------------ */
+
+test('burst work runs concurrently but never exceeds the limit', async () => {
+  const { runBounded } = await LC();
+
+  // ── WHY BOUNDED RATHER THAN Promise.all ─────────────────────────────────
+  // MEASURED on this target: half its trades arrive under 3s apart, p10 184ms,
+  // so a serial loop compounds lateness across a burst. But unbounded is the
+  // worse mistake — Jupiter's free tier throttles, and that throttle was
+  // already misread once as a 50% no-route rate.
+  let inFlight = 0;
+  let peak = 0;
+  const order = [];
+  const items = Array.from({ length: 12 }, (_, i) => i);
+
+  const out = await runBounded(items, {
+    limit: 4,
+    worker: async (n) => {
+      peak = Math.max(peak, ++inFlight);
+      // Reverse durations, so completion order differs from input order and a
+      // result array that merely appends would be visibly wrong.
+      await new Promise((r) => setTimeout(r, (12 - n) * 2));
+      order.push(n);
+      inFlight--;
+      return n * 10;
+    },
+  });
+
+  assert.equal(peak, 4, 'must saturate the limit');
+  assert.ok(peak <= 4, 'must never exceed it');
+  assert.equal(inFlight, 0, 'everything settles');
+  // Results keep INPUT order regardless of completion order, so the caller's
+  // bookkeeping does not silently depend on scheduling.
+  assert.deepEqual(out, items.map((n) => n * 10));
+  assert.notDeepEqual(order, items, 'completion order genuinely differed');
+
+  // One worker failing must not take the batch down with it — a single
+  // unroutable token cannot be allowed to drop the rest of a burst.
+  const withError = await runBounded([1, 2, 3], {
+    limit: 3,
+    worker: async (n) => { if (n === 2) throw new Error('boom'); return n; },
+  });
+  assert.deepEqual(withError[0], 1);
+  assert.equal(withError[1].error, 'boom');
+  assert.deepEqual(withError[2], 3);
+
+  // Degenerate inputs.
+  assert.deepEqual(await runBounded([], { limit: 4, worker: async () => 1 }), []);
+  assert.deepEqual(await runBounded([7], { limit: 99, worker: async (n) => n }), [7]);
+});
+
+test('exposure is reserved before the first await, so concurrent buys cannot both fit', async () => {
+  const { createExposureLedger, runBounded } = await LC();
+
+  // ── THE RACE ────────────────────────────────────────────────────────────
+  // `exposureSol += size` after a fill is fine serially. Concurrently, two
+  // buys read the OLD exposure, both decide they fit under the cap, and both
+  // proceed — breaching the cap by exactly the amount that made it a cap.
+  const ledger = createExposureLedger({ maxExposureSol: 0.1 });
+
+  // Ten 0.01 trades fit exactly. Float arithmetic makes 0.01*10 come to
+  // 0.09999999999999999, and a cap that rejects its own tenth trade over 1e-17
+  // is a bug, not a safeguard.
+  const slots = [];
+  for (let i = 0; i < 10; i++) {
+    const s = ledger.reserve(0.01);
+    assert.equal(s.ok, true, `reservation ${i + 1} of 10 must fit`);
+    slots.push(s);
+  }
+  assert.equal(ledger.reserve(0.01).ok, false, 'the eleventh must not');
+  assert.match(ledger.reserve(0.01).reason, /exposure cap/);
+
+  // In-flight counts against the cap: it bounds what CAN be spent, not only
+  // what already has been.
+  assert.ok(Math.abs(ledger.inFlight - 0.1) < 1e-9);
+  assert.equal(ledger.committed, 0);
+
+  // A trade that did not land gives its room back. A reservation left dangling
+  // ratchets the cap shut on trades that never happened.
+  slots[0].release();
+  assert.ok(Math.abs(ledger.available - 0.01) < 1e-9);
+  assert.equal(ledger.reserve(0.01).ok, true);
+
+  // Commit records the ACTUAL spend, which slippage makes differ from the
+  // requested size.
+  const l2 = createExposureLedger({ maxExposureSol: 1 });
+  const s = l2.reserve(0.1);
+  s.commit(0.0973);
+  assert.equal(l2.reserved, 0);
+  assert.ok(Math.abs(l2.committed - 0.0973) < 1e-9);
+
+  // Double-settling must not double-count, in either direction.
+  s.commit(0.5); s.release();
+  assert.ok(Math.abs(l2.committed - 0.0973) < 1e-9);
+  assert.equal(l2.reserved, 0);
+
+  // Closing a position frees its capital.
+  l2.releaseCommitted(0.0973);
+  assert.equal(l2.committed, 0);
+  l2.releaseCommitted(999);
+  assert.equal(l2.committed, 0, 'never goes negative');
+
+  assert.equal(l2.reserve(0).ok, false);
+  assert.equal(l2.reserve(-1).ok, false);
+
+  // ── AN OVERSPEND IS RECORDED, NOT CLAMPED ───────────────────────────────
+  // solSpent comes from the wallet's balance delta and therefore includes the
+  // transaction fee, so the actual can exceed the reservation. That SOL really
+  // left the wallet. Clamping it to keep the total under the cap would be
+  // lying about exposure to the one component whose job is knowing it — so it
+  // is recorded, and the NEXT reservation is correspondingly tighter.
+  const over = createExposureLedger({ maxExposureSol: 0.1 });
+  const o = over.reserve(0.1);
+  o.commit(0.1005);                       // 0.0005 SOL of fees on top
+  assert.ok(over.committed > 0.1, 'the overspend is visible, not hidden');
+  assert.equal(over.reserve(0.0001).ok, false, 'and it tightens the next reservation');
+
+  // The race, run for real: 20 concurrent buys against room for 5.
+  const raced = createExposureLedger({ maxExposureSol: 0.05 });
+  let granted = 0;
+  await runBounded(Array.from({ length: 20 }, (_, i) => i), {
+    limit: 20,
+    worker: async () => {
+      const slot = raced.reserve(0.01);
+      // The await AFTER the reservation is what breaks a naive implementation.
+      await new Promise((r) => setTimeout(r, 5));
+      if (slot.ok) { granted++; slot.commit(0.01); }
+    },
+  });
+  assert.equal(granted, 5, 'exactly the cap, not 20');
+  assert.ok(Math.abs(raced.committed - 0.05) < 1e-9);
+});
+
+/* ------------------------------------------------------------------ *
+ * PHASE 3 — shadow calibration
+ * ------------------------------------------------------------------ */
+
+test('shadow calibration measures round-trip drag, cancelling the token move', async () => {
+  const { createCalibrationLedger, recordShadowEntry, recordShadowExit, calibrationSummary } = await LC();
+  const led = createCalibrationLedger();
+
+  // ── THE HOLE THIS CLOSES ────────────────────────────────────────────────
+  // Entry impact sat at n=18; the exit side at n=4 spanning -26.6% to +60.3%.
+  // The paper book's +31% rested entirely on that. Quoting exits in shadow
+  // mode costs nothing and closes the gap.
+
+  // A token that doubled. We entered 1% worse and exited 1% worse.
+  recordShadowEntry(led, { mint: 'A', ourFillUsd: 1.01, targetFillUsd: 1.00, ourTokens: 990, sizeSol: 0.01, quoteGapPct: 1, at: 1000 });
+  const a = recordShadowExit(led, { mint: 'A', ourFillUsd: 1.98, targetFillUsd: 2.00, exitGapPct: -1, at: 5000 });
+
+  // The token's 100% move cancels: both of us caught it. What remains is
+  // purely what copying cost — which is the only figure worth calibrating on.
+  assert.ok(Math.abs(a.targetReturnPct - 100) < 1e-9);
+  assert.ok(Math.abs(a.ourReturnPct - 96.04) < 0.01);
+  assert.ok(a.dragPct < 0, 'copying cost us');
+  assert.ok(Math.abs(a.dragPct - -3.96) < 0.01);
+  assert.equal(a.heldMs, 4000);
+
+  // A token that halved. Drag is still drag — it is not a P&L sign test.
+  recordShadowEntry(led, { mint: 'B', ourFillUsd: 2.00, targetFillUsd: 2.00, ourTokens: 500, quoteGapPct: 0, at: 0 });
+  const b = recordShadowExit(led, { mint: 'B', ourFillUsd: 1.00, targetFillUsd: 1.00, exitGapPct: 0, at: 100 });
+  assert.equal(b.dragPct, 0, 'identical fills, no drag, despite a 50% loss');
+
+  // An exit with no matching entry is DROPPED, not invented. The target sells
+  // tokens it bought before this process started, and fabricating an entry for
+  // those would fabricate the very number being measured.
+  assert.equal(recordShadowExit(led, { mint: 'NEVER_BOUGHT', ourFillUsd: 5, targetFillUsd: 4 }), null);
+
+  // Junk in does not become a data point.
+  assert.equal(recordShadowEntry(led, { mint: 'C', ourFillUsd: 0, targetFillUsd: 1 }), null);
+  assert.equal(recordShadowEntry(led, { mint: 'C', ourFillUsd: 1, targetFillUsd: null }), null);
+
+  // An entry still open is excluded rather than counted as flat.
+  recordShadowEntry(led, { mint: 'OPEN', ourFillUsd: 1, targetFillUsd: 1, ourTokens: 10, quoteGapPct: 0, at: 0 });
+
+  // ── SEEDED PAIRS ARE QUARANTINED ────────────────────────────────────────
+  // A seeded entry was quoted against a trade minutes old, so its gap is price
+  // drift as much as copy cost. That exact contamination produced
+  // copyImpactPct 9 when the true figure at ~500ms was -8.9% — the opposite
+  // sign — and it cost a book. It taints the whole round trip, whichever side
+  // the exit came from.
+  recordShadowEntry(led, { mint: 'S', ourFillUsd: 1.30, targetFillUsd: 1.00, ourTokens: 10, quoteGapPct: 30, seeded: true, at: 0 });
+  const sp = recordShadowExit(led, { mint: 'S', ourFillUsd: 1.30, targetFillUsd: 1.00, exitGapPct: 30, at: 10 });
+  assert.equal(sp.seeded, true);
+
+  const s = calibrationSummary(led);
+  assert.equal(s.roundTrips, 2, 'the seeded pair is excluded from the headline');
+  assert.equal(s.seededRoundTrips, 1);
+  assert.equal(s.seededMedianDragPct, 0);
+  assert.equal(s.openPositions, 1);
+  assert.equal(s.entrySamples, 3);
+  assert.equal(s.exitSamples, 2);
+  assert.equal(s.medianEntryGapPct, 0);
+  assert.equal(s.aheadCount, 0);
+  assert.ok(s.worstDragPct < 0 && s.bestDragPct === 0);
+  assert.ok(Math.abs(s.meanDragPct - -1.98) < 0.01);
+
+  // An empty ledger reports nulls, not zeroes — "no data" and "no drag" are
+  // very different claims to put in front of a scaling decision.
+  const empty = calibrationSummary(createCalibrationLedger());
+  assert.equal(empty.medianDragPct, null);
+  assert.equal(empty.meanDragPct, null);
+  assert.equal(empty.roundTrips, 0);
+});
+
+test('calibration survives a restart, or the scaling gate is unreachable', async () => {
+  const { loadCalibration, saveCalibration, pruneCalibration, createCalibrationLedger,
+          recordShadowEntry, recordShadowExit, calibrationSummary } = await LC();
+  const { rm } = await import('node:fs/promises');
+  const tmp = new URL('./.tmp-calibration.json', import.meta.url).pathname.slice(1);
+
+  // ── WHY THIS IS PERSISTED ───────────────────────────────────────────────
+  // The gate that matters is 20+ LIVE round trips before capital scales. Held
+  // only in memory, every restart resets the sample to zero and no single
+  // session runs long enough to reach it — the gate would be unreachable by
+  // construction. A measurement that cannot accumulate is not a measurement.
+  const led = createCalibrationLedger();
+  recordShadowEntry(led, { mint: 'A', ourFillUsd: 1, targetFillUsd: 1, ourTokens: 100, quoteGapPct: 0.5, at: 1000 });
+  recordShadowExit(led, { mint: 'A', ourFillUsd: 2, targetFillUsd: 2.1, exitGapPct: -4.8, at: 2000 });
+  recordShadowEntry(led, { mint: 'STILL_OPEN', ourFillUsd: 1, targetFillUsd: 1, ourTokens: 50, quoteGapPct: 1, at: 3000 });
+
+  await saveCalibration(led, tmp);
+  const back = await loadCalibration(tmp);
+
+  // `open` is a Map at runtime and an object on disk; a round trip that lost
+  // the Map would silently stop pairing every future exit.
+  assert.ok(back.open instanceof Map);
+  assert.equal(back.open.size, 1);
+  assert.equal(back.open.get('STILL_OPEN').ourTokens, 50);
+
+  const s = calibrationSummary(back);
+  assert.equal(s.roundTrips, 1);
+  assert.equal(s.exitSamples, 1);
+  assert.ok(Math.abs(s.medianExitGapPct - -4.8) < 1e-9);
+  assert.ok(s.medianDragPct < 0);
+
+  // An exit arriving in a LATER session still pairs against the restored entry.
+  const pair = recordShadowExit(back, { mint: 'STILL_OPEN', ourFillUsd: 1.5, targetFillUsd: 1.5, exitGapPct: 0, at: 9000 });
+  assert.ok(pair, 'pairing must survive the restart');
+  assert.equal(pair.dragPct, 0);
+  assert.equal(pair.heldMs, 6000);
+
+  // A missing file is an empty ledger, not a crash.
+  const fresh = await loadCalibration('C:\\nope\\missing.json');
+  assert.equal(fresh.open.size, 0);
+  assert.deepEqual(fresh.pairs, []);
+
+  // ── PRUNING ─────────────────────────────────────────────────────────────
+  // The target does not exit everything. An entry left open forever grows the
+  // file without bound and makes openPositions meaningless.
+  const stale = createCalibrationLedger();
+  const now = Date.now();
+  stale.open.set('OLD', { at: now - 8 * 24 * 3600e3, ourTokens: 1 });
+  stale.open.set('HELD', { at: now - 2 * 24 * 3600e3, ourTokens: 1 });
+  const p = pruneCalibration(stale, { now });
+  assert.equal(p.dropped, 1, 'a week-old entry is abandoned');
+  assert.equal(p.remaining, 1, 'a two-day hold is a real position');
+  assert.ok(stale.open.has('HELD'));
+
+  await rm(tmp, { force: true });
+});
+
+test('the scaling verdict refuses seeded evidence and heavy drag', async () => {
+  const { calibrationVerdict } = await LC();
+
+  // Nothing measured is NOT the same as nothing wrong.
+  assert.equal(calibrationVerdict({ roundTrips: 0, medianDragPct: null }).ok, false);
+  assert.match(calibrationVerdict({ roundTrips: 0, seededRoundTrips: 40, medianDragPct: 2 }).reason, /seeded pairs do not count/);
+
+  // A handful of live round trips is not a track record. This is the same
+  // mistake as the n=4 exit sample the paper book's +31% rested on.
+  assert.equal(calibrationVerdict({ roundTrips: 5, medianDragPct: 0 }).ok, false);
+
+  // Drag worse than -5% compounds across every trade at the new size — the
+  // mechanism by which a book that looks profitable on paper loses live.
+  assert.equal(calibrationVerdict({ roundTrips: 50, medianDragPct: -12 }).ok, false);
+  assert.match(calibrationVerdict({ roundTrips: 50, medianDragPct: -12 }).reason, /copying costs more than the edge/);
+
+  assert.equal(calibrationVerdict({ roundTrips: 50, medianDragPct: -1.2 }).ok, true);
+  assert.equal(calibrationVerdict({ roundTrips: 25, medianDragPct: 0.4 }).ok, true);
+});
+
+test('the shadow exit is quoted at OUR size, not the target size', async () => {
+  const { shadowSellQuote, createCalibrationLedger, recordShadowEntry } = await LC();
+  const cfg = { slippageBps: 300, jupiterBase: 'https://x' };
+  const led = createCalibrationLedger();
+  recordShadowEntry(led, { mint: 'M', ourFillUsd: 1, targetFillUsd: 1, ourTokens: 1000, sizeSol: 0.01, at: 0 });
+
+  // Our position is a FRACTION of the target's. Quoting their token count
+  // would measure price impact at a depth we would never trade — and impact
+  // grows with size, so it would overstate our cost.
+  let askedAmount = null;
+  const quoteFn = async ({ amountLamports, inputMint, outputMint }) => {
+    askedAmount = amountLamports;
+    assert.equal(inputMint, 'M', 'selling the token');
+    assert.equal(outputMint, 'So11111111111111111111111111111111111111112', 'for SOL');
+    return { ok: true, quote: { outAmount: String(0.02 * 1e9) } };
+  };
+
+  const full = await shadowSellQuote(
+    { kind: 'SELL', mint: 'M', sellFraction: 1, solReceived: 5, tokenDelta: -250000 },
+    { ledger: led, cfg, solUsd: 150, decimalsFor: async () => 6, quoteFn, paperCfg: {} }
+  );
+  assert.equal(askedAmount, 1000 * 1e6, 'our 1000 tokens, not their 250000');
+  // 0.02 SOL for 1000 tokens at $150 = $0.003/token.
+  assert.ok(Math.abs(full.ourFillUsd - 0.003) < 1e-9);
+  assert.ok(Number.isFinite(full.exitGapPct));
+
+  // A partial sell scales our side proportionally.
+  const half = await shadowSellQuote(
+    { kind: 'SELL', mint: 'M', sellFraction: 0.5, solReceived: 5, tokenDelta: -125000 },
+    { ledger: led, cfg, solUsd: 150, decimalsFor: async () => 6, quoteFn, paperCfg: {} }
+  );
+  assert.equal(askedAmount, 500 * 1e6);
+  assert.ok(half.ourFillUsd > 0);
+
+  // No shadow entry means no measurement — reported, not guessed.
+  const orphan = await shadowSellQuote(
+    { kind: 'SELL', mint: 'UNKNOWN', sellFraction: 1, solReceived: 1, tokenDelta: -100 },
+    { ledger: led, cfg, solUsd: 150, decimalsFor: async () => 6, quoteFn, paperCfg: {} }
+  );
+  assert.equal(orphan.ourFillUsd, null);
+  assert.match(orphan.reason, /no shadow entry/);
+
+  // A failed quote is a missing sample, not a zero.
+  const failed = await shadowSellQuote(
+    { kind: 'SELL', mint: 'M', sellFraction: 1, solReceived: 1, tokenDelta: -100 },
+    { ledger: led, cfg, solUsd: 150, decimalsFor: async () => 6, quoteFn: async () => ({ ok: false, error: 'rate limited' }), paperCfg: {} }
+  );
+  assert.equal(failed.ourFillUsd, null);
+  assert.equal(failed.exitGapPct, null);
+  assert.equal(failed.reason, 'rate limited');
+
+  // Unknown decimals would silently mis-size the sale by 10^n.
+  const noDec = await shadowSellQuote(
+    { kind: 'SELL', mint: 'M', sellFraction: 1, solReceived: 1, tokenDelta: -100 },
+    { ledger: led, cfg, solUsd: 150, decimalsFor: async () => null, quoteFn, paperCfg: {} }
+  );
+  assert.equal(noDec.ourFillUsd, null);
+  assert.match(noDec.reason, /decimals/);
+});
+
+/* ------------------------------------------------------------------ *
+ * PHASE 4 — capital tiers
+ * ------------------------------------------------------------------ */
+
+test('capital tiers gate on evidence and demote as readily as they promote', async () => {
+  const { resolveTier, applyTier, CAPITAL_TIERS } = await LC();
+
+  // A fresh run starts at probe: 0.01 SOL a trade, ~$0.75.
+  const fresh = resolveTier({ roundTrips: 0, netSol: 0, exitSamples: 0 });
+  assert.equal(fresh.tier, 'probe');
+  assert.equal(fresh.maxTradeSol, 0.01);
+  assert.equal(fresh.maxExposureSol, 0.1);
+
+  // ── ALL THREE GATES, NOT ANY ────────────────────────────────────────────
+  // Volume without profit is an expensive habit; profit without samples is
+  // luck; samples without either is measurement, not a track record.
+  assert.equal(resolveTier({ roundTrips: 500, netSol: -1, exitSamples: 500 }).tier, 'probe', 'losing money stays at probe');
+  assert.equal(resolveTier({ roundTrips: 5, netSol: 50, exitSamples: 500 }).tier, 'probe', 'too few round trips');
+
+  // The gate that encodes the actual lesson: the paper book's +31% rested on
+  // FOUR exit samples. Capital does not scale on an unmeasured exit.
+  assert.equal(resolveTier({ roundTrips: 500, netSol: 50, exitSamples: 4 }).tier, 'probe',
+    'four exit samples cannot unlock any tier above probe');
+
+  // All three met, in order.
+  assert.equal(resolveTier({ roundTrips: 30, netSol: 0, exitSamples: 20 }).tier, 'micro');
+  assert.equal(resolveTier({ roundTrips: 100, netSol: 0.25, exitSamples: 60 }).tier, 'small');
+  assert.equal(resolveTier({ roundTrips: 300, netSol: 2.0, exitSamples: 150 }).tier, 'scaled');
+  assert.equal(resolveTier({ roundTrips: 9999, netSol: 999, exitSamples: 9999 }).tier, 'scaled', 'the top tier is a ceiling');
+
+  // ── DEMOTION ────────────────────────────────────────────────────────────
+  // Nothing latches. Tiers are recomputed from current stats, so a drawdown
+  // that drops net below a floor drops the caps with it — at the moment they
+  // matter most.
+  const good = resolveTier({ roundTrips: 320, netSol: 2.5, exitSamples: 200 });
+  assert.equal(good.tier, 'scaled');
+  const drawdown = resolveTier({ roundTrips: 340, netSol: 0.30, exitSamples: 210 });
+  assert.equal(drawdown.tier, 'small', 'a drawdown demotes');
+  assert.ok(drawdown.maxTradeSol < good.maxTradeSol);
+  const worse = resolveTier({ roundTrips: 360, netSol: -0.5, exitSamples: 220 });
+  assert.equal(worse.tier, 'probe', 'going net negative returns to the smallest size');
+
+  // Caps rise together, never one without the others.
+  for (let i = 1; i < CAPITAL_TIERS.length; i++) {
+    assert.ok(CAPITAL_TIERS[i].maxTradeSol > CAPITAL_TIERS[i - 1].maxTradeSol);
+    assert.ok(CAPITAL_TIERS[i].maxExposureSol > CAPITAL_TIERS[i - 1].maxExposureSol);
+    assert.ok(CAPITAL_TIERS[i].dailyLossLimitSol > CAPITAL_TIERS[i - 1].dailyLossLimitSol);
+    assert.ok(CAPITAL_TIERS[i].minExitSamples > CAPITAL_TIERS[i - 1].minExitSamples);
+  }
+
+  // The next-tier requirements are actionable, not just a name.
+  const needs = resolveTier({ roundTrips: 10, netSol: -0.5, exitSamples: 3 }).next;
+  assert.equal(needs.name, 'micro');
+  assert.equal(needs.needs.length, 3);
+  assert.ok(needs.needs.some((n) => /20 more round trips/.test(n)));
+  assert.ok(needs.needs.some((n) => /17 more exit samples/.test(n)));
+
+  // A tier table edited to give probe a floor must fail CLOSED — falling
+  // through to "no caps" would be the worst possible default.
+  const strict = resolveTier({ roundTrips: 0, netSol: 0, exitSamples: 0 }, [{ ...CAPITAL_TIERS[0], minRoundTrips: 5 }]);
+  assert.equal(strict.tier, 'blocked');
+  assert.equal(strict.maxTradeSol, 0);
+  assert.equal(strict.maxExposureSol, 0);
+
+  // Applying a tier overwrites exactly the three caps and nothing else.
+  const cfg = applyTier({ slippageBps: 300, gasReserveSol: 0.05, maxTradeSol: 99 }, good);
+  assert.equal(cfg.maxTradeSol, 1.0);
+  assert.equal(cfg.maxExposureSol, 10.0);
+  assert.equal(cfg.dailyLossLimitSol, 2.0);
+  assert.equal(cfg.slippageBps, 300, 'unrelated settings survive');
+  assert.equal(cfg.gasReserveSol, 0.05);
+  assert.equal(cfg.tier, 'scaled');
+});
+
+test('a round trip is a closed position, not a transaction', async () => {
+  const { trackRecord } = await LC();
+
+  // ── WHY COUNT SELLS ─────────────────────────────────────────────────────
+  // Fifty landed buys and no sells is no evidence at all about EXITING, which
+  // is the risky half — a failed sell is money in a draining pool. Counting
+  // transactions would promote a bot that has only ever bought.
+  const log = [
+    { outcome: 'LANDED', side: 'BUY', realisedSol: 0 },
+    { outcome: 'LANDED', side: 'BUY', realisedSol: 0 },
+    { outcome: 'LANDED', side: 'SELL', realisedSol: 0.02 },
+    { outcome: 'LANDED', side: 'SELL', realisedSol: -0.01 },
+    { outcome: 'ABANDONED', side: 'SELL', realisedSol: -99 },   // never landed
+    { outcome: 'LANDED', side: 'SELL', realisedSol: null },     // basis unknown
+  ];
+  const r = trackRecord(log);
+  assert.equal(r.roundTrips, 2, 'two settled sells, not six transactions and not four landed');
+  assert.equal(r.landedCount, 5);
+  assert.ok(Math.abs(r.netSol - 0.01) < 1e-9, 'unlanded and unknown-basis rows contribute nothing');
+
+  // With a calibration ledger, exit samples come from the shadow measurement,
+  // which is available in dry-run and therefore grows without spending.
+  assert.equal(trackRecord(log, { exitSamples: 44 }).exitSamples, 44);
+  assert.equal(trackRecord([]).roundTrips, 0);
+  assert.equal(trackRecord([]).netSol, 0);
+});
+
 test('the live book is a different file from the paper book', async () => {
   const { LIVE_BOOK_PATH, loadLiveBook, saveLiveBook } = await LC();
   const { BOOK_PATH } = await import('../paper_copytrade.mjs');
