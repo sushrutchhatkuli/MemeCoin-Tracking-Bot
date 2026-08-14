@@ -9036,6 +9036,81 @@ test('reconcile treats the chain as truth and adopts what the book missed', asyn
   assert.equal(out.applied, true);
 });
 
+test('realised P&L is settled from the chain, so the daily limit is not inert', async () => {
+  const { settleFill, applyFill, dailyLossState } = await LC();
+
+  // ── THE BUG THIS EXISTS TO PREVENT ──────────────────────────────────────
+  // dailyLossState sums intent.realisedSol. That field was read by the limit
+  // and written by nothing, so the limit computed 0 forever and could never
+  // trip. A safety guard that cannot fire is worse than none, because it is
+  // trusted. This test asserts the field actually arrives.
+  const book = { positions: {}, closed: [] };
+
+  // A BUY realises nothing — it converts SOL into a position. Recording the
+  // spend as a loss would halt after five ordinary buys regardless of how they
+  // performed: a limit on activity, not on losing money.
+  const bought = applyFill(book, { side: 'BUY', mint: 'M', solSpent: 0.01, tokenDelta: 1000 });
+  assert.equal(bought.realisedSol, 0);
+  assert.equal(book.positions.M.costSol, 0.01);
+  assert.equal(book.positions.M.tokens, 1000);
+
+  // Scaling in accumulates basis rather than replacing it.
+  applyFill(book, { side: 'BUY', mint: 'M', solSpent: 0.01, tokenDelta: 500 });
+  assert.equal(book.positions.M.costSol, 0.02);
+  assert.equal(book.positions.M.tokens, 1500);
+
+  // A partial sell realises against the proportional basis only.
+  const half = applyFill(book, { side: 'SELL', mint: 'M', solReceived: 0.02, tokenDelta: -750 });
+  assert.ok(Math.abs(half.realisedSol - 0.01) < 1e-9, 'proceeds 0.02 minus half of 0.02 basis');
+  assert.equal(book.positions.M.tokens, 750);
+  assert.ok(Math.abs(book.positions.M.costSol - 0.01) < 1e-9);
+
+  // Closing it out removes the position.
+  const rest = applyFill(book, { side: 'SELL', mint: 'M', solReceived: 0.004, tokenDelta: -750 });
+  assert.ok(Math.abs(rest.realisedSol - -0.006) < 1e-9, 'a real loss is recorded as negative');
+  assert.equal(book.positions.M, undefined);
+  assert.equal(book.closed.length, 2);
+
+  // A position adopted by reconcile has no basis. Its P&L is null, NOT the
+  // whole proceeds counted as profit — that would mask real losses from the
+  // very limit meant to catch them.
+  const orphan = { positions: { O: { mint: 'O', tokens: 100, costSol: null } }, closed: [] };
+  const sold = applyFill(orphan, { side: 'SELL', mint: 'O', solReceived: 5, tokenDelta: -100 });
+  assert.equal(sold.realisedSol, null);
+  assert.equal(sold.basisUnknown, true);
+  assert.equal(orphan.closed.length, 0, 'an unknown basis is not booked as a 5 SOL gain');
+
+  // And the numbers come from the transaction, not the quote: slippage, a
+  // different route, or a partial fill all mean the two disagree.
+  const parsed = await settleFill({
+    signature: 'sig', wallet: 'W',
+    rpcImpl: async () => ({ ok: true, result: { fake: 'tx' } }),
+    parseImpl: () => ({ kind: 'BUY', mint: 'M', solSpent: 0.0097, tokenDelta: 950 }),
+  });
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.solSpent, 0.0097);
+
+  // A just-confirmed signature is often not readable yet — measured on this
+  // target, every sample needed 2-3 attempts.
+  let calls = 0;
+  const eventually = await settleFill({
+    signature: 'sig', wallet: 'W', delayMs: 0,
+    rpcImpl: async () => (++calls < 3 ? { ok: true, result: null } : { ok: true, result: { fake: 'tx' } }),
+    parseImpl: () => ({ kind: 'SELL', mint: 'M', solReceived: 0.02, tokenDelta: -100 }),
+  });
+  assert.equal(eventually.ok, true);
+  assert.equal(calls, 3);
+
+  // Unreadable is reported, never guessed at.
+  const lost = await settleFill({ signature: 'sig', wallet: 'W', attempts: 2, delayMs: 0, rpcImpl: async () => ({ ok: true, result: null }) });
+  assert.equal(lost.ok, false);
+
+  // End to end: six settled losing sells trip a 0.05 limit.
+  const now = Date.UTC(2026, 7, 14, 12, 0, 0);
+  const log = Array.from({ length: 6 }, () => ({ at: now - 3600e3, outcome: 'LANDED', realisedSol: -0.01 }));
+  assert.equal(dailyLossState(log, { dailyLossLimitSol: 0.05 }, now).tripped, true);
+});
+
 test('the daily loss limit bounds a bad day, not just a bad trade', async () => {
   const { dailyLossState } = await LC();
   const cfg = { dailyLossLimitSol: 0.05 };

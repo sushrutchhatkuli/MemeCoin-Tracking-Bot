@@ -363,11 +363,15 @@ export async function fetchJupiterQuote(
     `${base}/quote?inputMint=${inputMint}&outputMint=${outputMint}` +
     `&amount=${Math.floor(amountLamports)}&slippageBps=${slippageBps}`;
 
+  const headers = {};
+  const apiKey = process.env['JUPITER_API_KEY'];
+  if (apiKey) headers['x-api-key'] = apiKey;
+
   let last = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (attempt) await new Promise((r) => setTimeout(r, retryDelayMs * attempt));
     try {
-      const res = await fetchImpl(url, { signal: AbortSignal.timeout(12_000) });
+      const res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(12_000) });
       const text = await res.text();
 
       if (res.ok) {
@@ -376,6 +380,7 @@ export async function fetchJupiterQuote(
         last = { ok: false, noRoute: true, error: 'quote returned no outAmount' };
         continue;
       }
+
 
       // ── A THROTTLE IS NOT A ROUTING FAILURE, AND IT LOOKED LIKE ONE ────────
       // The free tier answers HTTP 400 under load with a body that matches the
@@ -428,10 +433,15 @@ export async function buildSwapTransaction(
   { quote, userPublicKey, cfg = LIVE_DEFAULTS, fetchImpl = fetch } = {}
 ) {
   try {
+    const headers = { 'content-type': 'application/json' };
+    const apiKey = process.env['JUPITER_API_KEY'];
+    if (apiKey) headers['x-api-key'] = apiKey;
+
     const res = await fetchImpl(`${cfg.jupiterBase}/swap`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers,
       body: JSON.stringify({
+
         quoteResponse: quote,
         userPublicKey,
         wrapAndUnwrapSol: true,
@@ -628,6 +638,20 @@ export async function planIntent(
   });
   if (!sized.ok) return { ...base, decision: 'SKIP', reason: sized.reason };
 
+  // ── FIRED CONCURRENTLY WITH THE QUOTE, NOT AFTER IT ───────────────────────
+  // The security audit costs ~107ms measured, the quote ~28ms and decimals
+  // ~31ms. Run serially that is the sum; run together it is the largest of
+  // them. Nothing is traded any earlier by hurrying the decision, but ~130ms
+  // of the ~180ms decision path is pure waiting, and on a copy trade whose
+  // edge decays within a second that is worth removing.
+  //
+  // The audit does not depend on the quote. Only the GATE is venue-aware, and
+  // the venue is applied at evaluation time below, so nothing is weakened by
+  // starting the audit earlier. The catch is required because an early return
+  // on a failed quote would otherwise leave this promise unhandled.
+  const securityPromise = securityFor(trade.mint).catch(() => null);
+  const decimalsPromise = decimalsFor(trade.mint).catch(() => null);
+
   const quoted = await quoteFn({
     inputMint: WSOL_MINT,
     outputMint: trade.mint,
@@ -664,7 +688,7 @@ export async function planIntent(
   // is wrong by a factor of 10^decimals and produced a "quote gap" of exactly
   // -100% on every sample — a number so uniform it was obviously an artifact
   // rather than a measurement. Decimals are fetched once per mint and cached.
-  const decimals = await decimalsFor(trade.mint);
+  const decimals = await decimalsPromise;
   const outRaw = Number(quoted.quote.outAmount);
   const outTokens =
     Number.isFinite(outRaw) && Number.isFinite(decimals) ? outRaw / 10 ** decimals : null;
@@ -686,7 +710,7 @@ export async function planIntent(
     quoteGapPct: ourFillUsd && targetFillUsd ? (ourFillUsd / targetFillUsd - 1) * 100 : null,
   };
 
-  const gate = evaluateSafetyGate(await securityFor(trade.mint, venue), { venue, cfg });
+  const gate = evaluateSafetyGate(await securityPromise, { venue, cfg });
   if (!gate.pass) {
     return { ...base, ...measured, decision: 'BLOCKED', reason: gate.reasons.join('; ') };
   }
@@ -875,6 +899,85 @@ export async function reconcile({ owner, rpcUrl, rpcImpl, book, adopt = true } =
 /* ------------------------------------------------------------------ *
  * ITEM 3 + 6 — execution policy
  * ------------------------------------------------------------------ */
+
+/**
+ * Read back what a landed transaction ACTUALLY did, from the chain.
+ *
+ * ── WHY THE QUOTE IS NOT AN ANSWER ──────────────────────────────────────────
+ * The quote says what Jupiter expected; slippage, a different route, or a
+ * partial fill mean the transaction may have done something else. Every number
+ * that matters downstream — realised P&L, the daily loss limit, and the Phase 3
+ * comparison against the target's own fill — has to come from the transaction
+ * itself, not from what was requested.
+ *
+ * Retries because a just-confirmed signature is frequently not yet readable:
+ * measured earlier on this target, every sample needed 2-3 attempts.
+ */
+export async function settleFill({ signature, wallet, rpcUrl, rpcImpl, attempts = 4, delayMs = 400, parseImpl } = {}) {
+  const { parseWalletSwap } = parseImpl ? { parseWalletSwap: parseImpl } : await import('./paper_copytrade.mjs');
+  for (let i = 0; i < attempts; i++) {
+    const res = await rpcImpl(rpcUrl, 'getTransaction', [
+      signature,
+      { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' },
+    ]);
+    if (res.ok && res.result) {
+      const swap = parseWalletSwap(res.result, { wallet });
+      if (swap) return { ok: true, ...swap };
+      return { ok: false, error: 'transaction did not parse as a swap for this wallet' };
+    }
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return { ok: false, error: `could not read ${String(signature).slice(0, 12)}… after ${attempts} attempts` };
+}
+
+/**
+ * Apply a settled fill to the live book, and return the realised P&L. PURE.
+ *
+ * ── WHAT COUNTS AS A LOSS ───────────────────────────────────────────────────
+ * A BUY realises nothing — it converts SOL into a position. Recording the spend
+ * as a loss would trip the daily limit after five ordinary buys no matter how
+ * well they performed, which is a halt on activity rather than on losing money.
+ *
+ * A SELL realises proceeds minus the cost basis of the tokens actually sold. A
+ * position adopted by reconcile has no known basis, so its P&L is recorded as
+ * null rather than as a fictitious profit equal to the whole proceeds — which
+ * is what treating a null basis as zero would do, and it would mask real losses
+ * from the limit that is supposed to catch them.
+ */
+export function applyFill(book, { side, mint, solSpent, solReceived, tokenDelta }) {
+  if (!book.positions) book.positions = {};
+  const pos = book.positions[mint];
+
+  if (side === 'BUY') {
+    const tokens = Math.abs(tokenDelta ?? 0);
+    if (pos) {
+      pos.tokens = (pos.tokens ?? 0) + tokens;
+      pos.costSol = (pos.costSol ?? 0) + (solSpent ?? 0);
+    } else {
+      book.positions[mint] = { mint, tokens, costSol: solSpent ?? 0, openedAt: Date.now() };
+    }
+    return { realisedSol: 0, opened: true };
+  }
+
+  const sold = Math.abs(tokenDelta ?? 0);
+  const heldBefore = pos?.tokens ?? 0;
+  const basis = pos?.costSol;
+  const fraction = heldBefore > 0 ? Math.min(1, sold / heldBefore) : 1;
+  const costOfSold = Number.isFinite(basis) ? basis * fraction : null;
+
+  if (pos) {
+    pos.tokens = Math.max(0, heldBefore - sold);
+    if (Number.isFinite(basis)) pos.costSol = basis - (costOfSold ?? 0);
+    if (pos.tokens <= 1e-9) delete book.positions[mint];
+  }
+
+  const realisedSol = costOfSold === null ? null : (solReceived ?? 0) - costOfSold;
+  if (realisedSol !== null) {
+    if (!book.closed) book.closed = [];
+    book.closed.push({ mint, solReceived, costSol: costOfSold, realisedSol, at: Date.now() });
+  }
+  return { realisedSol, closed: true, basisUnknown: costOfSold === null };
+}
 
 /**
  * Realised loss since midnight UTC, against the daily limit. PURE.
@@ -1237,15 +1340,48 @@ export async function main(argv = []) {
 
         intent.outcome = result.status;
         intent.executionSignature = result.signature ?? null;
+
+        // ── Settle from the chain, not from the quote ─────────────────────
+        // realisedSol is what the daily loss limit reads. Until this ran, the
+        // field was never written and the limit could not trip.
+        let fill = null;
+        let realisedSol = null;
+        if (result.status === 'LANDED' && result.signature) {
+          fill = await settleFill({ signature: result.signature, wallet: signer.publicKey, rpcUrl, rpcImpl });
+          if (fill.ok) {
+            const applied = applyFill(book, {
+              side: intent.side, mint: intent.mint,
+              solSpent: fill.solSpent, solReceived: fill.solReceived, tokenDelta: fill.tokenDelta,
+            });
+            realisedSol = applied.realisedSol;
+            if (applied.basisUnknown) {
+              console.log(`    ${formatTicker(null, intent.mint)} sold with unknown cost basis — P&L not counted`);
+            }
+            await saveLiveBook(book);
+          } else {
+            console.error(`    ⚠ could not settle ${result.signature.slice(0, 12)}… — ${fill.error}`);
+          }
+        }
+
         await updateIntent(intent.id, {
           outcome: result.status,
           executionSignature: result.signature ?? null,
           attempts: result.attempts ?? null,
           panicked: result.panicked ?? false,
           error: result.error ?? null,
+          // The honest fill, for the daily limit and for Phase 3 calibration.
+          realisedSol,
+          actualSolSpent: fill?.solSpent ?? null,
+          actualSolReceived: fill?.solReceived ?? null,
+          actualTokenDelta: fill?.tokenDelta ?? null,
+          settleError: fill && !fill.ok ? fill.error : null,
         });
 
-        if (result.status === 'LANDED' && intent.side === 'BUY') exposureSol += intent.sizeSol;
+        if (result.status === 'LANDED' && intent.side === 'BUY') {
+          // Actual spend, not the requested size — slippage and fees mean these
+          // differ, and exposure tracked from intent drifts from reality.
+          exposureSol += Number.isFinite(fill?.solSpent) ? fill.solSpent : intent.sizeSol;
+        }
 
         // ITEM 5 again, and this is the important one: re-read the chain after
         // every fill rather than assuming the transaction did what the quote
