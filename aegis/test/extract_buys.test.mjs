@@ -8720,3 +8720,246 @@ test('the book detects a second instance writing it', async () => {
   assert.equal(detectConcurrentWriter({}, { pid: 111, now }), null);
   assert.equal(detectConcurrentWriter(null, { pid: 111, now }), null);
 });
+/* ------------------------------------------------------------------ *
+ * Live copytrade — Phase 1 shadow mode
+ * ------------------------------------------------------------------ */
+
+const LC = () => import('../live_copytrade.mjs');
+
+test('the shadow build cannot broadcast, and that is enforced', async () => {
+  const { submitIntent } = await LC();
+  // A thrown error is a stronger guarantee than a --dry-run flag a stray
+  // argument could clear. Phase 1 is DEFINED by the absence of a send path.
+  await assert.rejects(() => submitIntent({ anything: true }), /not implemented|shadow-mode/i);
+
+  const src = await (await import('node:fs/promises')).readFile(
+    new URL('../live_copytrade.mjs', import.meta.url), 'utf8'
+  );
+  for (const forbidden of ['sendRawTransaction', 'Keypair', 'fromSecretKey', 'signTransaction']) {
+    assert.ok(!src.includes(forbidden), `must not reference ${forbidden}`);
+  }
+});
+
+test('the gas reserve is subtracted before sizing, not checked after', async () => {
+  const { sizeUnderGasReserve, liveConfig } = await LC();
+  const cfg = liveConfig({ gasReserveSol: 0.05, maxTradeSol: 1, maxExposureSol: 10 });
+
+  // Plenty spare: the request stands.
+  assert.equal(sizeUnderGasReserve(cfg, { requestedSol: 0.5, nativeSolBalance: 2 }).sizeSol, 0.5);
+
+  // Near the floor: capped so the wallet keeps enough to transact. Checking
+  // AFTER is how a wallet reaches 0.004 SOL — positive, but unable to pay ATA
+  // rent on its next buy or the fee on the sell that gets it out.
+  const tight = sizeUnderGasReserve(cfg, { requestedSol: 0.5, nativeSolBalance: 0.2 });
+  assert.ok(Math.abs(tight.sizeSol - 0.15) < 1e-9);
+  assert.equal(tight.cappedBy, 'gas reserve');
+
+  // At or under the floor: no trade at all.
+  assert.equal(sizeUnderGasReserve(cfg, { requestedSol: 0.5, nativeSolBalance: 0.05 }).ok, false);
+  assert.match(sizeUnderGasReserve(cfg, { requestedSol: 0.5, nativeSolBalance: 0.01 }).reason, /gas reserve/);
+
+  // Caps compose, and the binding one is named.
+  const capped = sizeUnderGasReserve(liveConfig({ maxTradeSol: 0.01, gasReserveSol: 0.05 }), {
+    requestedSol: 5, nativeSolBalance: 10,
+  });
+  assert.equal(capped.sizeSol, 0.01);
+  assert.equal(capped.cappedBy, 'maxTradeSol');
+
+  const exposed = sizeUnderGasReserve(liveConfig({ maxTradeSol: 1, maxExposureSol: 0.1 }), {
+    requestedSol: 1, nativeSolBalance: 10, exposureSol: 0.1,
+  });
+  assert.equal(exposed.ok, false);
+  assert.match(exposed.reason, /max exposure/);
+});
+
+test('the mint lock serialises same-token work and lets others run free', async () => {
+  const { createMintLock } = await LC();
+  const lock = createMintLock();
+  const order = [];
+  const slow = (tag, ms) => lock.run(tag.split(':')[0], async () => {
+    order.push(`${tag}:start`);
+    await new Promise((r) => setTimeout(r, ms));
+    order.push(`${tag}:end`);
+  });
+
+  // A BUY and an ADD of ONE token arriving together must not both build a
+  // transaction — that duplicates the ATA and doubles the size.
+  await Promise.all([slow('MINT:buy', 30), slow('MINT:add', 5)]);
+  assert.deepEqual(order, ['MINT:buy:start', 'MINT:buy:end', 'MINT:add:start', 'MINT:add:end']);
+
+  // The second caller WAITS rather than being dropped — dropping it would
+  // silently under-copy the target.
+  assert.ok(order.includes('MINT:add:end'));
+
+  // Different mints are independent.
+  const par = [];
+  await Promise.all([
+    lock.run('A', async () => { par.push('A1'); await new Promise((r) => setTimeout(r, 20)); par.push('A2'); }),
+    lock.run('B', async () => { par.push('B1'); await new Promise((r) => setTimeout(r, 1)); par.push('B2'); }),
+  ]);
+  assert.ok(par.indexOf('B2') < par.indexOf('A2'), 'B must not wait for A');
+
+  // No leak: the map empties once work settles.
+  assert.equal(lock.depth(), 0);
+});
+
+test('a lock is released even when the work throws', async () => {
+  const { createMintLock } = await LC();
+  const lock = createMintLock();
+  await assert.rejects(() => lock.run('M', async () => { throw new Error('boom'); }));
+  // A failed buy must not wedge the mint forever — the sell needs the lock.
+  const after = await lock.run('M', async () => 'ok');
+  assert.equal(after, 'ok');
+  assert.equal(lock.depth(), 0);
+});
+
+test('safety gating is venue-aware but never waives authority checks', async () => {
+  const { evaluateSafetyGate, liveConfig } = await LC();
+  const cfg = liveConfig({ maxTopHolderPct: 60 });
+  const clean = { mintAuthority: null, freezeAuthority: null, top10Pct: 30 };
+
+  assert.equal(evaluateSafetyGate(clean, { venue: 'pump-amm', cfg }).pass, true);
+
+  // An un-migrated bonding curve has NO pool, so "LP burned" is undefined
+  // rather than false and the curve itself holds most of the supply. Testing
+  // those as booleans rejects every such token and defeats copytrading.
+  const concentrated = { mintAuthority: null, freezeAuthority: null, top10Pct: 95 };
+  assert.equal(evaluateSafetyGate(concentrated, { venue: 'pump-amm', cfg }).pass, false);
+  const bonding = evaluateSafetyGate(concentrated, { venue: 'pump-bonding', cfg });
+  assert.equal(bonding.pass, true);
+  assert.match(bonding.waived.join(' '), /bonding curve/);
+
+  // NEVER waived, at any venue: these separate a token you can sell from one
+  // you cannot, which is the whole risk a copy bot inherits.
+  for (const venue of ['pump-bonding', 'pump-amm', 'raydium']) {
+    assert.equal(evaluateSafetyGate({ mintAuthority: 'someone', top10Pct: 1 }, { venue, cfg }).pass, false);
+    assert.equal(evaluateSafetyGate({ freezeAuthority: 'someone', top10Pct: 1 }, { venue, cfg }).pass, false);
+  }
+
+  // Fails CLOSED on a missing audit.
+  assert.equal(evaluateSafetyGate(null, { venue: 'pump-amm', cfg }).pass, false);
+  // And can be turned off deliberately, which is recorded rather than silent.
+  assert.equal(evaluateSafetyGate(null, { cfg: liveConfig({ requireSafetyGate: false }) }).pass, true);
+});
+
+test('venue is read from the route, not guessed from the mint', async () => {
+  const { classifyVenue } = await LC();
+  assert.equal(classifyVenue({ routePlan: [{ swapInfo: { label: 'Pump.fun Amm' } }] }), 'pump-amm');
+  assert.equal(classifyVenue({ routePlan: [{ swapInfo: { label: 'Pump.fun' } }] }), 'pump-bonding');
+  assert.equal(classifyVenue({ routePlan: [{ swapInfo: { label: 'Raydium CLMM' } }] }), 'raydium');
+  assert.equal(classifyVenue({ routePlan: [] }), 'unknown');
+  assert.equal(classifyVenue(null), 'unknown');
+});
+
+test('a no-route is a measurement, not an error', async () => {
+  const { fetchJupiterQuote } = await LC();
+  // Distinguishable from a network failure, because the no-route RATE is one of
+  // the three numbers Phase 1 exists to produce. Measured 0/12 on this target.
+  const r404 = await fetchJupiterQuote({ fetchImpl: async () => new Response('', { status: 404 }) });
+  assert.equal(r404.noRoute, true);
+
+  const worded = await fetchJupiterQuote({
+    fetchImpl: async () => new Response('{"error":"Could not find any route"}', { status: 400 }),
+  });
+  assert.equal(worded.noRoute, true);
+
+  // A network failure is NOT a no-route — conflating them would fabricate a
+  // routability problem out of an outage.
+  const down = await fetchJupiterQuote({ fetchImpl: async () => { throw new Error('ECONNRESET'); } });
+  assert.equal(down.ok, false);
+  assert.equal(down.noRoute, false);
+
+  // A 200 with no outAmount is unroutable in practice.
+  const empty = await fetchJupiterQuote({ fetchImpl: async () => new Response('{}', { status: 200 }) });
+  assert.equal(empty.noRoute, true);
+});
+
+test('intent ids are stable per observed trade and side', async () => {
+  const { intentId } = await LC();
+  // Derived from the target's signature, so the same observed trade always
+  // yields the same id however many times it is seen. That is what makes a
+  // crash mid-flight recoverable in Phase 2 rather than a double-buy.
+  assert.equal(intentId('SIG123', 'BUY'), intentId('SIG123', 'BUY'));
+  assert.notEqual(intentId('SIG123', 'BUY'), intentId('SIG123', 'SELL'));
+  assert.notEqual(intentId('SIG123', 'BUY'), intentId('SIG124', 'BUY'));
+  assert.match(intentId(null, 'BUY'), /unknown:BUY/);
+});
+
+test('planIntent reports a decline without paying for a quote', async () => {
+  const { planIntent, liveConfig } = await LC();
+  const { paperConfig } = await import('../paper_copytrade.mjs');
+  let quoted = 0;
+
+  // Below the gas reserve: refused before Jupiter is touched, so a wallet that
+  // cannot trade does not spend rate limit discovering it repeatedly.
+  const out = await planIntent(
+    { kind: 'BUY', mint: 'M', solSpent: 1, tokenDelta: 1000, signature: 'S1' },
+    {
+      cfg: liveConfig({ gasReserveSol: 0.05 }),
+      paperCfg: paperConfig({ perTradeSol: 1 }),
+      solUsd: 100,
+      nativeSolBalance: 0.01,
+      quoteFn: async () => { quoted++; return { ok: true, quote: {} }; },
+    }
+  );
+  assert.equal(out.decision, 'SKIP');
+  assert.equal(quoted, 0, 'no quote for a trade that was never viable');
+});
+
+test('planIntent measures the quote gap even when the gate blocks', async () => {
+  const { planIntent, liveConfig } = await LC();
+  const { paperConfig } = await import('../paper_copytrade.mjs');
+
+  // Phase 1 is a measurement exercise. A blocked buy still tells us what the
+  // copy would have cost, and discarding that on the way to "BLOCKED" throws
+  // away the most valuable number in the run.
+  const out = await planIntent(
+    { kind: 'BUY', mint: 'M', solSpent: 1, tokenDelta: 1000, signature: 'S1' },
+    {
+      cfg: liveConfig({ maxTradeSol: 1, maxExposureSol: 10, gasReserveSol: 0, requireSafetyGate: true }),
+      paperCfg: paperConfig({ perTradeSol: 1, slippagePct: 0 }),
+      solUsd: 100,
+      nativeSolBalance: 10,
+      // Raw base units; decimals convert them to UI so the comparison is valid.
+      quoteFn: async () => ({ ok: true, quote: { outAmount: '1000000000', routePlan: [{ swapInfo: { label: 'Pump.fun Amm' } }], priceImpactPct: '0' } }),
+      decimalsFor: async () => 6,
+      securityFor: async () => ({ mintAuthority: 'still-set' }),
+      buildFn: async () => ({ ok: true, bytes: 700 }),
+    }
+  );
+
+  assert.equal(out.decision, 'BLOCKED');
+  assert.match(out.reason, /mint authority/);
+  assert.equal(out.venue, 'pump-amm');
+  // 1000 raw / 10^6 = 1000 UI tokens for 1 SOL at $100 -> $0.10 each.
+  assert.ok(Math.abs(out.ourFillUsd - 0.1) < 1e-9, `got ${out.ourFillUsd}`);
+  assert.ok(Number.isFinite(out.quoteGapPct), 'gap must survive a block');
+});
+
+test('the quote gap uses matching units', async () => {
+  const { planIntent, liveConfig } = await LC();
+  const { paperConfig } = await import('../paper_copytrade.mjs');
+
+  // outAmount is RAW base units; the target's tokenDelta is UI. Dividing one by
+  // the other is wrong by 10^decimals and produced a uniform -100% gap on every
+  // sample — an artifact so consistent it could only have been a bug.
+  const mk = (decimals) => planIntent(
+    { kind: 'BUY', mint: 'M', solSpent: 1, tokenDelta: 1000, signature: 'S1' },
+    {
+      cfg: liveConfig({ maxTradeSol: 1, maxExposureSol: 10, gasReserveSol: 0, requireSafetyGate: false }),
+      paperCfg: paperConfig({ perTradeSol: 1, slippagePct: 0 }),
+      solUsd: 100,
+      nativeSolBalance: 10,
+      quoteFn: async () => ({ ok: true, quote: { outAmount: String(1000 * 10 ** decimals), routePlan: [], priceImpactPct: '0' } }),
+      decimalsFor: async () => decimals,
+      buildFn: async () => ({ ok: true, bytes: 700 }),
+    }
+  );
+
+  // Identical economics at any decimal scale: same tokens, same SOL, same fill.
+  for (const d of [0, 6, 9]) {
+    const r = await mk(d);
+    assert.ok(Math.abs(r.ourFillUsd - 0.1) < 1e-9, `decimals ${d} -> ${r.ourFillUsd}`);
+    assert.ok(Math.abs(r.quoteGapPct) < 1e-6, `decimals ${d} gap ${r.quoteGapPct}`);
+  }
+});
