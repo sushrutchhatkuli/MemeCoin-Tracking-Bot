@@ -8726,18 +8726,379 @@ test('the book detects a second instance writing it', async () => {
 
 const LC = () => import('../live_copytrade.mjs');
 
-test('the shadow build cannot broadcast, and that is enforced', async () => {
+test('nothing can be broadcast without a signer, and dry-run never builds one', async () => {
   const { submitIntent } = await LC();
-  // A thrown error is a stronger guarantee than a --dry-run flag a stray
-  // argument could clear. Phase 1 is DEFINED by the absence of a send path.
-  await assert.rejects(() => submitIntent({ anything: true }), /not implemented|shadow-mode/i);
+
+  // Phase 1 guaranteed this by having no send path at all. Phase 2 has one, so
+  // the guarantee moves: the send path is unreachable without a signer, and
+  // --dry-run never constructs a signer. The assertion is now about the SEAM
+  // rather than the absence of code, because the code has to exist to trade.
+  await assert.rejects(() => submitIntent({ intent: { transactionBase64: 'AAA' } }), /without a signer/i);
+  await assert.rejects(() => submitIntent({ intent: {}, signer: null }), /without a signer/i);
 
   const src = await (await import('node:fs/promises')).readFile(
     new URL('../live_copytrade.mjs', import.meta.url), 'utf8'
   );
-  for (const forbidden of ['sendRawTransaction', 'Keypair', 'fromSecretKey', 'signTransaction']) {
-    assert.ok(!src.includes(forbidden), `must not reference ${forbidden}`);
-  }
+
+  // The key boundary, checked mechanically. A key read from the environment or
+  // from a default path is how a hot wallet gets used by a process that did not
+  // mean to use one — the ONLY way in is --keyfile, at the CLI edge.
+  assert.ok(!/process\.env\.[A-Z_]*(KEY|SECRET|PRIVATE|MNEMONIC|SEED)/.test(src),
+    'must never read a key from the environment');
+  assert.ok(src.includes('--keyfile'), 'the only key input is an explicit --keyfile path');
+
+  // live_execute holds the signing primitives and must not know how to FIND a
+  // key — a module that can locate one can be made to use one.
+  const exec = await (await import('node:fs/promises')).readFile(
+    new URL('../live_execute.mjs', import.meta.url), 'utf8'
+  );
+  assert.ok(!exec.includes('process.env'), 'live_execute must not read the environment');
+  assert.ok(!/readFile|readFileSync/.test(exec), 'live_execute must not read files — keys arrive as bytes from the caller');
+});
+
+test('a keyfile inside the repository is refused outright', async () => {
+  const { assertKeyfileOutsideRepo } = await LC();
+  const root = 'C:\\Users\\me\\Projects\\aegis-repo';
+
+  // .gitignore is not protection: it is one `git add -f` from failing. The
+  // path is refused instead.
+  assert.throws(() => assertKeyfileOutsideRepo(`${root}\\hot.json`, root), /refusing/i);
+  assert.throws(() => assertKeyfileOutsideRepo(`${root}\\aegis\\.state\\hot.json`, root), /refusing/i);
+  // Windows paths are case-insensitive, so a naive compare misses this one.
+  assert.throws(() => assertKeyfileOutsideRepo(`${root.toUpperCase()}\\hot.json`, root), /refusing/i);
+
+  // Outside is fine, and a sibling directory that merely shares a prefix is
+  // outside — `aegis-repo-keys` must not be mistaken for a child of `aegis-repo`.
+  assert.ok(assertKeyfileOutsideRepo('C:\\Users\\me\\.solana\\hot.json', root));
+  assert.ok(assertKeyfileOutsideRepo(`${root}-keys\\hot.json`, root));
+});
+
+test('a signer exposes a public key and never the secret', async () => {
+  const { createSigner, base58Encode, base58Decode } = await import('../live_execute.mjs');
+  const { generateKeyPairSync } = await import('node:crypto');
+
+  // A throwaway keypair. Nothing here touches a real wallet.
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const seed = privateKey.export({ format: 'der', type: 'pkcs8' }).subarray(-32);
+  const pub = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
+
+  const signer = createSigner({ secretKey: Uint8Array.from([...seed, ...pub]) });
+  assert.equal(signer.publicKey, base58Encode(pub));
+
+  // The secret must not be reachable from anything the signer returns, and
+  // must not survive a JSON.stringify of an object that happens to hold one.
+  const serialised = JSON.stringify({ signer, note: 'an intent log entry' });
+  assert.ok(serialised.includes('[redacted]'));
+  assert.ok(!serialised.includes(Buffer.from(seed).toString('hex')));
+  assert.ok(!Object.values(signer).some((v) => v instanceof Uint8Array && Buffer.from(v).equals(Buffer.from(seed))));
+
+  // A 32-byte seed alone works too.
+  assert.equal(createSigner({ secretKey: Uint8Array.from(seed) }).publicKey, signer.publicKey);
+
+  // Incoherent bytes are caught here rather than by signing for the wrong
+  // wallet: the embedded public half is CHECKED, not trusted.
+  const wrong = Uint8Array.from([...seed, ...new Array(32).fill(7)]);
+  assert.throws(() => createSigner({ secretKey: wrong }), /not a coherent keypair/i);
+
+  // And a wallet mix-up is caught before a lamport moves.
+  assert.throws(
+    () => createSigner({ secretKey: Uint8Array.from(seed), expectPublicKey: 'SomeOtherWallet1111111111111111111111111111' }),
+    /wrong wallet/i
+  );
+
+  // Leading zero bytes must survive the round trip — a Solana address with a
+  // leading '1' is a real address, and dropping it yields a different wallet.
+  // (base58 has no 0, O, I or l, so the fixture avoids them.)
+  assert.equal(base58Encode(base58Decode('11aBcXyZ9')), '11aBcXyZ9');
+  assert.equal(base58Encode(base58Decode(signer.publicKey)), signer.publicKey);
+});
+
+test('signing replaces slot 0 and leaves the message untouched', async () => {
+  const { createSigner, signTransaction, splitTransaction, readCompactU16 } = await import('../live_execute.mjs');
+  const { generateKeyPairSync } = await import('node:crypto');
+  const { privateKey } = generateKeyPairSync('ed25519');
+  const seed = privateKey.export({ format: 'der', type: 'pkcs8' }).subarray(-32);
+  const signer = createSigner({ secretKey: Uint8Array.from(seed) });
+
+  // A transaction shaped like Jupiter's: one empty signature slot, then a
+  // message. The message is the part that must survive byte-for-byte — a
+  // signature over a REBUILT message could authorise something other than what
+  // was quoted.
+  const message = Buffer.from('v0-message-bytes-standing-in-for-a-real-swap');
+  const unsigned = Buffer.concat([Buffer.from([1]), Buffer.alloc(64), message]);
+
+  const { signedBase64, signature } = signTransaction({
+    transactionBase64: unsigned.toString('base64'), signer,
+  });
+  const signed = Buffer.from(signedBase64, 'base64');
+
+  assert.equal(signed.length, unsigned.length, 'signing must not change the length');
+  assert.ok(signed.subarray(65).equals(message), 'the message must be byte-identical');
+  assert.ok(!signed.subarray(1, 65).equals(Buffer.alloc(64)), 'slot 0 must be filled');
+  assert.equal(signature.length >= 86 && signature.length <= 88, true, 'base58 signature is 87-88 chars');
+
+  // signTransaction verifies its own output before returning, so a layout
+  // mistake surfaces locally rather than as a rejected transaction that has
+  // already cost a priority fee.
+  assert.equal(splitTransaction(signed).sigCount, 1);
+  assert.equal(readCompactU16(Buffer.from([0x80, 0x01]), 0).value, 128);
+
+  // A transaction expecting no signatures is not something to sign.
+  assert.throws(
+    () => signTransaction({ transactionBase64: Buffer.from([0]).toString('base64'), signer }),
+    /expects no signatures/i
+  );
+});
+
+test('a buy is abandoned after the slot budget and is never retried', async () => {
+  const { confirmWithinSlots } = await import('../live_execute.mjs');
+  const { executeBuy } = await LC();
+
+  // ── THE ONE FAILURE THIS CODEBASE DOES NOT RETRY ────────────────────────
+  // A blockhash lives ~150 slots (~60s), and waiting that long is the obvious
+  // implementation. For copy-trading it is wrong: the measured ~0% copy impact
+  // holds at ~1s of lag. Three slots is ~1.2s.
+  let slot = 1000;
+  const stalled = async (_u, method) => {
+    if (method === 'getSlot') return { ok: true, result: (slot += 2) };
+    return { ok: true, result: { value: [null] } };   // never confirms
+  };
+  const gone = await confirmWithinSlots({ signature: 'sig', rpcImpl: stalled, maxSlots: 3, pollMs: 0 });
+  assert.equal(gone.abandoned, true);
+  assert.equal(gone.confirmed, false);
+  assert.match(gone.error, /MUST NOT be retried/);
+
+  // A landed transaction confirms normally.
+  const lands = async (_u, method) =>
+    method === 'getSlot'
+      ? { ok: true, result: 1000 }
+      : { ok: true, result: { value: [{ err: null, slot: 1001, confirmations: 1 }] } };
+  assert.equal((await confirmWithinSlots({ signature: 'sig', rpcImpl: lands, pollMs: 0 })).confirmed, true);
+
+  // An on-chain error is FAILED, which is distinct from ABANDONED: failed is
+  // known not to have landed, abandoned may still land.
+  const errs = async (_u, method) =>
+    method === 'getSlot'
+      ? { ok: true, result: 1000 }
+      : { ok: true, result: { value: [{ err: { InstructionError: [3, 'Custom'] }, slot: 1001 }] } };
+  const failed = await confirmWithinSlots({ signature: 'sig', rpcImpl: errs, pollMs: 0 });
+  assert.equal(failed.failed, true);
+  assert.equal(failed.abandoned, undefined);
+
+  // And the buy path reports the abandonment without a second attempt.
+  const signer = { publicKey: 'x', publicKeyBytes: new Uint8Array(32), sign: () => Buffer.alloc(64) };
+  let sends = 0;
+  const counting = async (_u, method) => {
+    if (method === 'sendTransaction') { sends++; return { ok: true, result: 'sig' }; }
+    if (method === 'getSlot') return { ok: true, result: (slot += 2) };
+    return { ok: true, result: { value: [null] } };
+  };
+  const out = await executeBuy({
+    intent: { transactionBase64: Buffer.concat([Buffer.from([1]), Buffer.alloc(64), Buffer.from('m')]).toString('base64') },
+    signer, rpcImpl: counting, cfg: { maxConfirmSlots: 3 },
+  });
+  // The stub signer produces a signature that fails local verification, which
+  // is itself the point: an unverifiable signature is never sent.
+  assert.equal(out.retried, false);
+  assert.equal(sends, 0, 'an unsignable transaction must not be broadcast');
+  assert.equal(out.status, 'UNSIGNABLE');
+});
+
+test('a stubborn sell escalates instead of repeating, then gives up loudly', async () => {
+  const { panicEscalation } = await import('../live_execute.mjs');
+  const { executeSellWithPanic } = await LC();
+  const cfg = { slippageBps: 300, panicSlippageBps: 2500, panicAfterFailedSells: 2,
+                priorityFeeMaxLamports: 1_000_000, panicPriorityFeeLamports: 5_000_000, panicMaxAttempts: 5 };
+
+  // Below the threshold nothing changes — most sells work first time and
+  // paying panic slippage on all of them would be its own losing strategy.
+  assert.equal(panicEscalation(0, cfg).slippageBps, 300);
+  assert.equal(panicEscalation(0, cfg).panic, false);
+  assert.equal(panicEscalation(1, cfg).panic, false);
+
+  // Past it, each attempt widens. A failed sell is money in a pool that may be
+  // draining, so repeating an identical request is the one thing guaranteed
+  // not to help.
+  assert.equal(panicEscalation(2, cfg).panic, true);
+  assert.ok(panicEscalation(3, cfg).slippageBps > panicEscalation(2, cfg).slippageBps);
+  assert.ok(panicEscalation(4, cfg).priorityFeeMaxLamports > panicEscalation(2, cfg).priorityFeeMaxLamports);
+  assert.equal(panicEscalation(4, cfg).slippageBps, 2500, 'the last attempt reaches the panic bar');
+
+  // Bounded on purpose: past the panic bar a fill is barely a sale, and an
+  // unbounded loop on an unsellable token just burns fees.
+  assert.equal(panicEscalation(5, cfg).giveUp, true);
+
+  // Every attempt RE-QUOTES. Resending a stale quote fails for the same reason
+  // it failed the first time.
+  const seen = [];
+  const signer = { publicKey: 'x', publicKeyBytes: new Uint8Array(32), sign: () => Buffer.alloc(64) };
+  const stuck = await executeSellWithPanic({
+    intent: { mint: 'M' }, signer, cfg,
+    rpcImpl: async () => ({ ok: false, error: 'node down' }),
+    requote: async ({ slippageBps, panic }) => { seen.push({ slippageBps, panic }); return { ok: false, error: 'no route' }; },
+  });
+  assert.equal(stuck.status, 'STUCK');
+  assert.equal(stuck.needsHuman, true);
+  assert.equal(seen.length, 5, 'one re-quote per attempt, then give up');
+  assert.deepEqual(seen.map((s) => s.panic), [false, false, true, true, true]);
+
+  // A sell that lands stops the escalation immediately.
+  const tx = Buffer.concat([Buffer.from([1]), Buffer.alloc(64), Buffer.from('m')]).toString('base64');
+  let attempts = 0;
+  const lands = await executeSellWithPanic({
+    intent: { mint: 'M' }, signer, cfg,
+    rpcImpl: async () => ({ ok: true, result: 'sig' }),
+    requote: async () => { attempts++; return { ok: true, transactionBase64: tx }; },
+  });
+  // The stub signer cannot produce a verifiable signature, so this exercises
+  // the loop rather than a real fill — the assertion that matters is that it
+  // escalated and stopped rather than looping forever.
+  assert.equal(attempts, 5);
+  assert.equal(lands.status, 'STUCK');
+});
+
+test('a crash between send and record is resolved against the chain, never replayed', async () => {
+  const { unresolvedIntents, resolveIntentOutcome } = await import('../live_execute.mjs');
+  const { alreadyExecuted } = await LC();
+
+  const log = [
+    { id: 'a:BUY', decision: 'WOULD_BUY', sentSignature: 'sigA', outcome: 'LANDED' },
+    { id: 'b:BUY', decision: 'WOULD_BUY', sentSignature: 'sigB' },              // crashed mid-send
+    { id: 'c:BUY', decision: 'SKIP' },                                          // never sent
+    { id: 'd:SELL', decision: 'WOULD_SELL', sentSignature: 'sigD' },            // crashed mid-send
+  ];
+
+  // Only the two with a signature and no outcome need settling. Treating them
+  // as un-executed is what turns a 0.01 SOL test into an unbounded one after a
+  // few crashes: the transaction may well have landed.
+  assert.deepEqual(unresolvedIntents(log).map((i) => i.id), ['b:BUY', 'd:SELL']);
+
+  const landed = await resolveIntentOutcome({
+    intent: log[1], rpcImpl: async () => ({ ok: true, result: { value: [{ err: null, slot: 99 }] } }),
+  });
+  assert.equal(landed.outcome, 'LANDED');
+  assert.equal(landed.landedSlot, 99);
+
+  const failed = await resolveIntentOutcome({
+    intent: log[1], rpcImpl: async () => ({ ok: true, result: { value: [{ err: { x: 1 } }] } }),
+  });
+  assert.equal(failed.outcome, 'FAILED');
+
+  // An RPC that cannot answer leaves the intent UNRESOLVED rather than
+  // assuming it failed — assuming failure is what causes the double-buy.
+  const unknown = await resolveIntentOutcome({
+    intent: log[1], rpcImpl: async () => ({ ok: false, error: 'timeout' }),
+  });
+  assert.equal(unknown.outcome, null);
+  assert.equal(unknown.resolveError, 'timeout');
+
+  // The duplicate guard: the id is derived from the target's own signature, so
+  // the socket and the poller both delivering the same trade resolves to the
+  // same id — this fires routinely, not only after a crash.
+  assert.equal(alreadyExecuted(log, 'a:BUY').outcome, 'LANDED');
+  assert.equal(alreadyExecuted(log, 'b:BUY'), null, 'a dangling intent is not "done"');
+  assert.equal(alreadyExecuted(log, 'zz:BUY'), null);
+});
+
+test('reconcile treats the chain as truth and adopts what the book missed', async () => {
+  const { diffHoldings, fetchHoldings } = await import('../live_execute.mjs');
+  const { reconcile } = await LC();
+
+  const book = { positions: { GONE: { mint: 'GONE', tokens: 100 }, KEPT: { mint: 'KEPT', tokens: 50 } } };
+  const holdings = new Map([['KEPT', 47.5], ['ORPHAN', 900]]);
+  const diff = diffHoldings({ book, holdings });
+
+  assert.deepEqual(diff.missing.map((m) => m.mint), ['GONE']);
+  assert.deepEqual(diff.untracked.map((m) => m.mint), ['ORPHAN']);
+  assert.equal(diff.inSync, false);
+
+  const rpcImpl = async () => ({
+    ok: true,
+    result: { value: [
+      { account: { data: { parsed: { info: { mint: 'KEPT', tokenAmount: { uiAmount: 47.5 } } } } } },
+      { account: { data: { parsed: { info: { mint: 'ORPHAN', tokenAmount: { uiAmount: 900 } } } } } },
+      { account: { data: { parsed: { info: { mint: 'DUST', tokenAmount: { uiAmount: 0 } } } } } },
+    ] },
+  });
+  assert.equal((await fetchHoldings({ owner: 'w', rpcImpl })).holdings.has('DUST'), false, 'empty ATAs are not positions');
+
+  const out = await reconcile({ owner: 'w', rpcImpl, book });
+  assert.equal(book.positions.GONE, undefined, 'a position the wallet does not hold is dropped');
+  // The dangerous half: a token the book does not know about is a token
+  // nothing will ever try to sell.
+  assert.equal(book.positions.ORPHAN.tokens, 900);
+  assert.equal(book.positions.ORPHAN.adoptedByReconcile, true);
+  // Cost basis is null, not invented. A fabricated entry price corrupts P&L in
+  // a way that is very hard to notice later.
+  assert.equal(book.positions.ORPHAN.entryPriceUsd, null);
+  // A partial fill leaves less than the book believes.
+  assert.equal(book.positions.KEPT.tokens, 47.5);
+  assert.equal(out.applied, true);
+});
+
+test('the daily loss limit bounds a bad day, not just a bad trade', async () => {
+  const { dailyLossState } = await LC();
+  const cfg = { dailyLossLimitSol: 0.05 };
+  const now = Date.UTC(2026, 7, 13, 18, 0, 0);
+  const today = Date.UTC(2026, 7, 13, 9, 0, 0);
+  const yesterday = Date.UTC(2026, 7, 12, 23, 0, 0);
+
+  // Forty losing trades can each respect a 0.01 SOL per-trade cap and still
+  // lose 0.4 SOL. Per-trade caps do not bound a day.
+  const losses = Array.from({ length: 6 }, () => ({ at: today, outcome: 'LANDED', realisedSol: -0.01 }));
+  assert.equal(dailyLossState(losses, cfg, now).tripped, true);
+  assert.equal(dailyLossState(losses.slice(0, 4), cfg, now).tripped, false);
+
+  // Yesterday's losses do not count against today.
+  assert.equal(dailyLossState([{ at: yesterday, outcome: 'LANDED', realisedSol: -5 }], cfg, now).tripped, false);
+
+  // Only transactions that actually landed count.
+  assert.equal(dailyLossState([{ at: today, outcome: 'ABANDONED', realisedSol: -5 }], cfg, now).realisedSol, 0);
+
+  // Gains offset.
+  assert.equal(dailyLossState([...losses, { at: today, outcome: 'LANDED', realisedSol: 0.5 }], cfg, now).tripped, false);
+});
+
+test('the live book is a different file from the paper book', async () => {
+  const { LIVE_BOOK_PATH, loadLiveBook, saveLiveBook } = await LC();
+  const { BOOK_PATH } = await import('../paper_copytrade.mjs');
+
+  // ── WHY THIS IS A TEST AND NOT A CONVENTION ──────────────────────────────
+  // They describe different wallets. Sharing one file made reconcile compare
+  // the live wallet's chain balances against paper positions it never held —
+  // "5 stale positions dropped" on the first run — and left a multi-day paper
+  // measurement one save call from being overwritten by the state of a wallet
+  // holding 0.01 SOL.
+  assert.notEqual(LIVE_BOOK_PATH, BOOK_PATH);
+
+  // A fresh live book starts EMPTY rather than inheriting anything. What the
+  // wallet holds is discovered from the chain, not carried over.
+  const missing = await loadLiveBook('C:\\nope\\does\\not\\exist.json');
+  assert.deepEqual(missing.positions, {});
+  assert.deepEqual(missing.closed, []);
+  assert.equal(missing.mode, 'live');
+
+  const tmp = new URL('./.tmp-live-book.json', import.meta.url);
+  const { rm } = await import('node:fs/promises');
+  await saveLiveBook({ positions: { M: { mint: 'M', tokens: 1 } }, closed: [], mode: 'live' }, tmp.pathname.slice(1));
+  assert.equal((await loadLiveBook(tmp.pathname.slice(1))).positions.M.tokens, 1);
+  await rm(tmp.pathname.slice(1), { force: true });
+
+  // And this module must never write the paper book in either mode.
+  const src = await (await import('node:fs/promises')).readFile(
+    new URL('../live_copytrade.mjs', import.meta.url), 'utf8'
+  );
+  assert.ok(!/\bsaveBook\b/.test(src), 'live_copytrade must never write the paper book');
+});
+
+test('a serialised swap is never written to the intent log', async () => {
+  const { forLog } = await LC();
+  const intent = { id: 'x:BUY', decision: 'WOULD_BUY', transactionBase64: 'AQAAAAsecretswap', transactionPreview: 'AQAA…' };
+  const logged = forLog(intent);
+  assert.equal(logged.transactionBase64, undefined);
+  assert.equal(logged.transactionPreview, 'AQAA…', 'the preview is enough to audit shape and size');
+  assert.equal(logged.id, 'x:BUY');
+  assert.equal(JSON.stringify(logged).includes('secretswap'), false);
 });
 
 test('the gas reserve is subtracted before sizing, not checked after', async () => {
