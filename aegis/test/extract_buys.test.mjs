@@ -8858,10 +8858,14 @@ test('a no-route is a measurement, not an error', async () => {
   const r404 = await fetchJupiterQuote({ fetchImpl: async () => new Response('', { status: 404 }) });
   assert.equal(r404.noRoute, true);
 
+  // A 400 is NOT counted as unroutable, however it is worded — measured, that
+  // status is a rate limit here. See the dedicated test below.
   const worded = await fetchJupiterQuote({
+    retries: 0,
     fetchImpl: async () => new Response('{"error":"Could not find any route"}', { status: 400 }),
   });
-  assert.equal(worded.noRoute, true);
+  assert.equal(worded.noRoute, false);
+  assert.equal(worded.throttled, true);
 
   // A network failure is NOT a no-route — conflating them would fabricate a
   // routability problem out of an outage.
@@ -9003,4 +9007,41 @@ test('a throttle is retried before it is called a no-route', async () => {
   });
   assert.equal(gone.noRoute, true);
   assert.equal(c404, 1, '404 must not be retried');
+});
+
+test('HTTP 400 from Jupiter is a rate limit, not a no-route', async () => {
+  const { fetchJupiterQuote } = await import('../live_copytrade.mjs');
+
+  // Jupiter uses 400 for BOTH conditions and words them the same, so the
+  // wording cannot separate them. MEASURED with an 8-request burst on a mint
+  // that quotes fine alone:
+  //   lite-api.jup.ag   8x HTTP 400
+  //   api.jup.ag        5x HTTP 400 + 3x HTTP 429
+  // The 429s settle it — identical behaviour, one host merely labels the limit
+  // honestly. Across ~30 refusals over two runs every mint quoted HTTP 200 when
+  // retried individually, and not one was confirmed unroutable.
+  const limited = await fetchJupiterQuote({
+    retries: 0,
+    fetchImpl: async () => new Response('{"error":"Could not find any route"}', { status: 400 }),
+  });
+  assert.equal(limited.throttled, true);
+  assert.equal(limited.noRoute, false, 'a 400 must not be counted as unroutable');
+  assert.match(limited.error, /rate limited/);
+
+  // 429 is the same condition, labelled properly.
+  const explicit = await fetchJupiterQuote({
+    retries: 0,
+    fetchImpl: async () => new Response('rate limited', { status: 429 }),
+  });
+  assert.equal(explicit.throttled, true);
+  assert.equal(explicit.noRoute, false);
+
+  // 404 IS unambiguous and stays a no-route.
+  const gone = await fetchJupiterQuote({ retries: 0, fetchImpl: async () => new Response('', { status: 404 }) });
+  assert.equal(gone.noRoute, true);
+  assert.notEqual(gone.throttled, true);
+
+  // A 200 carrying no outAmount is unroutable in practice.
+  const empty = await fetchJupiterQuote({ retries: 0, fetchImpl: async () => new Response('{}', { status: 200 }) });
+  assert.equal(empty.noRoute, true);
 });

@@ -333,13 +333,28 @@ export async function fetchJupiterQuote(
       // So a refusal is retried before it is believed. A 404 is taken at face
       // value — that one is unambiguous — but a 400/429 only becomes NO_ROUTE
       // if it survives a retry.
-      const worded = /no route|not tradable|could not find any route/i.test(text);
+      // ── HTTP 400 IS A RATE LIMIT HERE, PROVEN, NOT INFERRED ───────────────
+      // Jupiter uses 400 for BOTH a genuine no-route and a throttle, and the
+      // bodies are worded the same, so the wording cannot separate them.
+      // MEASURED with an 8-request burst on one mint that quotes fine alone:
+      //   lite-api.jup.ag   8x HTTP 400
+      //   api.jup.ag        5x HTTP 400 + 3x HTTP 429
+      // The 429s settle it — identical behaviour, one host merely labels the
+      // limit honestly. Across ~30 refusals in two runs, every single mint
+      // quoted HTTP 200 when retried individually, and NOT ONE was confirmed
+      // unroutable.
+      //
+      // So 400 is classified as THROTTLED. Only a 404, or a 200 carrying no
+      // outAmount, is called NO_ROUTE. Getting this backwards produced a "50%
+      // no-route rate" that would have justified building a direct Pump.fun
+      // fallback for a problem with no confirmed instances.
       if (res.status === 404) return { ok: false, noRoute: true, error: 'no route (404)', attempts: attempt + 1 };
+      const throttled = res.status === 429 || res.status === 400;
       last = {
         ok: false,
-        noRoute: worded,
-        throttled: res.status === 429 || res.status === 400,
-        error: `HTTP ${res.status}${worded ? ' (no route)' : ''}`,
+        noRoute: !throttled && /no route|not tradable|could not find any route/i.test(text),
+        throttled,
+        error: `HTTP ${res.status}${throttled ? ' (rate limited)' : ''}`,
       };
     } catch (err) {
       last = { ok: false, noRoute: false, error: err.message };
