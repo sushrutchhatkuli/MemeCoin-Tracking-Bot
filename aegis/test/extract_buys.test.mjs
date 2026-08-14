@@ -9145,6 +9145,74 @@ test('the daily loss limit bounds a bad day, not just a bad trade', async () => 
  * PHASE 3 — burst queuing
  * ------------------------------------------------------------------ */
 
+test('every Jupiter request spends from one shared budget', async () => {
+  const { createRateLimiter, fetchJupiterQuote, buildSwapTransaction, jupiterLimiter } = await LC();
+
+  // ── WHY THIS EXISTS ─────────────────────────────────────────────────────
+  // The key was wired correctly and the collector still ran at a 1% buy-quote
+  // success rate for thirteen hours. Four burst workers, each pacing 400ms
+  // AFTER its own trade, plus a retry on every rejection, put ~20 requests a
+  // second against a bucket that refills ten every few seconds — and the
+  // retries doubled the load exactly when it was already over.
+  //
+  // The budget belongs to the PROCESS, so one limiter has to sit in front of
+  // every request rather than each caller pacing itself.
+  let clock = 0;
+  const lim = createRateLimiter({
+    perWindow: 8, windowMs: 10_000,
+    now: () => clock,
+    sleep: async (ms) => { clock += ms; },
+  });
+
+  for (let i = 0; i < 8; i++) await lim.acquire();
+  assert.equal(lim.inWindow, 8, 'the window fills');
+  assert.equal(clock, 0, 'and nothing waits until it is full');
+
+  // The ninth must wait for the oldest to age out, not squeeze in.
+  await lim.acquire();
+  assert.ok(clock >= 10_000, `expected a wait past the window, got ${clock}ms`);
+
+  // Sliding, not fixed: a fixed window lets 8 land at the end of one period and
+  // 8 more at the start of the next, which is 16 inside the span the server is
+  // actually measuring.
+  clock = 25_000;
+  assert.equal(lim.inWindow, 0, 'old stamps leave the window');
+
+  // ── BOTH REQUEST PATHS, NOT JUST QUOTES ─────────────────────────────────
+  // A swap-build is a request too. Budgeting quotes alone leaves half the
+  // traffic unmetered, which is its own version of the same bug.
+  let acquired = 0;
+  const counting = { acquire: async () => { acquired++; } };
+
+  await fetchJupiterQuote({
+    inputMint: 'A', outputMint: 'B', amountLamports: 1e7, slippageBps: 300,
+    retries: 0, limiter: counting,
+    fetchImpl: async () => new Response('{"outAmount":"1"}', { status: 200 }),
+  });
+  assert.equal(acquired, 1, 'a quote spends one token');
+
+  await buildSwapTransaction({
+    quote: {}, userPublicKey: 'X', cfg: { jupiterBase: 'https://x' }, limiter: counting,
+    fetchImpl: async () => new Response('{"swapTransaction":"AA"}', { status: 200 }),
+  });
+  assert.equal(acquired, 2, 'a swap-build spends one too');
+
+  // Retries go through the budget as well — an unbudgeted retry is what turns
+  // being throttled into staying throttled.
+  acquired = 0;
+  await fetchJupiterQuote({
+    inputMint: 'A', outputMint: 'B', amountLamports: 1e7, slippageBps: 300,
+    retries: 2, retryDelayMs: 0, limiter: counting,
+    fetchImpl: async () => new Response('rate limited', { status: 429 }),
+  });
+  assert.equal(acquired, 3, 'the initial attempt and both retries are all metered');
+
+  // The shipped default is paced for the measured bucket, not for the
+  // x-ratelimit-reset header, which claims a one-second window that idle
+  // probes disprove (1s/2s/3s idle all return 0 tokens; 5s returns 10).
+  assert.ok(jupiterLimiter, 'a process-wide default exists so no path is unmetered');
+});
+
 test('the Jupiter host and the auth header are one decision', async () => {
   const { resolveJupiter, JUPITER_FREE_BASE, JUPITER_PAID_BASE, fetchJupiterQuote, buildSwapTransaction } = await LC();
 

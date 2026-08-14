@@ -390,6 +390,82 @@ export function resolveJupiter({ apiKey = null, configBase = null } = {}) {
   };
 }
 
+/**
+ * A shared request budget, because Jupiter's is per-second and small.
+ *
+ * ── MEASURED, AND THE HEADERS LIE ───────────────────────────────────────────
+ * Firing 14 requests back to back with a valid key gives 10x HTTP 200 with
+ * `x-ratelimit-remaining` counting 9 -> 0, then 429s, with `x-ratelimit-reset`
+ * pointing one second ahead. Read literally that says ten per SECOND.
+ *
+ * It is not. Draining the bucket and then idling by a measured amount:
+ *
+ *   1s idle -> 0 tokens      3s idle -> 0 tokens
+ *   2s idle -> 0 tokens      5s idle -> 10 tokens
+ *
+ * The window is roughly FIVE seconds, so the sustainable rate is 10 per 5s,
+ * about 2 requests a second — five times slower than the header implies. A
+ * limiter built from the header alone still throttles, which is what happened:
+ * pacing at 8/second produced 8 successes in the first window and near-total
+ * 429s thereafter.
+ *
+ * Confirmed from the other direction too: sequential probes at 100ms, 200ms and
+ * 400ms spacing all yielded ~10-12 successes out of 25 regardless of pacing,
+ * which is the signature of an exhausted bucket rather than a per-second cap.
+ *
+ * ── WHY PER-WORKER PACING WAS NOT ENOUGH ────────────────────────────────────
+ * Burst queuing runs four workers, each pausing quotePaceMs (400ms) AFTER its
+ * own trade. Four workers x (quote + swap-build) inside a 400ms pause is ~20
+ * requests a second against a budget of ten — and every rejection was retried,
+ * which doubled the load precisely when it was already over. That feedback loop
+ * held the live collector at a 1% buy-quote success rate for thirteen hours
+ * while the startup banner correctly reported "authenticated".
+ *
+ * The budget is a property of the PROCESS, not of any one call, so it lives in
+ * one shared limiter that every Jupiter request passes through. A sliding
+ * window rather than a fixed one: a fixed window lets ten requests land at the
+ * end of one second and ten more at the start of the next, which is twenty in
+ * the span the server is actually measuring.
+ */
+export function createRateLimiter({ perWindow = 8, windowMs = 1000, now = () => Date.now(), sleep } = {}) {
+  const stamps = [];
+  const wait = sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  return {
+    async acquire() {
+      for (;;) {
+        const t = now();
+        while (stamps.length && t - stamps[0] >= windowMs) stamps.shift();
+        if (stamps.length < perWindow) {
+          stamps.push(t);
+          return;
+        }
+        // Wait only until the oldest request leaves the window, plus a small
+        // margin for clock skew between us and the server.
+        await wait(Math.max(1, windowMs - (t - stamps[0]) + 15));
+      }
+    },
+    get inWindow() {
+      const t = now();
+      return stamps.filter((s) => t - s < windowMs).length;
+    },
+  };
+}
+
+/**
+ * The process-wide default: 8 per 5 seconds, against a measured 10 per ~5s.
+ *
+ * Deliberately 8 rather than 10, and 5000ms rather than the 5s boundary the
+ * server actually uses: the window is theirs and our clock is not, so spending
+ * the last token of a budget counted elsewhere is how a limiter that looks
+ * right still collects 429s.
+ *
+ * ~1.6 requests a second sounds slow, and is ample. The target trades about 94
+ * times an hour — roughly 3 requests a minute including swap-builds, or 0.05/s.
+ * Average load was never the problem; four concurrent workers plus retries
+ * bursting past the bucket was.
+ */
+export const jupiterLimiter = createRateLimiter({ perWindow: 8, windowMs: 10_000 });
+
 export async function fetchJupiterQuote(
   {
     inputMint,
@@ -399,6 +475,7 @@ export async function fetchJupiterQuote(
     base = LIVE_DEFAULTS.jupiterBase,
     apiKey = null,
     fetchImpl = fetch,
+    limiter = jupiterLimiter,
     retries = 1,
     retryDelayMs = 1200,
   } = {}
@@ -415,6 +492,8 @@ export async function fetchJupiterQuote(
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (attempt) await new Promise((r) => setTimeout(r, retryDelayMs * attempt));
     try {
+      // Retries pass through the budget too — the retry storm was half the load.
+      await limiter?.acquire?.();
       const res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(12_000) });
       const text = await res.text();
 
@@ -474,12 +553,14 @@ export async function fetchJupiterQuote(
  * discarded; nothing signs it.
  */
 export async function buildSwapTransaction(
-  { quote, userPublicKey, cfg = LIVE_DEFAULTS, apiKey = null, fetchImpl = fetch } = {}
+  { quote, userPublicKey, cfg = LIVE_DEFAULTS, apiKey = null, fetchImpl = fetch, limiter = jupiterLimiter } = {}
 ) {
   try {
     const headers = { 'content-type': 'application/json' };
     if (apiKey) headers['x-api-key'] = apiKey;
 
+    // A swap-build is a request like any other and spends from the same budget.
+    await limiter?.acquire?.();
     const res = await fetchImpl(`${cfg.jupiterBase}/swap`, {
       method: 'POST',
       headers,
