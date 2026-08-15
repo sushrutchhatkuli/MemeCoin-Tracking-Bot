@@ -66,6 +66,7 @@ import {
   resolveTarget,
   resolveTargets,
   exitMatchesOrigin,
+  whaleTag,
   createWhaleSocket,
   createWhaleCluster,
   createClusterTracker,
@@ -2170,7 +2171,10 @@ export function trackRecord(intents = [], calibration = null) {
  * CLI
  * ------------------------------------------------------------------ */
 
-function renderIntent(i) {
+function renderIntent(i, whale = null) {
+  // With four whales mirrored and exits whale-specific, a line that does not
+  // name the wallet cannot say which sell will close it.
+  const credit = whale ? `  (${whale})` : '';
   const tag = {
     WOULD_BUY: '✓ WOULD BUY ',
     WOULD_SELL: '✓ WOULD SELL',
@@ -2184,8 +2188,9 @@ function renderIntent(i) {
   }[i.decision] ?? i.decision;
 
   const head = `  ${tag} ${formatTicker(null, i.mint).padEnd(12)}`;
+  const tail = credit;
   if (i.decision === 'WOULD_SELL' && Number.isFinite(i.expectedSol)) {
-    return head + `${((i.sellFraction ?? 1) * 100).toFixed(0)}% → ${i.expectedSol.toFixed(4)} SOL`;
+    return head + `${((i.sellFraction ?? 1) * 100).toFixed(0)}% → ${i.expectedSol.toFixed(4)} SOL` + tail;
   }
   if (i.decision === 'WOULD_BUY') {
     return (
@@ -2194,11 +2199,12 @@ function renderIntent(i) {
       `impact ${i.priceImpactPct.toFixed(2)}%  ` +
       (i.quoteGapPct === null ? 'gap n/a' : `gap ${i.quoteGapPct >= 0 ? '+' : ''}${i.quoteGapPct.toFixed(1)}%`) +
       `  tx ${i.transactionBytes}B` +
-      (i.cappedBy ? `  [capped: ${i.cappedBy}]` : '')
+      (i.cappedBy ? `  [capped: ${i.cappedBy}]` : '') +
+      tail
     );
   }
-  if (i.decision === 'WOULD_SELL') return head + `${((i.sellFraction ?? 1) * 100).toFixed(0)}% of position`;
-  return head + (i.reason ?? '');
+  if (i.decision === 'WOULD_SELL') return head + `${((i.sellFraction ?? 1) * 100).toFixed(0)}% of position` + tail;
+  return head + (i.reason ?? '') + tail;
 }
 
 export async function main(argv = []) {
@@ -2712,7 +2718,7 @@ export async function main(argv = []) {
           console.error(`  ⛔ STUCK POSITION ${formatTicker(null, intent.mint)} — ${result.error}`);
         }
         stats[result.status] = (stats[result.status] ?? 0) + 1;
-        console.log(`  ${renderIntent(intent)}  → ${result.status}${result.panicked ? ' (panic)' : ''}`);
+        console.log(`  ${renderIntent(intent, whaleTag(t.wallet ?? target.address, watchlist)?.text ?? null)}  → ${result.status}${result.panicked ? ' (panic)' : ''}`);
 
         // ITEM 5 + the daily limit, re-checked after every fill rather than
         // only at startup — a limit that is only ever read once is not a limit.
@@ -2738,7 +2744,7 @@ export async function main(argv = []) {
       // Paced: the free tier throttles under burst, and a throttle masquerading
       // as a routing failure is exactly what this run has to avoid measuring.
       await new Promise((r) => setTimeout(r, cfg.quotePaceMs ?? 400));
-      console.log(renderIntent(intent));
+      console.log(renderIntent(intent, whaleTag(t.wallet ?? target.address, watchlist)?.text ?? null));
     }
   };
 

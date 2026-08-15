@@ -5219,6 +5219,73 @@ const whaleFile = {
  * Multi-wallet tracking and the whale cluster signal
  * ------------------------------------------------------------------ */
 
+test('activity lines name the whale by rank, and prefer the honest win rate', async () => {
+  const { whaleTag } = await PC();
+  const watchlist = { wallets: [
+    { address: 'Ar2Y6o1QmrRAskjii', rank: 1, label: 'Elite Whale #1', all_time_win_rate: '62%', win_rate: '100%' },
+    { address: '8zkgFGVZrDLieViwq', rank: 2, label: 'Elite Whale #2', all_time_win_rate: '52%' },
+    { address: 'NoRateWallet11111', rank: 3, label: 'Elite Whale #3' },
+  ] };
+
+  // ── WHY THE ALL-TIME RATE, NOT THE OBSERVED ONE ─────────────────────────
+  // The observed rate reads far higher on small samples — measured 100%
+  // observed against 27% on chain for the same wallet — and a log line is
+  // where a flattering number does the most damage, because nobody re-derives
+  // it. Wallet #1 carries both; the on-chain figure must win.
+  assert.equal(whaleTag('Ar2Y6o1QmrRAskjii', watchlist).text, 'Rank #1: Ar2Y6o… — 62% WR');
+  assert.equal(whaleTag('8zkgFGVZrDLieViwq', watchlist).text, 'Rank #2: 8zkgFG… — 52% WR');
+
+  // A wallet with no rate is named without one rather than with a fabricated
+  // or zero figure.
+  assert.equal(whaleTag('NoRateWallet11111', watchlist).text, 'Rank #3: NoRate…');
+
+  // Sells drop the rate — it is the WALLET that matters on an exit, and the
+  // extra number crowds a line that already carries a fraction and a P&L.
+  assert.equal(whaleTag('8zkgFGVZrDLieViwq', watchlist, { withWinRate: false }).text, 'Rank #2: 8zkgFG…');
+
+  // ── UNKNOWN IS NULL, NOT RANK #INFINITY ─────────────────────────────────
+  // A trade from something off the watchlist reads as unattributed rather than
+  // claiming a rank it does not hold.
+  assert.equal(whaleTag('STRANGER', watchlist), null);
+  assert.equal(whaleTag(null, watchlist), null);
+  assert.equal(whaleTag('Ar2Y6o1QmrRAskjii', { wallets: [] }), null);
+
+  // Rank falls back to position when the field is absent — the file's order IS
+  // the rank, and an older file carries no explicit one.
+  assert.equal(whaleTag('B', { wallets: [{ address: 'A' }, { address: 'B' }] }).rank, 2);
+
+  // The structured parts are available too, so a caller can format its own.
+  const t = whaleTag('Ar2Y6o1QmrRAskjii', watchlist);
+  assert.equal(t.rank, 1);
+  assert.equal(t.label, 'Elite Whale #1');
+  assert.equal(t.short, 'Ar2Y6o…');
+});
+
+test('the sell alert leads with the rank, since rank decides whose exit it is', async () => {
+  const { buildSellMessage } = await import('../telegram.mjs');
+  const base = {
+    position: { address: 'MINT1111', chain: 'solana', entryMarketCap: 100_000, peakMarketCap: 200_000 },
+    currentMcap: 150_000, headline: 'h', reason: 'r', action: 'Consider trimming',
+    wallet: '8zkgFGVZrDLieViwqiXFCydSX6WL5hsxmUu55yBdsNsZ',
+    label: 'Elite Whale #2', solscan: 'https://solscan.io/x', soldPct: 100,
+  };
+
+  // With several whales mirrored and exits whale-specific, "which wallet" is
+  // the first thing the reader needs — a sell from rank #4 says nothing about
+  // a position opened by rank #1, and without the rank the two alerts read
+  // identically.
+  const ranked = buildSellMessage({ ...base, rank: 2 });
+  assert.match(ranked, /Rank #2/);
+  assert.match(ranked, /Elite Whale #2/);
+  assert.match(ranked, /8zkgFG…/);
+  assert.match(ranked, /sold 100% of their holdings/);
+
+  // Absent rank degrades to the previous line rather than printing "Rank #null".
+  const unranked = buildSellMessage(base);
+  assert.doesNotMatch(unranked, /Rank #/);
+  assert.match(unranked, /Elite Whale #2/, 'the wallet is still named');
+});
+
 test('only the originating whale closes its own position', async () => {
   const { createBook, runPaperTick, openPaperPosition, paperConfig, exitMatchesOrigin } = await PC();
 

@@ -1817,6 +1817,43 @@ export function rankLookup(watchlist) {
   return (address) => map.get(address) ?? Infinity;
 }
 
+/**
+ * A short, readable credit for the wallet behind a trade. PURE.
+ *
+ * ── WHY A LOG LINE NEEDS THIS AT ALL ────────────────────────────────────────
+ * With one target every line was implicitly attributed and naming the wallet
+ * would have been noise. With four, "BUY $BIAO — 1.0000 SOL" no longer says
+ * whose conviction it was, and since only the originating whale can close a
+ * position, the reader cannot tell which sell to expect. Attribution stopped
+ * being decoration the moment exits became whale-specific.
+ *
+ * The win rate is taken from the ALL-TIME on-chain figure first. The observed
+ * rate reads far higher on small samples — measured 100% observed against 27%
+ * on chain for the same wallet — and a log line is exactly where a flattering
+ * number does the most damage, because nobody re-derives it.
+ *
+ * Returns null for an unknown address rather than inventing a rank, so a trade
+ * from something not on the watchlist reads as unattributed instead of as
+ * rank #Infinity.
+ */
+export function whaleTag(address, watchlist, { withWinRate = true } = {}) {
+  if (!address) return null;
+  const wallets = watchlist?.wallets ?? [];
+  const i = wallets.findIndex((w) => w?.address === address);
+  if (i === -1) return null;
+  const w = wallets[i];
+  const rate = withWinRate ? (w.all_time_win_rate ?? w.win_rate ?? null) : null;
+  return {
+    rank: w.rank ?? i + 1,
+    address,
+    short: `${address.slice(0, 6)}…`,
+    label: w.label ?? null,
+    winRate: rate,
+    // "Rank #2: 8zkgFG… — 52% WR"
+    text: `Rank #${w.rank ?? i + 1}: ${address.slice(0, 6)}…${rate ? ` — ${rate} WR` : ''}`,
+  };
+}
+
 export function createClusterTracker({ windowMs = 180_000, bonus = 25 } = {}) {
   const byMint = new Map();
   return {
@@ -2152,6 +2189,7 @@ export async function runPaperTick({
         mint: c.mint,
         symbol: res.position?.symbol ?? c.symbol ?? null,
         sizeSol: res.sizeSol,
+        originatingWhale: res.position?.originatingWhale ?? null,
         basis: res.basis ?? null,
         whaleSpendSol: c.whaleSpendSol ?? null,
         // So the activity log can say ADD rather than BUY. A scale-in and a new
@@ -2243,7 +2281,7 @@ export async function runPaperTick({
             report.exits.push({
               mint: t.mint, symbol: p.symbol, trigger: 'WHALE_SELL',
               label: `target sold ${(fraction * 100).toFixed(0)}%`,
-              gainPct, subId: sub.subId, profile: sub.profile,
+              gainPct, subId: sub.subId, profile: sub.profile, seller: t.wallet ?? null,
             });
           }
         }
@@ -2265,6 +2303,7 @@ export async function runPaperTick({
           trigger: 'WHALE_SELL',
           label: `target sold ${(fraction * 100).toFixed(0)}%`,
           gainPct,
+          seller: t.wallet ?? null,
         });
       }
       continue;
@@ -2950,12 +2989,17 @@ export async function main(argv = []) {
         stamp,
         kind: o.scaledIn ? 'ADD ' : 'BUY ',
         mint: o.mint,
+        // Credited to the wallet that opened it — with four whales mirrored and
+        // exits whale-specific, an unattributed line cannot say which sell to
+        // expect.
+        whale: whaleTag(o.originatingWhale, watchlist)?.text ?? null,
         tail:
           ` — ${o.sizeSol.toFixed(4)} SOL` +
           (o.basis && cfg.pctWhale ? `  (${o.basis})` : '') +
           (o.scaledIn && Number.isFinite(o.blendedEntryUsd)
             ? `  entry now $${o.blendedEntryUsd.toPrecision(4)}`
-            : ''),
+            : '') +
+          (o.whale ? `  (${o.whale})` : ''),
       });
     }
     for (const e of report.exits) {
@@ -2963,9 +3007,11 @@ export async function main(argv = []) {
         stamp,
         kind: 'SELL',
         mint: e.mint,
+        whale: whaleTag(e.seller, watchlist, { withWinRate: false })?.text ?? null,
         tail:
           ` — ${e.label ?? e.trigger}` +
-          `${Number.isFinite(e.gainPct) ? ` (${e.gainPct >= 0 ? '+' : ''}${e.gainPct.toFixed(0)}%)` : ''}`,
+          `${Number.isFinite(e.gainPct) ? ` (${e.gainPct >= 0 ? '+' : ''}${e.gainPct.toFixed(0)}%)` : ''}` +
+          (e.whale ? `  (${e.whale})` : ''),
       });
     }
     // Bounded, because the dashboard is fixed-height by design — an unbounded
@@ -3011,11 +3057,9 @@ export async function main(argv = []) {
       // The FEED matters more than the host now: a run silently falling back to
       // polling looks identical to one on the socket except for tens of seconds
       // of lag, which is the whole reason the socket exists.
-      const s = socket?.status();
-      // Three states, not two: a socket that is live but still draining an
-      // inherited backlog is neither "push" nor "down", and reporting it as
-      // push would hide the catch-up the FEED line exists to make visible.
-      const feed = !socket?.isConnected()
+      const s = typeof socket?.status === 'function' ? socket.status() : null;
+      const isConnected = typeof socket?.isConnected === 'function' ? socket.isConnected() : false;
+      const feed = !isConnected
         ? socketEnabled
           ? 'poll (socket down)'
           : 'poll'

@@ -260,6 +260,7 @@ export function buildSellMessage({
   action,
   wallet,
   label,
+  rank = null,
   solscan,
   soldPct,
   tradeLink,
@@ -285,7 +286,12 @@ export function buildSellMessage({
 
   if (wallet) {
     const short = `${wallet.slice(0, 6)}…${wallet.slice(-4)}`;
-    lines.push(`• Insider Wallet: <a href="${esc(solscan)}">${esc(short)}</a> (${esc(label)})`);
+    // The RANK leads when the caller knows it. With several whales mirrored and
+    // exits whale-specific, "which wallet" is the first thing the reader needs:
+    // a sell from rank #4 says nothing about a position opened by rank #1, and
+    // without the rank the two alerts are indistinguishable.
+    const ranked = Number.isFinite(rank) ? `<b>Rank #${rank}</b> — ` : '';
+    lines.push(`• Insider Wallet: ${ranked}<a href="${esc(solscan)}">${esc(short)}</a> (${esc(label)})`);
     if (soldPct !== undefined && soldPct !== null) {
       lines.push(`• Action: sold ${soldPct.toFixed(0)}% of their holdings on-chain`);
     }
