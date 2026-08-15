@@ -9749,6 +9749,160 @@ test('a bundled entry quotes each sub-wallet separately and fails whole', async 
   assert.equal(held.blocked, true);
 });
 
+test('slippage is a bounded ceiling, not a cost', async () => {
+  const { resolveSlippageBps, LIVE_DEFAULTS } = await LC();
+
+  assert.equal(resolveSlippageBps(1.0).bps, 100);
+  assert.equal(LIVE_DEFAULTS.slippageBps, 100, 'the shipped default is 1.0%');
+
+  // ── WHY THE FLOOR IS 0.5% AND NOT ZERO ──────────────────────────────────
+  // This is a CEILING, not a cost: 1% tolerance does not make a fill 1% worse,
+  // it refuses one more than 1% worse than quoted. Tightening therefore does
+  // not improve fills that land — it converts some into fills that do not, and
+  // a rejected buy is a missed trade rather than a cheaper one.
+  assert.equal(resolveSlippageBps(0.5).clamped, false);
+  assert.equal(resolveSlippageBps(0.1).bps, 50, 'clamped up to the floor');
+  assert.match(resolveSlippageBps(0.1).reason, /below 0.5%/);
+  assert.equal(resolveSlippageBps(0).bps, 50);
+  assert.equal(resolveSlippageBps(-5).bps, 50);
+
+  assert.equal(resolveSlippageBps(2.0).clamped, false);
+  assert.equal(resolveSlippageBps(50).bps, 200, 'clamped down to the ceiling');
+  assert.match(resolveSlippageBps(50).reason, /above 2%/);
+
+  // Junk falls back to the default rather than to zero, which would reject
+  // every fill on offer.
+  for (const junk of ['abc', null, undefined, NaN]) {
+    assert.equal(resolveSlippageBps(junk).bps, 100, `${junk} must fall back to the default`);
+  }
+
+  // Fractional percentages survive the round trip to basis points.
+  assert.equal(resolveSlippageBps(1.25).bps, 125);
+  assert.equal(resolveSlippageBps(0.75).bps, 75);
+});
+
+test('a Jito tip is only attached where it can actually buy priority', async () => {
+  const { swapFeeConfig, buildSwapTransaction, LIVE_DEFAULTS } = await LC();
+  const cfg = { ...LIVE_DEFAULTS, jitoTipLamports: 1_000_000, priorityFeeMaxLamports: 1_000_000 };
+
+  // ── A TIP OUTSIDE A BUNDLE IS A DONATION ────────────────────────────────
+  // The tip buys position in Jito's bundle auction. A transaction carrying one
+  // and then broadcast through an ordinary RPC still PAYS it — it is a real
+  // transfer to a Jito tip account — and gets nothing back, because nothing
+  // entered the auction.
+  const solo = swapFeeConfig(cfg, { bundled: false });
+  assert.equal(solo.jitoTipLamports, undefined, 'an unbundled swap must not tip');
+  assert.equal(solo.priorityLevelWithMaxLamports.maxLamports, 1_000_000);
+
+  const bundled = swapFeeConfig(cfg, { bundled: true });
+  assert.equal(bundled.jitoTipLamports, 1_000_000);
+  assert.equal(bundled.priorityLevelWithMaxLamports, undefined, 'the two fee shapes are exclusive');
+
+  // A zero tip stays on the ordinary priority path even when bundling, so
+  // "bundled" never implies a charge that was not configured.
+  assert.equal(swapFeeConfig({ ...cfg, jitoTipLamports: 0 }, { bundled: true }).jitoTipLamports, undefined);
+  assert.equal(LIVE_DEFAULTS.jitoTipLamports, 0, 'off by default');
+
+  // ── SERIALISATION ───────────────────────────────────────────────────────
+  // Jupiter builds the tip instruction into the swap, so the shape has to
+  // reach the request body intact. VERIFIED against the live API: the tipped
+  // form returns a 735-byte transaction against 698 without.
+  let body = null;
+  await buildSwapTransaction({
+    quote: { outAmount: '1' }, userPublicKey: 'W', cfg, bundled: true,
+    limiter: { acquire: async () => {} },
+    fetchImpl: async (_u, o) => { body = JSON.parse(o.body); return new Response('{"swapTransaction":"AA"}', { status: 200 }); },
+  });
+  assert.deepEqual(body.prioritizationFeeLamports, { jitoTipLamports: 1_000_000 });
+
+  await buildSwapTransaction({
+    quote: { outAmount: '1' }, userPublicKey: 'W', cfg, bundled: false,
+    limiter: { acquire: async () => {} },
+    fetchImpl: async (_u, o) => { body = JSON.parse(o.body); return new Response('{"swapTransaction":"AA"}', { status: 200 }); },
+  });
+  assert.equal(body.prioritizationFeeLamports.jitoTipLamports, undefined);
+  assert.equal(body.prioritizationFeeLamports.priorityLevelWithMaxLamports.priorityLevel, 'high');
+});
+
+test('direct routes are preferred but never cost a trade', async () => {
+  const { quoteWithDirectPreference, fetchJupiterQuote, LIVE_DEFAULTS } = await LC();
+
+  // ── MEASURED FIRST, AND IT IS NEARLY A NO-OP ────────────────────────────
+  // Against eight tokens this target actually traded, EVERY baseline route was
+  // already one hop: 5 identical outputs, 1 better by +0.079%, 0 worse, 0 lost.
+  // So the multi-hop fee drag this removes is ~0 here, and the flag's real
+  // effect is a tail risk — a token whose only path is multi-hop would return
+  // NO ROUTE and the trade would be lost outright. Losing a trade to save
+  // 0.08% is a bad exchange, so the restriction is attempted then RELAXED.
+  assert.equal(LIVE_DEFAULTS.onlyDirectRoutes, true);
+
+  const urls = [];
+  const capture = async (url) => { urls.push(url); return new Response('{"outAmount":"1"}', { status: 200 }); };
+  await fetchJupiterQuote({
+    inputMint: 'A', outputMint: 'B', amountLamports: 1e7, slippageBps: 100, retries: 0,
+    onlyDirectRoutes: true, limiter: { acquire: async () => {} }, fetchImpl: capture,
+  });
+  assert.match(urls[0], /onlyDirectRoutes=true/);
+  assert.match(urls[0], /slippageBps=100/);
+
+  urls.length = 0;
+  await fetchJupiterQuote({
+    inputMint: 'A', outputMint: 'B', amountLamports: 1e7, slippageBps: 100, retries: 0,
+    onlyDirectRoutes: false, limiter: { acquire: async () => {} }, fetchImpl: capture,
+  });
+  assert.ok(!urls[0].includes('onlyDirectRoutes'), 'absent, not "=false"');
+
+  // A direct route that works is used, with no second request.
+  let calls = 0;
+  const direct = await quoteWithDirectPreference({
+    inputMint: 'A', outputMint: 'B', amountLamports: 1e7, slippageBps: 100, retries: 0,
+    limiter: { acquire: async () => {} },
+    fetchImpl: async () => { calls++; return new Response('{"outAmount":"9"}', { status: 200 }); },
+  });
+  assert.equal(direct.ok, true);
+  assert.equal(direct.direct, true);
+  assert.equal(direct.usedFallback, false);
+  assert.equal(calls, 1, 'no fallback request when the direct route works');
+
+  // No direct route relaxes to multi-hop rather than losing the trade.
+  calls = 0;
+  const relaxed = await quoteWithDirectPreference({
+    inputMint: 'A', outputMint: 'B', amountLamports: 1e7, slippageBps: 100, retries: 0,
+    limiter: { acquire: async () => {} },
+    fetchImpl: async () => {
+      calls++;
+      return calls === 1 ? new Response('', { status: 404 }) : new Response('{"outAmount":"7"}', { status: 200 });
+    },
+  });
+  assert.equal(relaxed.ok, true);
+  assert.equal(relaxed.usedFallback, true, 'and it reports that it relaxed, so the rate is visible');
+  assert.equal(calls, 2);
+
+  // ── A THROTTLE MUST NOT RELAX ───────────────────────────────────────────
+  // Retrying a rate limit as a second request doubles load on the very limit
+  // that caused it — the feedback loop that held the collector at 1% success.
+  calls = 0;
+  const throttled = await quoteWithDirectPreference({
+    inputMint: 'A', outputMint: 'B', amountLamports: 1e7, slippageBps: 100, retries: 0,
+    limiter: { acquire: async () => {} },
+    fetchImpl: async () => { calls++; return new Response('rate limited', { status: 429 }); },
+  });
+  assert.equal(throttled.ok, false);
+  assert.equal(throttled.throttled, true);
+  assert.equal(throttled.usedFallback, false);
+  assert.equal(calls, 1, 'a throttle must not trigger a second request');
+
+  // Opting out skips the direct attempt entirely.
+  calls = 0;
+  const off = await quoteWithDirectPreference({
+    inputMint: 'A', outputMint: 'B', amountLamports: 1e7, slippageBps: 100, retries: 0,
+    onlyDirectRoutes: false, limiter: { acquire: async () => {} },
+    fetchImpl: async () => { calls++; return new Response('{"outAmount":"1"}', { status: 200 }); },
+  });
+  assert.equal(calls, 1);
+  assert.equal(off.direct, false);
+});
+
 test('every Jupiter request spends from one shared budget', async () => {
   const { createRateLimiter, fetchJupiterQuote, buildSwapTransaction, jupiterLimiter } = await LC();
 

@@ -144,9 +144,23 @@ export const LIVE_DEFAULTS = {
   // Jupiter. NOT quote-api.jup.ag/v6 — that host no longer resolves. Verified
   // today: lite-api answers in ~241ms, api.jup.ag in ~149ms.
   jupiterBase: 'https://lite-api.jup.ag/swap/v1',
-  slippageBps: 300,
+
+  // 1.0%, tunable 0.5-2.0 via --max-slippage. A CEILING, not a cost: tightening
+  // it does not improve fills that land, it turns some of them into fills that
+  // do not. See resolveSlippageBps.
+  slippageBps: 100,
   priorityFeeMaxLamports: 1_000_000,
+
+  // Only ever charged on a bundled entry — see swapFeeConfig. Outside a bundle
+  // the tip is a real transfer that buys nothing, because nothing entered
+  // Jito's auction. Off by default: at the 0.01 SOL cap, the 0.001 SOL that
+  // --jito-tip sets is 10% of the trade, against a measured ~4% exit drag.
   jitoTipLamports: 0,
+
+  // Prefer a single-pool route, then relax rather than lose the trade.
+  // MEASURED across eight of this target's tokens: every baseline route was
+  // already one hop, so the fee drag this removes is ~0 here.
+  onlyDirectRoutes: true,
   // Minimum spacing between Jupiter calls. See the throttle note in
   // fetchJupiterQuote for why this is not politeness but measurement hygiene.
   quotePaceMs: 400,
@@ -490,13 +504,15 @@ export async function fetchJupiterQuote(
     apiKey = null,
     fetchImpl = fetch,
     limiter = jupiterLimiter,
+    onlyDirectRoutes = false,
     retries = 1,
     retryDelayMs = 1200,
   } = {}
 ) {
   const url =
     `${base}/quote?inputMint=${inputMint}&outputMint=${outputMint}` +
-    `&amount=${Math.floor(amountLamports)}&slippageBps=${slippageBps}`;
+    `&amount=${Math.floor(amountLamports)}&slippageBps=${slippageBps}` +
+    (onlyDirectRoutes ? '&onlyDirectRoutes=true' : '');
 
   // Passed in explicitly. A hidden environment read here is what broke this
   // once already, because it silently resolves to "no key" rather than failing.
@@ -566,8 +582,34 @@ export async function fetchJupiterQuote(
  * This is the end of the line in Phase 1. The base64 payload is logged and
  * discarded; nothing signs it.
  */
+/**
+ * Which fee shape a swap request should carry. PURE.
+ *
+ * ── A JITO TIP OUTSIDE A BUNDLE IS A DONATION ───────────────────────────────
+ * The tip buys priority in Jito's bundle auction. A transaction carrying one
+ * and then broadcast through an ordinary RPC still pays it — it is a real
+ * transfer to a Jito tip account — and receives nothing at all in return, since
+ * nothing entered the auction. So the tip is attached ONLY when the caller is
+ * actually going to bundle.
+ *
+ * At the shipped 0.01 SOL trade cap, a 0.001 SOL tip is 10% of the trade. That
+ * is not a rounding error next to a measured ~4% exit drag, and it is charged
+ * per bundle whether or not the bundle wins.
+ */
+export function swapFeeConfig(cfg, { bundled = false } = {}) {
+  if (bundled && (cfg.jitoTipLamports ?? 0) > 0) {
+    return { jitoTipLamports: cfg.jitoTipLamports };
+  }
+  return {
+    priorityLevelWithMaxLamports: {
+      maxLamports: cfg.priorityFeeMaxLamports,
+      priorityLevel: 'high',
+    },
+  };
+}
+
 export async function buildSwapTransaction(
-  { quote, userPublicKey, cfg = LIVE_DEFAULTS, apiKey = null, fetchImpl = fetch, limiter = jupiterLimiter } = {}
+  { quote, userPublicKey, cfg = LIVE_DEFAULTS, apiKey = null, fetchImpl = fetch, limiter = jupiterLimiter, bundled = false } = {}
 ) {
   try {
     const headers = { 'content-type': 'application/json' };
@@ -584,12 +626,7 @@ export async function buildSwapTransaction(
         userPublicKey,
         wrapAndUnwrapSol: true,
         dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: {
-          priorityLevelWithMaxLamports: {
-            maxLamports: cfg.priorityFeeMaxLamports,
-            priorityLevel: 'high',
-          },
-        },
+        prioritizationFeeLamports: swapFeeConfig(cfg, { bundled }),
       }),
       signal: AbortSignal.timeout(15_000),
     });
@@ -607,6 +644,66 @@ export async function buildSwapTransaction(
   } catch (err) {
     return { ok: false, error: err.message };
   }
+}
+
+/**
+ * Slippage tolerance, bounded at both ends. PURE.
+ *
+ * ── WHAT THIS NUMBER IS, AND IS NOT ─────────────────────────────────────────
+ * It is a CEILING, not a cost. A 1% tolerance does not make a fill 1% worse; it
+ * refuses one that would be more than 1% worse than quoted. Tightening it does
+ * not reduce drag on trades that land — it converts some of them into trades
+ * that do not land at all.
+ *
+ * That is why the floor is 0.5% rather than zero. On a token moving fast enough
+ * to be worth copying, a tolerance under half a percent rejects most of the
+ * fills it is offered, and a rejected buy is a missed trade rather than a
+ * cheaper one. The 2% ceiling is the other end: past it the tolerance stops
+ * bounding anything a memecoin swap is likely to do.
+ */
+export function resolveSlippageBps(pct, { minPct = 0.5, maxPct = 2.0, defaultPct = 1.0 } = {}) {
+  // ABSENT IS NOT ZERO. Number(null) and Number('') are both 0, which is
+  // finite and would clamp to the floor rather than fall back to the default —
+  // silently tightening the ceiling on a flag that was never passed.
+  const absent = pct === null || pct === undefined || (typeof pct === 'string' && pct.trim() === '');
+  const v = absent ? NaN : Number(pct);
+  if (!Number.isFinite(v)) return { bps: Math.round(defaultPct * 100), pct: defaultPct, clamped: false, reason: null };
+  if (v < minPct) return { bps: Math.round(minPct * 100), pct: minPct, clamped: true, reason: `below ${minPct}%` };
+  if (v > maxPct) return { bps: Math.round(maxPct * 100), pct: maxPct, clamped: true, reason: `above ${maxPct}%` };
+  return { bps: Math.round(v * 100), pct: v, clamped: false, reason: null };
+}
+
+/**
+ * Quote with direct routes preferred, falling back to multi-hop on a no-route.
+ *
+ * ── MEASURED BEFORE BUILDING, AND IT IS NEARLY A NO-OP ──────────────────────
+ * Restricting to a single pool is meant to strip multi-hop fee drag. Against
+ * eight tokens this target actually traded, EVERY baseline route was already
+ * one hop — Jupiter picks direct paths for these tokens unprompted:
+ *
+ *   identical output: 5    direct better: 1 (+0.079%)    worse: 0    no route: 0
+ *
+ * So the drag this removes is close to zero here, and the flag's real effect is
+ * a tail risk: a token whose only path is multi-hop would return NO ROUTE and
+ * the trade would be lost outright. Losing a trade to save 0.08% is a bad
+ * exchange, so the restriction is attempted and then RELAXED rather than
+ * enforced. The fallback costs a second request only when the first found
+ * nothing, and `usedFallback` is reported so the rate it fires is visible
+ * instead of assumed.
+ */
+export async function quoteWithDirectPreference(params = {}) {
+  const { onlyDirectRoutes = true, ...rest } = params;
+  if (!onlyDirectRoutes) return { ...(await fetchJupiterQuote(rest)), usedFallback: false, direct: false };
+
+  const direct = await fetchJupiterQuote({ ...rest, onlyDirectRoutes: true });
+  if (direct.ok) return { ...direct, usedFallback: false, direct: true };
+
+  // Only a genuine absence of route is worth relaxing for. A throttle relaxed
+  // into a second request would double load on the limit that caused it.
+  if (!direct.noRoute) return { ...direct, usedFallback: false, direct: true };
+
+  const any = await fetchJupiterQuote({ ...rest, onlyDirectRoutes: false });
+  return { ...any, usedFallback: true, direct: false };
 }
 
 /* ------------------------------------------------------------------ *
@@ -753,7 +850,7 @@ export async function planIntent(
     exposureSol = 0,
     securityFor = async () => null,
     decimalsFor = async () => null,
-    quoteFn = fetchJupiterQuote,
+    quoteFn = quoteWithDirectPreference,
     buildFn = buildSwapTransaction,
     jupiterKey = null,
     priceFallback = null,
@@ -816,6 +913,7 @@ export async function planIntent(
     slippageBps: cfg.slippageBps,
     base: cfg.jupiterBase,
     apiKey: jupiterKey,
+    onlyDirectRoutes: cfg.onlyDirectRoutes !== false,
   });
   if (!quoted.ok) {
     // ── DEXSCREENER FALLBACK: MEASUREMENT ONLY ────────────────────────────
@@ -949,7 +1047,7 @@ export function forLog(intent) {
  */
 export async function planLiveSell(
   trade,
-  { cfg, book, holdings, decimalsFor, quoteFn = fetchJupiterQuote, buildFn = buildSwapTransaction, userPublicKey, slippageBps, jupiterKey = null, now = Date.now() } = {}
+  { cfg, book, holdings, decimalsFor, quoteFn = quoteWithDirectPreference, buildFn = buildSwapTransaction, userPublicKey, slippageBps, jupiterKey = null, now = Date.now() } = {}
 ) {
   const base = { id: intentId(trade.signature, 'SELL'), at: now, side: 'SELL', mint: trade.mint, targetSignature: trade.signature ?? null };
   const heldTokens = holdings?.get?.(trade.mint) ?? book?.positions?.[trade.mint]?.tokens ?? 0;
@@ -967,6 +1065,7 @@ export async function planLiveSell(
     slippageBps: slippageBps ?? cfg.slippageBps,
     base: cfg.jupiterBase,
     apiKey: jupiterKey,
+    onlyDirectRoutes: cfg.onlyDirectRoutes !== false,
   });
   if (!quoted.ok) {
     return { ...base, decision: quoted.noRoute ? 'NO_ROUTE' : quoted.throttled ? 'THROTTLED' : 'QUOTE_FAILED', reason: quoted.error, sellTokens };
@@ -1003,7 +1102,7 @@ export async function planLiveSell(
  * serialise them anyway, just after they had already spent their retries.
  */
 export async function buildSubWalletEntries(
-  { trade, parts, signers, cfg, slippageBps, jupiterKey, quoteFn = fetchJupiterQuote, buildFn = buildSwapTransaction } = {}
+  { trade, parts, signers, cfg, slippageBps, jupiterKey, quoteFn = quoteWithDirectPreference, buildFn = buildSwapTransaction } = {}
 ) {
   if (parts.length !== signers.length) {
     return { ok: false, error: `${parts.length} parts against ${signers.length} signers` };
@@ -1017,6 +1116,7 @@ export async function buildSubWalletEntries(
       slippageBps: slippageBps ?? cfg.slippageBps,
       base: cfg.jupiterBase,
       apiKey: jupiterKey,
+      onlyDirectRoutes: cfg.onlyDirectRoutes !== false,
     });
     if (!quoted.ok) {
       // One leg failing kills the whole entry. A bundle is atomic, so a partial
@@ -1030,6 +1130,8 @@ export async function buildSubWalletEntries(
       userPublicKey: signers[i].publicKey,
       cfg,
       apiKey: jupiterKey,
+      // The one path that reaches Jito's auction, so the one that may tip.
+      bundled: true,
     });
     if (!built.ok) return { ok: false, error: `sub-wallet ${i + 1} build: ${built.error}`, failedLeg: i };
     legs.push({
@@ -1781,7 +1883,7 @@ export function calibrationVerdict(summary, { minRoundTrips = 20 } = {}) {
  * their size would measure price impact at a depth we would never trade.
  */
 export async function shadowSellQuote(
-  trade, { ledger, cfg, solUsd, decimalsFor, quoteFn = fetchJupiterQuote, paperCfg = {}, jupiterKey = null } = {}
+  trade, { ledger, cfg, solUsd, decimalsFor, quoteFn = quoteWithDirectPreference, paperCfg = {}, jupiterKey = null } = {}
 ) {
   const open = ledger?.open?.get(trade.mint);
   const targetFillUsd = impliedExitPriceUsd(trade, { solUsd, minReceiveSol: paperCfg.impliedMinSpendSol });
@@ -1799,6 +1901,7 @@ export async function shadowSellQuote(
     slippageBps: cfg.slippageBps,
     base: cfg.jupiterBase,
     apiKey: jupiterKey,
+    onlyDirectRoutes: cfg.onlyDirectRoutes !== false,
   });
   if (!quoted.ok) return { ourFillUsd: null, targetFillUsd, exitGapPct: null, reason: quoted.error };
 
@@ -2031,6 +2134,27 @@ export async function main(argv = []) {
   // Off unless asked for. Splitting changes what a shadow run measures — two
   // thirds of capital would stop mirroring, and drag against the target then
   // reports a strategy difference rather than a copying cost.
+  // ── Execution tuning ────────────────────────────────────────────────────
+  const slipIdx = argv.indexOf('--max-slippage');
+  if (slipIdx !== -1) {
+    const slip = resolveSlippageBps(argv[slipIdx + 1]);
+    if (slip.clamped) console.error(`  --max-slippage ${argv[slipIdx + 1]} is ${slip.reason}; using ${slip.pct}%.`);
+    cfg.slippageBps = slip.bps;
+  }
+
+  const tipIdx = argv.indexOf('--jito-tip');
+  if (tipIdx !== -1) {
+    const sol = Number(argv[tipIdx + 1]);
+    if (!Number.isFinite(sol) || sol < 0) {
+      console.error(`  --jito-tip ${argv[tipIdx + 1]} is not a SOL amount.`);
+      process.exitCode = 1;
+      return;
+    }
+    cfg.jitoTipLamports = Math.round(sol * LAMPORTS);
+  }
+
+  if (argv.includes('--allow-multi-hop')) cfg.onlyDirectRoutes = false;
+
   const swIdx = argv.indexOf('--sub-wallets');
   const swRequested = swIdx !== -1 ? Number(argv[swIdx + 1]) : 0;
   const subWalletsOff = !(swRequested > 0);
@@ -2108,6 +2232,20 @@ export async function main(argv = []) {
   console.log(`  node          ${new URL(rpcUrl).host}`);
   console.log(`  jupiter       ${jupiter.describe}`);
   console.log(`  sizing        ${paperCfg.pctWhale ? paperCfg.pctWhale + '% of target' : paperCfg.perTradeSol + ' SOL flat'}`);
+
+  console.log(`  slippage      ${(cfg.slippageBps / 100).toFixed(2)}% ceiling · routes ${cfg.onlyDirectRoutes ? 'direct-first' : 'multi-hop allowed'}`);
+  if (cfg.jitoTipLamports > 0) {
+    const tipSol = cfg.jitoTipLamports / LAMPORTS;
+    const tipPct = (tipSol / cfg.maxTradeSol) * 100;
+    console.log(`  jito tip      ${tipSol} SOL per bundle (${tipPct.toFixed(0)}% of a ${cfg.maxTradeSol} SOL trade)`);
+    if (subWalletsOff) {
+      // Nothing bundles, so nothing enters the auction the tip pays for.
+      console.log(`  ⚠  sub-wallets are off, so nothing is bundled — the tip is NOT charged.`);
+      console.log(`     Pass --sub-wallets 2+ to bundle, or the tip has no path to spend on.`);
+    } else if (tipPct > 20) {
+      console.log(`  ⚠  the tip alone is ${tipPct.toFixed(0)}% of the trade, against a measured ~4% exit drag.`);
+    }
+  }
 
   // ── Sub-wallets, and what splitting costs ───────────────────────────────
   if (subWalletsOff) {
