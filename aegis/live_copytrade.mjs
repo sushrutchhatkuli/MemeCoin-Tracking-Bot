@@ -196,7 +196,27 @@ export const LIVE_DEFAULTS = {
 
   // Safety gating. See evaluateSafetyGate for why this is venue-aware.
   requireSafetyGate: true,
+
+  // Top-10 share of supply EXCLUDING pools, from RPC. This is the insider
+  // proxy: a liquidity pool holding half the float is not an insider.
   maxTopHolderPct: 60,
+
+  // ── INSIDER SHIELD (needs BIRDEYE_API_KEY) ───────────────────────────────
+  // Birdeye's top-10 INCLUDES pool and vault accounts, so it runs 2-3.5x
+  // higher than the figure above on the same token — measured 27/85/43/70%
+  // against 19/25/19/25%. It gets its own ceiling for that reason; reusing the
+  // 60 above would block essentially every token this target buys.
+  maxBirdeyeTop10Pct: 95,
+
+  // Total holder count, which RPC cannot supply: getTokenLargestAccounts stops
+  // at 20 accounts, which is why every token sampled through it reported "19
+  // holders". Measured on real targets: 113 to 2,703. 0 disables the floor.
+  minHolderCount: 0,
+
+  // Holder GROWTH floor. A token whose holder count is falling is being left,
+  // and that is invisible in a single snapshot. Expressed as the maximum
+  // tolerated decline from the highest count seen for that mint. null disables.
+  maxHolderDeclinePct: null,
 
   // Hard caps. Inert in Phase 1; present so Phase 2 cannot ship without them.
   maxTradeSol: 0.01,
@@ -361,6 +381,113 @@ export function evaluateSafetyGate(security, { venue = 'unknown', cfg = LIVE_DEF
   }
 
   return { pass: reasons.length === 0, reasons, waived, venue };
+}
+
+/* ------------------------------------------------------------------ *
+ * Insider Shield
+ * ------------------------------------------------------------------ */
+
+export const HOLDER_HISTORY_PATH = join(HERE, '.state', 'holder_history.json');
+
+export async function loadHolderHistory(path = HOLDER_HISTORY_PATH) {
+  try {
+    const raw = JSON.parse(await readFile(path, 'utf8'));
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+export async function saveHolderHistory(history, path = HOLDER_HISTORY_PATH) {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(history, null, 2), 'utf8');
+  return history;
+}
+
+/**
+ * Fold one holder-count observation into the history. PURE.
+ *
+ * Keeps the PEAK rather than the full series. Growth is judged against the
+ * high-water mark because that is the number a decline is a decline from, and
+ * storing every reading would grow without bound for a check that only ever
+ * looks at two of them.
+ */
+export function recordHolderCount(history, mint, count, now = Date.now()) {
+  if (!Number.isFinite(count) || count <= 0) return history;
+  const prev = history[mint];
+  history[mint] = {
+    first: prev?.first ?? count,
+    firstAt: prev?.firstAt ?? now,
+    peak: Math.max(prev?.peak ?? 0, count),
+    latest: count,
+    latestAt: now,
+    samples: (prev?.samples ?? 0) + 1,
+  };
+  return history;
+}
+
+/**
+ * Has this token's holder base shrunk past tolerance? PURE.
+ *
+ * ── ONE SAMPLE CANNOT SHOW A TREND ──────────────────────────────────────────
+ * The first time a mint is seen there is nothing to compare against, so growth
+ * is UNKNOWN rather than failing. Failing closed here would block every new
+ * token permanently — a token is always new once, and the target trades tokens
+ * minutes old, so a closed default would block essentially the whole strategy
+ * rather than the risky part of it.
+ */
+export function holderGrowthVerdict(entry, { maxDeclinePct = null } = {}) {
+  if (maxDeclinePct === null || maxDeclinePct === undefined) return { ok: true, reason: 'growth floor disabled' };
+  if (!entry || !(entry.samples > 1) || !(entry.peak > 0)) {
+    return { ok: true, unknown: true, reason: 'first sighting — no trend yet' };
+  }
+  const declinePct = ((entry.peak - entry.latest) / entry.peak) * 100;
+  if (declinePct > maxDeclinePct) {
+    return { ok: false, declinePct, reason: `holders down ${declinePct.toFixed(1)}% from peak ${entry.peak} (limit ${maxDeclinePct}%)` };
+  }
+  return { ok: true, declinePct };
+}
+
+/**
+ * The Insider Shield: concentration and holder-base checks, on top of the gate.
+ *
+ * Wraps evaluateSafetyGate rather than replacing it, so the authority checks —
+ * the ones that catch a token which cannot be sold at all — keep running
+ * whether or not Birdeye answered. A missing or wobbling holder feed degrades
+ * this to the RPC checks alone; it never opens the gate and never closes it on
+ * absent data.
+ */
+export function insiderShield(security, { venue = 'unknown', cfg = LIVE_DEFAULTS, holderEntry = null } = {}) {
+  const base = evaluateSafetyGate(security, { venue, cfg });
+  const reasons = [...(base.reasons ?? [])];
+  const waived = [...(base.waived ?? [])];
+
+  const birdTop10 = Number(security?.birdeyeTop10Pct);
+  if (Number.isFinite(birdTop10)) {
+    if (birdTop10 > cfg.maxBirdeyeTop10Pct) {
+      reasons.push(`birdeye top-10 ${birdTop10.toFixed(1)}% > ${cfg.maxBirdeyeTop10Pct}%`);
+    }
+  } else if (cfg.minHolderCount > 0 || cfg.maxHolderDeclinePct !== null) {
+    // Only worth noting when the operator asked for holder-based checks at all.
+    waived.push('birdeye concentration unavailable');
+  }
+
+  const holders = Number(security?.holderCount);
+  if (cfg.minHolderCount > 0) {
+    if (!Number.isFinite(holders) || holders <= 0) {
+      // Absent is not zero. The feed returns success with holder: 0 during
+      // wobbles, and treating that as a real reading would block everything.
+      waived.push('holder count unavailable — floor not applied');
+    } else if (holders < cfg.minHolderCount) {
+      reasons.push(`${holders} holders < ${cfg.minHolderCount}`);
+    }
+  }
+
+  const growth = holderGrowthVerdict(holderEntry, { maxDeclinePct: cfg.maxHolderDeclinePct });
+  if (!growth.ok) reasons.push(growth.reason);
+  else if (growth.unknown && cfg.maxHolderDeclinePct !== null) waived.push(growth.reason);
+
+  return { pass: reasons.length === 0, reasons, waived, venue, shield: true };
 }
 
 /* ------------------------------------------------------------------ *
@@ -849,6 +976,7 @@ export async function planIntent(
     nativeSolBalance,
     exposureSol = 0,
     securityFor = async () => null,
+    holderEntryFor = () => null,
     decimalsFor = async () => null,
     quoteFn = quoteWithDirectPreference,
     buildFn = buildSwapTransaction,
@@ -1005,7 +1133,10 @@ export async function planIntent(
     ourTokens: Number.isFinite(outTokens) && outTokens > 0 ? outTokens : null,
   };
 
-  const gate = evaluateSafetyGate(await securityPromise, { venue, cfg });
+  // Insider Shield wraps the gate; the authority checks still run when the
+  // holder feed is unavailable.
+  const sec = await securityPromise;
+  const gate = insiderShield(sec, { venue, cfg, holderEntry: holderEntryFor(trade.mint) });
   if (!gate.pass) {
     return { ...base, ...measured, decision: 'BLOCKED', reason: gate.reasons.join('; ') };
   }
@@ -2099,6 +2230,7 @@ export async function main(argv = []) {
     configBase: configuredBase && configuredBase !== JUPITER_FREE_BASE ? configuredBase : null,
   });
   const jupiterKey = jupiter.authenticated ? (process.env.JUPITER_API_KEY || dotenv.jupiterKey) : null;
+  const birdeyeKey = process.env.BIRDEYE_API_KEY || dotenv.birdeyeKey || null;
   // The host follows the key. Leaving cfg on the free default while sending an
   // authenticated header is the half-configured state that caused the outage:
   // the key was set and the requests still went to the anonymous endpoint.
@@ -2154,6 +2286,13 @@ export async function main(argv = []) {
   }
 
   if (argv.includes('--allow-multi-hop')) cfg.onlyDirectRoutes = false;
+
+  const minHIdx = argv.indexOf('--min-holders');
+  if (minHIdx !== -1 && Number(argv[minHIdx + 1]) >= 0) cfg.minHolderCount = Number(argv[minHIdx + 1]);
+  const declIdx = argv.indexOf('--max-holder-decline-pct');
+  if (declIdx !== -1 && Number(argv[declIdx + 1]) >= 0) cfg.maxHolderDeclinePct = Number(argv[declIdx + 1]);
+  const btIdx = argv.indexOf('--max-birdeye-top10-pct');
+  if (btIdx !== -1 && Number(argv[btIdx + 1]) > 0) cfg.maxBirdeyeTop10Pct = Number(argv[btIdx + 1]);
 
   const swIdx = argv.indexOf('--sub-wallets');
   const swRequested = swIdx !== -1 ? Number(argv[swIdx + 1]) : 0;
@@ -2347,14 +2486,36 @@ export async function main(argv = []) {
 
   // The real audit, cached per mint: the same token recurs constantly in a
   // seed pass and each audit costs several RPC calls.
-  const { fetchSolanaSecurity } = await import('./sources.mjs');
+  const { fetchSolanaSecurity, fetchBirdeyeHolderCount } = await import('./sources.mjs');
+  const holderHistory = await loadHolderHistory();
   const securityCache = new Map();
   const securityFor = async (mint) => {
     if (securityCache.has(mint)) return securityCache.get(mint);
     const rec = await fetchSolanaSecurity(mint, { rpcUrl }).catch(() => null);
-    securityCache.set(mint, rec?.ok === false ? null : rec);
-    return securityCache.get(mint);
+    let merged = rec?.ok === false ? null : rec;
+
+    // Birdeye ENRICHES the RPC audit; it never replaces it. If the holder feed
+    // fails — and it intermittently returns success with holder: 0 — the mint
+    // and freeze authority checks must still run, because those are the ones
+    // that catch a token which cannot be sold at all.
+    if (merged && birdeyeKey) {
+      const bird = await fetchBirdeyeHolderCount(mint, { apiKey: birdeyeKey }).catch(() => null);
+      if (bird?.ok) {
+        merged = {
+          ...merged,
+          holderCount: bird.holderCount,
+          // Kept under its OWN name. Birdeye counts pools as holders, so this
+          // runs 2-3.5x the RPC figure and must not land in the same threshold.
+          birdeyeTop10Pct: bird.top10Pct ?? undefined,
+        };
+        recordHolderCount(holderHistory, mint, bird.holderCount);
+        await saveHolderHistory(holderHistory).catch(() => {});
+      }
+    }
+    securityCache.set(mint, merged);
+    return merged;
   };
+  const holderEntryFor = (mint) => holderHistory[mint] ?? null;
 
   // Decimals, cached — needed to put Jupiter's raw outAmount into the same
   // units as the target's UI-denominated fill. Immutable per mint, so one
@@ -2399,7 +2560,7 @@ export async function main(argv = []) {
           cfg, paperCfg, book, solUsd, userPublicKey, nativeSolBalance,
           // In-flight size counts against the cap, so concurrent buys cannot
           // each read the same stale exposure and all decide they fit.
-          exposureSol: exposure.inFlight, securityFor, decimalsFor, jupiterKey,
+          exposureSol: exposure.inFlight, securityFor, decimalsFor, jupiterKey, holderEntryFor,
           // MEASUREMENT ONLY, and only in dry-run. A throttled quote in live
           // mode has no route and therefore no transaction to sign, so a price
           // could never become a trade — passing a fallback there would only

@@ -173,6 +173,94 @@ export async function fetchPairsBatch(addresses) {
 }
 
 /**
+ * Holder count and top-10 concentration from Birdeye.
+ *
+ * ── THE DOCUMENTED PATH IS NOT AN API PATH ──────────────────────────────────
+ * /v1/token/holder answers HTTP 200 with a readme.io DOCUMENTATION PAGE — HTML,
+ * not JSON. Verified with a valid key. That is the worst possible failure
+ * shape: res.ok is true, so a caller checking status alone parses HTML as JSON
+ * and reads the exception as "no holders". The working path is
+ * /defi/v3/token/holder, which is what this uses; a `json` content-type is
+ * checked anyway so the HTML case can never be mistaken for data.
+ *
+ * ── ITS TOP-10 IS NOT THE REPO'S TOP-10 ─────────────────────────────────────
+ * Birdeye counts program-owned pool and vault accounts as holders. The repo's
+ * own top10Pct excludes them. Measured on the same four tokens this target
+ * traded:
+ *
+ *   mint        RPC top10Pct    birdeye top10_hold_percent
+ *   Dmkj4dB3        19.2%              27.2%
+ *   4Bb2b68M        25.0%              85.5%
+ *   GppXM95i        18.8%              43.0%
+ *   3STf8WPw        25.4%              70.5%
+ *
+ * Two to three and a half times higher, because a liquidity pool holding half
+ * the supply is not an insider. Substituting one for the other in a threshold
+ * tuned for the other would block every token this target buys. They are
+ * reported as separate fields and gated separately.
+ *
+ * ── `holder: 0` IS A FAILED READ, NOT AN EMPTY TOKEN ────────────────────────
+ * The endpoint intermittently answers `success: true` with `holder: 0`, no
+ * items, and no percentage. Measured: six consecutive such responses for a mint
+ * that reported 113 holders minutes earlier and again minutes later. Every
+ * live token has holders, so zero is missing data — and a floor that treated it
+ * as real would block every trade for as long as the wobble lasted.
+ */
+export async function fetchBirdeyeHolderCount(
+  mint,
+  { apiKey = null, fetchImpl = fetch, base = 'https://public-api.birdeye.so', timeoutMs = 8000 } = {}
+) {
+  if (!mint || typeof mint !== 'string') return { ok: false, error: 'no mint' };
+  if (!apiKey) return { ok: false, error: 'no BIRDEYE_API_KEY', unconfigured: true };
+
+  let res;
+  try {
+    res = await fetchImpl(`${base}/defi/v3/token/holder?address=${mint}&offset=0&limit=10`, {
+      headers: { 'x-api-key': apiKey, 'x-chain': 'solana', accept: 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+
+  if (res.status === 401) return { ok: false, error: 'Birdeye rejected the key', unauthorized: true };
+  if (res.status === 429) return { ok: false, error: 'Birdeye rate limited', throttled: true };
+  if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+
+  // Guards the HTML-docs case, which arrives as a 200.
+  const ctype = res.headers?.get?.('content-type') ?? '';
+  if (ctype && !ctype.includes('json')) return { ok: false, error: `expected JSON, got ${ctype.split(';')[0]}` };
+
+  let body;
+  try {
+    body = await res.json();
+  } catch {
+    return { ok: false, error: 'response was not JSON' };
+  }
+  if (body?.success === false) return { ok: false, error: body.message ?? 'Birdeye reported failure' };
+
+  const data = body?.data ?? {};
+  const holderCount = Number(data.holder);
+  const top10Pct = Number(data.top10_hold_percent);
+  const items = Array.isArray(data.items) ? data.items : [];
+
+  // Zero holders and no rows is the wobble described above, not a token nobody
+  // owns. Reported as a miss so a floor cannot fire on it.
+  if (!Number.isFinite(holderCount) || holderCount <= 0) {
+    return { ok: false, error: 'empty holder response', emptyRead: true };
+  }
+
+  return {
+    ok: true,
+    holderCount,
+    // Already a percentage, verified: USDC reads 33.10, not 0.331.
+    top10Pct: Number.isFinite(top10Pct) && top10Pct > 0 ? top10Pct : null,
+    sampled: items.length,
+    source: 'birdeye',
+  };
+}
+
+/**
  * One mint's Solana price from DexScreener. Zero cost, no key.
  *
  * ── WHAT THIS IS AND IS NOT FOR ─────────────────────────────────────────────

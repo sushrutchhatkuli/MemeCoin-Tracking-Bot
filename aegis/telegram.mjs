@@ -87,6 +87,10 @@ export async function loadEnv(path) {
     // anonymous, and the buy side throttled to a 0% success rate while the
     // config looked correct.
     jupiterKey: pick('JUPITER_API_KEY'),
+    // Optional. Supplies total holder count, which Solana RPC cannot —
+    // getTokenLargestAccounts caps at 20 accounts. Its absence degrades the
+    // Insider Shield to the RPC checks rather than disabling the gate.
+    birdeyeKey: pick('BIRDEYE_API_KEY'),
   };
 }
 

@@ -9749,6 +9749,175 @@ test('a bundled entry quotes each sub-wallet separately and fails whole', async 
   assert.equal(held.blocked, true);
 });
 
+/* ------------------------------------------------------------------ *
+ * Insider Shield — Birdeye holder stats
+ * ------------------------------------------------------------------ */
+
+test('the Birdeye key is loaded from .env and sent as x-api-key', async () => {
+  const { loadEnv } = await import('../telegram.mjs');
+  const { fetchBirdeyeHolderCount } = await import('../sources.mjs');
+
+  // Read via loadEnv, not a bare process.env lookup. That distinction already
+  // cost thirteen hours once: the Jupiter key sat in .env while the header was
+  // set from process.env, so every request went out anonymous and the buy side
+  // ran at a 1% success rate with the config looking correct.
+  const { writeFile, rm } = await import('node:fs/promises');
+  const tmp = new URL('./.tmp-env', import.meta.url).pathname.slice(1);
+  await writeFile(tmp, 'BIRDEYE_API_KEY=be_test_key\nTELEGRAM_BOT_TOKEN=x\n', 'utf8');
+  assert.equal((await loadEnv(tmp)).birdeyeKey, 'be_test_key');
+  await rm(tmp, { force: true });
+
+  // Header name is lowercase x-api-key, and the chain must be pinned or the
+  // endpoint answers for whichever chain it feels like.
+  let seen = null;
+  await fetchBirdeyeHolderCount('MINT', {
+    apiKey: 'be_test_key',
+    fetchImpl: async (url, o) => {
+      seen = { url, headers: o.headers };
+      return new Response(JSON.stringify({ success: true, data: { holder: 500, top10_hold_percent: 12, items: [] } }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+  assert.equal(seen.headers['x-api-key'], 'be_test_key');
+  assert.equal(seen.headers['x-chain'], 'solana');
+  assert.match(seen.url, /defi\/v3\/token\/holder/);
+  assert.match(seen.url, /address=MINT/);
+
+  // No key is a clean miss, never a silent unauthenticated call.
+  const none = await fetchBirdeyeHolderCount('MINT', { apiKey: null, fetchImpl: async () => { throw new Error('must not fetch'); } });
+  assert.equal(none.ok, false);
+  assert.equal(none.unconfigured, true);
+});
+
+test('Birdeye holder parsing survives the shapes the live API actually returns', async () => {
+  const { fetchBirdeyeHolderCount } = await import('../sources.mjs');
+  const json = (body, headers = { 'content-type': 'application/json' }) =>
+    async () => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status: 200, headers });
+
+  // The happy path, shaped as measured: holder and top10_hold_percent live on
+  // `data`, and the percent is ALREADY a percentage — USDC reads 33.10, not
+  // 0.331. Read as a fraction it would be 100x too small and wave through
+  // exactly the concentration this gate exists to catch.
+  const ok = await fetchBirdeyeHolderCount('M', {
+    apiKey: 'k',
+    fetchImpl: json({ success: true, data: { holder: 8025835, top10_hold_percent: 33.10067487365124, items: [{ owner: 'a' }] } }),
+  });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.holderCount, 8025835);
+  assert.ok(Math.abs(ok.top10Pct - 33.1) < 0.01);
+  assert.equal(ok.source, 'birdeye');
+
+  // ── `holder: 0` IS A FAILED READ ────────────────────────────────────────
+  // MEASURED: six consecutive `success: true, holder: 0, items: []` responses
+  // for a mint that reported 113 holders minutes before and after. Every live
+  // token has holders, so zero is missing data — and a floor treating it as
+  // real would block every trade for as long as the wobble lasted.
+  const wobble = await fetchBirdeyeHolderCount('M', {
+    apiKey: 'k', fetchImpl: json({ success: true, data: { holder: 0, items: [] } }),
+  });
+  assert.equal(wobble.ok, false);
+  assert.equal(wobble.emptyRead, true);
+
+  // ── THE DOCUMENTED PATH SERVES HTML WITH A 200 ──────────────────────────
+  // /v1/token/holder answers with a readme.io docs page. res.ok is true, so a
+  // status-only check parses HTML as JSON and reads the failure as "no
+  // holders". The content-type guard makes that impossible.
+  const html = await fetchBirdeyeHolderCount('M', {
+    apiKey: 'k', fetchImpl: json('<!DOCTYPE html><html>docs</html>', { 'content-type': 'text/html; charset=utf-8' }),
+  });
+  assert.equal(html.ok, false);
+  assert.match(html.error, /expected JSON, got text\/html/);
+
+  // Error shapes are distinguishable so a caller can back off rather than retry.
+  const un = await fetchBirdeyeHolderCount('M', { apiKey: 'bad', fetchImpl: async () => new Response('{}', { status: 401 }) });
+  assert.equal(un.unauthorized, true);
+  const th = await fetchBirdeyeHolderCount('M', { apiKey: 'k', fetchImpl: async () => new Response('{}', { status: 429 }) });
+  assert.equal(th.throttled, true);
+  const fail = await fetchBirdeyeHolderCount('M', { apiKey: 'k', fetchImpl: json({ success: false, message: 'nope' }) });
+  assert.equal(fail.ok, false);
+  assert.match(fail.error, /nope/);
+  // A network throw is a miss, not a crash mid-tick.
+  assert.equal((await fetchBirdeyeHolderCount('M', { apiKey: 'k', fetchImpl: async () => { throw new Error('ECONNRESET'); } })).ok, false);
+  // A missing percentage is null, never zero — zero would read as "no concentration".
+  const noPct = await fetchBirdeyeHolderCount('M', { apiKey: 'k', fetchImpl: json({ success: true, data: { holder: 50 } }) });
+  assert.equal(noPct.top10Pct, null);
+});
+
+test('the Insider Shield blocks on holders without ever blocking on absent data', async () => {
+  const { insiderShield, liveConfig, recordHolderCount, holderGrowthVerdict } = await LC();
+  const clean = { mintAuthority: null, freezeAuthority: null, top10Pct: 20 };
+
+  // ── BIRDEYE'S TOP-10 IS NOT THE REPO'S TOP-10 ───────────────────────────
+  // Birdeye counts pools and vaults as holders; the RPC figure excludes them.
+  // Measured on the same four tokens: 27/85/43/70% against 19/25/19/25%. They
+  // get separate ceilings — reusing the RPC threshold for Birdeye's number
+  // would block every token this target buys.
+  const cfg = liveConfig({ maxTopHolderPct: 60, maxBirdeyeTop10Pct: 95, minHolderCount: 100 });
+  assert.equal(insiderShield({ ...clean, birdeyeTop10Pct: 85.5, holderCount: 113 }, { venue: 'pump-amm', cfg }).pass, true,
+    '85.5% is normal for a token whose pool holds most of the float');
+  assert.equal(insiderShield({ ...clean, birdeyeTop10Pct: 97, holderCount: 500 }, { venue: 'pump-amm', cfg }).pass, false);
+  assert.match(
+    insiderShield({ ...clean, birdeyeTop10Pct: 97, holderCount: 500 }, { venue: 'pump-amm', cfg }).reasons.join(),
+    /birdeye top-10 97.0%/
+  );
+
+  // The holder floor blocks a thin book.
+  const thin = insiderShield({ ...clean, holderCount: 40 }, { venue: 'pump-amm', cfg });
+  assert.equal(thin.pass, false);
+  assert.match(thin.reasons.join(), /40 holders < 100/);
+  assert.equal(insiderShield({ ...clean, holderCount: 2703 }, { venue: 'pump-amm', cfg }).pass, true);
+
+  // ── ABSENT IS NOT ZERO ──────────────────────────────────────────────────
+  // The feed returns success with holder: 0 during wobbles. Applying the floor
+  // to a missing reading would block everything until it recovered.
+  const missing = insiderShield(clean, { venue: 'pump-amm', cfg });
+  assert.equal(missing.pass, true, 'an unavailable holder count must not block');
+  assert.match(missing.waived.join(), /holder count unavailable/);
+
+  // Authority checks keep running whichever way the holder feed went — those
+  // catch a token that cannot be sold at all.
+  const mintable = insiderShield({ mintAuthority: 'X', holderCount: 5000 }, { venue: 'pump-amm', cfg });
+  assert.equal(mintable.pass, false);
+  assert.match(mintable.reasons.join(), /mint authority/);
+  // And an absent security record still fails closed.
+  assert.equal(insiderShield(null, { venue: 'pump-amm', cfg }).pass, false);
+
+  // ── GROWTH NEEDS TWO SAMPLES ────────────────────────────────────────────
+  // A token is new exactly once, and this target trades tokens minutes old, so
+  // failing closed on a first sighting would block the whole strategy rather
+  // than the risky part of it.
+  const gcfg = liveConfig({ maxHolderDeclinePct: 25, minHolderCount: 0 });
+  const hist = {};
+  recordHolderCount(hist, 'M', 1000, 1000);
+  assert.equal(holderGrowthVerdict(hist.M, { maxDeclinePct: 25 }).unknown, true);
+  assert.equal(insiderShield(clean, { venue: 'pump-amm', cfg: gcfg, holderEntry: hist.M }).pass, true);
+
+  // Growing is fine; the peak is what a decline is measured from.
+  recordHolderCount(hist, 'M', 1400, 2000);
+  assert.equal(hist.M.peak, 1400);
+  assert.equal(insiderShield(clean, { venue: 'pump-amm', cfg: gcfg, holderEntry: hist.M }).pass, true);
+
+  // A book leaving faster than tolerance blocks — invisible in one snapshot.
+  recordHolderCount(hist, 'M', 900, 3000);
+  assert.equal(hist.M.peak, 1400, 'the peak is remembered, not overwritten by the latest');
+  const shrunk = insiderShield(clean, { venue: 'pump-amm', cfg: gcfg, holderEntry: hist.M });
+  assert.equal(shrunk.pass, false);
+  assert.match(shrunk.reasons.join(), /holders down 35.7% from peak 1400/);
+
+  // A mild decline inside tolerance still passes.
+  assert.equal(holderGrowthVerdict({ peak: 1000, latest: 900, samples: 3 }, { maxDeclinePct: 25 }).ok, true);
+  // Disabled by default, so the floor is opt-in.
+  assert.equal(holderGrowthVerdict({ peak: 1000, latest: 1, samples: 9 }, {}).ok, true);
+  assert.equal(liveConfig({}).maxHolderDeclinePct, null);
+
+  // Junk observations never enter the history.
+  const h2 = {};
+  recordHolderCount(h2, 'Z', 0);
+  recordHolderCount(h2, 'Z', NaN);
+  assert.equal(h2.Z, undefined);
+});
+
 test('slippage is a bounded ceiling, not a cost', async () => {
   const { resolveSlippageBps, LIVE_DEFAULTS } = await LC();
 
