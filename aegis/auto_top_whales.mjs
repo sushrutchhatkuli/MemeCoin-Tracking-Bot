@@ -570,6 +570,27 @@ export function buildWatchlist(qualified, { source, rules }) {
         ...(rankingProfitUsd(w) !== null
           ? { all_time_net_profit_usd: money(rankingProfitUsd(w)) }
           : {}),
+        // ── PROVIDER FIGURES, KEPT SEPARATE AND LABELLED ────────────────────
+        // rankingProfitUsd and rankingWinRate read these FIRST, so when GMGN
+        // answers they silently become the sort keys. Written under their own
+        // names so a provider's career number can never be mistaken for one
+        // this system measured — the same separation all_time_* already gets
+        // from the observed rate, and for the same reason.
+        //
+        // Absent in practice today: gmgn.ai serves a Cloudflare 403 to every
+        // endpoint and auth scheme, re-verified 2026-08-15, so these keys are
+        // omitted rather than written null. An omitted key reads as "no
+        // provider data"; a null one reads as "the provider said nothing",
+        // and only the first is true.
+        ...(typeof w.gmgnNetProfitUsd === 'number'
+          ? { gmgn_net_profit_usd: money(w.gmgnNetProfitUsd) }
+          : {}),
+        ...(typeof w.gmgnWinRatePct === 'number'
+          ? { gmgn_win_rate: `${w.gmgnWinRatePct.toFixed(0)}%` }
+          : {}),
+        ...(typeof w.gmgnNetProfitUsd === 'number' || typeof w.gmgnWinRatePct === 'number'
+          ? { ranked_on: 'gmgn' }
+          : {}),
         // getSignaturesForAddress caps at 1000, so an exact 1000 means "at least
         // 1000" — and these are signatures, not trades. Naming it accurately
         // stops it being read as a verified trade count.

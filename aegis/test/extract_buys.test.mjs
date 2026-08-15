@@ -5194,6 +5194,69 @@ const whaleFile = {
   ],
 };
 
+test('GMGN figures reach the watchlist file and the alert, attributed as the provider’s', async () => {
+  const { buildWatchlist, ELITE_RULES } = await import('../auto_top_whales.mjs');
+
+  // ── WHY THESE GET THEIR OWN KEYS ────────────────────────────────────────
+  // rankingProfitUsd and rankingWinRate read the GMGN fields FIRST, so when
+  // the provider answers they silently become the sort keys. Written under
+  // their own names, a third party's career claim can never be mistaken for
+  // something measured here — the same separation all_time_* already has from
+  // the observed rate, and it matters more here: the provider's number for the
+  // current target reads $1,500,000 against an on-chain replay of ~$2,380.
+  const withGmgn = buildWatchlist(
+    [{
+      address: 'GmGnWaLLet1111111111111111111111111111111111',
+      winRatePct: 75, gradedBuys: 4, netProfitUsd: 500, lifetimeTrades: 200,
+      gmgnWinRatePct: 61.84, gmgnNetProfitUsd: 1_500_000,
+    }],
+    { source: 'test', rules: ELITE_RULES }
+  );
+  const e = withGmgn.wallets[0];
+  assert.equal(e.gmgn_win_rate, '62%');
+  assert.match(String(e.gmgn_net_profit_usd), /1500k|1\.5M|1500000/);
+  assert.equal(e.ranked_on, 'gmgn', 'the file records that the sort key came from a provider');
+  // The observed figures survive alongside rather than being overwritten.
+  assert.equal(e.win_rate, '75%');
+
+  // ── ABSENT MEANS OMITTED, NOT NULL ──────────────────────────────────────
+  // gmgn.ai serves a Cloudflare 403 to every endpoint and auth scheme
+  // (re-verified 2026-08-15), so these keys are missing in practice. An
+  // omitted key reads as "no provider data"; a null one reads as "the provider
+  // said nothing", and only the first is true.
+  const without = buildWatchlist(
+    [{ address: 'NoGmGn11111111111111111111111111111111111111', winRatePct: 50, gradedBuys: 3, netProfitUsd: 100, lifetimeTrades: 60 }],
+    { source: 'test', rules: ELITE_RULES }
+  );
+  assert.equal('gmgn_win_rate' in without.wallets[0], false);
+  assert.equal('gmgn_net_profit_usd' in without.wallets[0], false);
+  assert.equal('ranked_on' in without.wallets[0], false);
+
+  // ── AND IT RENDERS, ATTRIBUTED ──────────────────────────────────────────
+  const out = await handleCommand({
+    command: 'whales',
+    args: [],
+    deps: { loadWhales: async () => ({ wallets: [{
+      address: 'GmGnWaLLet1111111111111111111111111111111111',
+      win_rate: '75%', graded_buys: 4, enabled: true,
+      all_time_win_rate: '42%', all_time_wins: 55, all_time_trades: 131,
+      gmgn_win_rate: '62%', gmgn_net_profit_usd: '+$1500k',
+    }] }) },
+  });
+  assert.match(out, /GMGN:/, 'the provider is named, never presented as measured');
+  assert.match(out, /62% WR/);
+  assert.match(out, /\+\$1500k/);
+  // The on-chain figure still leads; the provider's claim sits after it.
+  assert.ok(out.indexOf('ALL-TIME WR') < out.indexOf('GMGN:'), 'measured data leads, provider follows');
+
+  // A wallet with no provider data renders no GMGN fragment at all.
+  const bare = await handleCommand({
+    command: 'whales', args: [],
+    deps: { loadWhales: async () => ({ wallets: [{ address: 'NoGmGn11111111111111111111111111111111111111', win_rate: '50%', graded_buys: 3, enabled: true }] }) },
+  });
+  assert.doesNotMatch(bare, /GMGN:/);
+});
+
 test('/whales lists the watchlist with win rates and their sample sizes', async () => {
   const out = await handleCommand({
     command: 'whales',

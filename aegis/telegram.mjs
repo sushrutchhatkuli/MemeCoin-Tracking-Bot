@@ -1304,12 +1304,28 @@ function whalesReport(whales, config = {}) {
         (w.mega_win_detail?.length ? ` (${esc(w.mega_win_detail.join(', '))})` : '')
       : null;
 
+    // GMGN's career figures, when the provider answered. Placed AFTER the
+    // on-chain line and explicitly attributed, because it is a third party's
+    // claim rather than something measured here — the same reason the observed
+    // rate is demoted below the on-chain one. Attribution matters more for this
+    // one than for the others: the provider's number for the current target
+    // reads $1,500,000 against an on-chain replay of ~$2,380, so a row showing
+    // it unlabelled would be the report's least defensible line.
+    const gmgn =
+      w.gmgn_win_rate || w.gmgn_net_profit_usd
+        ? `<i>GMGN:</i> ${[
+            w.gmgn_win_rate ? `${esc(String(w.gmgn_win_rate))} WR` : null,
+            w.gmgn_net_profit_usd ? `${esc(String(w.gmgn_net_profit_usd))} P&amp;L` : null,
+          ].filter(Boolean).join(' · ')}`
+        : null;
+
     const bits = [
       hunter,
       allTime,
       w.all_time_net_sol !== undefined && w.all_time_net_sol !== null
         ? `${w.all_time_net_sol >= 0 ? '+' : ''}${esc(String(w.all_time_net_sol))} SOL realized`
         : null,
+      gmgn,
       // Kept, but demoted and labelled, so the two can never be confused.
       w.win_rate ? `${esc(String(w.win_rate))} observed${graded !== null ? ` on ${esc(String(graded))}` : ''}` : null,
       w.net_profit_usd ? `${esc(String(w.net_profit_usd))} P&amp;L` : null,
