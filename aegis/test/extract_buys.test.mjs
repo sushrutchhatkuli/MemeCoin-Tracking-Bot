@@ -5219,41 +5219,68 @@ const whaleFile = {
  * Multi-wallet tracking and the whale cluster signal
  * ------------------------------------------------------------------ */
 
-test('any tracked whale can close a position another whale opened', async () => {
-  const { createBook, runPaperTick, openPaperPosition, paperConfig } = await PC();
+test('only the originating whale closes its own position', async () => {
+  const { createBook, runPaperTick, openPaperPosition, paperConfig, exitMatchesOrigin } = await PC();
 
-  // ── THE CONSEQUENCE OF MIRRORING ALL FOUR ───────────────────────────────
-  // Exits are keyed on the MINT, not on which whale opened the position. So a
-  // position bought on whale #1's conviction is closed by whale #4's sell of
-  // the same token. That follows directly from "mirror any whale's buy/sell"
-  // and it is a real trade-off, not an oversight: it widens the exit signal
-  // (four wallets watching for trouble instead of one) at the cost of exiting
-  // on a wallet whose entry we never copied and whose thesis we never shared.
-  //
-  // Pinned here so the behaviour is a decision rather than a discovery.
+  // ── ONE WHALE'S THESIS, ONE WHALE'S EXIT ────────────────────────────────
+  // With four wallets mirrored, exits keyed on the mint alone let whale #4's
+  // sell close a position bought on whale #1's conviction — an exit taken on a
+  // thesis we never copied. Matching the seller against the originating wallet
+  // keeps each position under the judgement of the wallet that opened it.
   const cfg = paperConfig({
     budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0,
     subWallets: 0, pureMirror: true,
   });
   const now = 1_000_000_000;
   const book = createBook({ budgetSol: 10, target: { address: 'WHALE_1' } });
-  openPaperPosition(book, { mint: 'M', symbol: 'M', priceUsd: 1, cfg, now: now - 1000 });
-  assert.ok(book.positions.M, 'opened on whale #1');
+  openPaperPosition(book, { mint: 'M', symbol: 'M', priceUsd: 1, cfg, now: now - 1000, originatingWhale: 'WHALE_1' });
+  assert.equal(book.positions.M.originatingWhale, 'WHALE_1', 'tagged at open');
 
-  const report = await runPaperTick({
+  const stranger = await runPaperTick({
     book, observations: { wallets: {} },
     watchlist: { wallets: [{ address: 'WHALE_1' }, { address: 'WHALE_4' }] },
     cfg, now,
     priceFetcher: async () => new Map([['M', 2]]),
-    // A DIFFERENT whale sells it.
     tradeFetcher: async () => ({
       ok: true, newestSignature: 'S1',
-      trades: [{ kind: 'SELL', mint: 'M', sellFraction: 1, blockTime: now, wallet: 'WHALE_4' }],
+      trades: [{ kind: 'SELL', mint: 'M', sellFraction: 1, blockTime: now, wallet: 'WHALE_4', signature: 'sigX' }],
     }),
   });
+  assert.ok(book.positions.M, "another whale's sell must NOT close it");
+  assert.equal(stranger.ignoredExits, 1);
+  assert.match(stranger.ignoredExitDetail[0].reason, /sold by WHALE_4/);
 
-  assert.equal(book.positions.M, undefined, "whale #4's sell closes whale #1's position");
+  // The originating whale's own sell does close it.
+  const report = await runPaperTick({
+    book, observations: { wallets: {} },
+    watchlist: { wallets: [{ address: 'WHALE_1' }, { address: 'WHALE_4' }] },
+    cfg, now: now + 1000,
+    priceFetcher: async () => new Map([['M', 2]]),
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S2',
+      trades: [{ kind: 'SELL', mint: 'M', sellFraction: 1, blockTime: now + 1000, wallet: 'WHALE_1', signature: 'sigY' }],
+    }),
+  });
+  assert.equal(book.positions.M, undefined, "the originating whale's sell closes it");
   assert.ok(report.exits.some((e) => e.trigger === 'WHALE_SELL'));
+
+  // ── BOTH UNKNOWNS FAIL OPEN, DELIBERATELY ───────────────────────────────
+  // An untagged position must not become unexitable — six were already open
+  // when this shipped. A position that can never be closed is a worse failure
+  // than one closed by the wrong whale.
+  assert.equal(exitMatchesOrigin({}, { wallet: 'ANYONE' }).match, true);
+  // `source` carried the address before originatingWhale existed, so older
+  // positions stay matchable rather than falling back to "anyone".
+  assert.equal(exitMatchesOrigin({ source: 'W1' }, { wallet: 'W2' }).match, false);
+  assert.equal(exitMatchesOrigin({ source: 'W1' }, { wallet: 'W1' }).match, true);
+  // An unattributed sell closes anything: only the socket cluster attributes
+  // trades, so demanding attribution would stop the POLL fallback ever closing
+  // a position — exactly when the socket is already down.
+  assert.equal(exitMatchesOrigin({ originatingWhale: 'W1' }, { blockTime: 1 }).match, true);
+  // originatingWhale wins over the legacy field when both are present.
+  assert.equal(exitMatchesOrigin({ originatingWhale: 'W1', source: 'W9' }, { wallet: 'W1' }).match, true);
+  // `source` on the signal is accepted as well as `wallet`.
+  assert.equal(exitMatchesOrigin({ originatingWhale: 'W1' }, { source: 'W2' }).match, false);
 
   // ── PURE MIRROR IS UNAFFECTED ───────────────────────────────────────────
   // Multi-wallet tracking changes WHOSE sells count, not WHETHER the book

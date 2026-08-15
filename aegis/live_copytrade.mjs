@@ -65,6 +65,7 @@ import {
   createBook,
   resolveTarget,
   resolveTargets,
+  exitMatchesOrigin,
   createWhaleSocket,
   createWhaleCluster,
   createClusterTracker,
@@ -1467,7 +1468,7 @@ export async function settleFill({ signature, wallet, rpcUrl, rpcImpl, attempts 
  * is what treating a null basis as zero would do, and it would mask real losses
  * from the limit that is supposed to catch them.
  */
-export function applyFill(book, { side, mint, solSpent, solReceived, tokenDelta }) {
+export function applyFill(book, { side, mint, solSpent, solReceived, tokenDelta, originatingWhale = null }) {
   if (!book.positions) book.positions = {};
   const pos = book.positions[mint];
 
@@ -1477,7 +1478,7 @@ export function applyFill(book, { side, mint, solSpent, solReceived, tokenDelta 
       pos.tokens = (pos.tokens ?? 0) + tokens;
       pos.costSol = (pos.costSol ?? 0) + (solSpent ?? 0);
     } else {
-      book.positions[mint] = { mint, tokens, costSol: solSpent ?? 0, openedAt: Date.now() };
+      book.positions[mint] = { mint, tokens, costSol: solSpent ?? 0, openedAt: Date.now(), originatingWhale: originatingWhale ?? null };
     }
     return { realisedSol: 0, opened: true };
   }
@@ -2557,6 +2558,20 @@ export async function main(argv = []) {
         const done = live ? alreadyExecuted(await loadIntents(), intentId(t.signature, t.kind)) : null;
         if (done) return { id: done.id, at: Date.now(), side: t.kind, mint: t.mint, decision: 'DUPLICATE', reason: `already ${done.outcome}` };
 
+        // ── ONLY THE ORIGINATING WHALE CLOSES ITS OWN POSITION ──────────────
+        // Checked before the holdings read, so an ignored sell costs no RPC.
+        // A live position that reconcile ADOPTED carries no origin, and
+        // exitMatchesOrigin lets anything close it — an adopted position has
+        // no known thesis to be faithful to, and stranding it would be worse.
+        if (t.kind === 'SELL') {
+          const held = book.positions?.[t.mint];
+          const origin = held ? exitMatchesOrigin(held, t) : { match: true };
+          if (!origin.match) {
+            return { id: intentId(t.signature, 'SELL'), at: Date.now(), side: 'SELL', mint: t.mint,
+              decision: 'SKIP', reason: origin.reason };
+          }
+        }
+
         if (live && t.kind === 'SELL') {
           const holdings = await fetchHoldings({ owner: signer.publicKey, rpcUrl, rpcImpl });
           return planLiveSell(t, { cfg, book, holdings: holdings.holdings, decimalsFor, userPublicKey, jupiterKey, now: Date.now() });
@@ -2649,6 +2664,8 @@ export async function main(argv = []) {
             const applied = applyFill(book, {
               side: intent.side, mint: intent.mint,
               solSpent: fill.solSpent, solReceived: fill.solReceived, tokenDelta: fill.tokenDelta,
+              // The wallet whose buy this mirrors, so only its sells close it.
+              originatingWhale: t.wallet ?? target.address ?? null,
             });
             realisedSol = applied.realisedSol;
             if (applied.basisUnknown) {

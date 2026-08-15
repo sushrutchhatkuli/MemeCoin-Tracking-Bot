@@ -454,7 +454,42 @@ export function scaleInPaperPosition(book, { mint, priceUsd, cfg, now = Date.now
  * "no balance" and "already holding" are ordinary outcomes of a tick and the
  * caller reports them rather than failing.
  */
-export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, now = Date.now(), source = null, demo = false, whaleSpendSol = null }) {
+/**
+ * May this sell close this position? PURE.
+ *
+ * ── ONE WHALE'S THESIS, ONE WHALE'S EXIT ────────────────────────────────────
+ * With four wallets mirrored, exits keyed on the mint alone let whale #4's sell
+ * close a position bought on whale #1's conviction — an exit taken on a thesis
+ * we never shared. Matching the seller against the originating wallet keeps
+ * each position under the judgement of the wallet that opened it.
+ *
+ * ── BOTH UNKNOWNS FAIL OPEN, AND THAT IS DELIBERATE ─────────────────────────
+ * An UNTAGGED POSITION is exitable by anyone. Six positions were already open
+ * when this shipped, tagged only by the older `source` field; requiring an
+ * exact match against a field they might not carry would strand them — held
+ * forever because no sell could ever match. A position that cannot be closed is
+ * a worse failure than one closed by the wrong whale.
+ *
+ * An UNATTRIBUTED SELL likewise closes anything. The poll fallback
+ * (fetchWhaleTrades) carries no wallet field — only the socket cluster
+ * attributes trades — so demanding attribution would silently stop the poll
+ * path from ever closing a position, exactly when the socket is already down.
+ */
+export function exitMatchesOrigin(position, signal) {
+  const origin = position?.originatingWhale ?? position?.source ?? null;
+  const seller = signal?.source ?? signal?.wallet ?? null;
+  if (!origin) return { match: true, reason: 'position carries no originating whale' };
+  if (!seller) return { match: true, reason: 'sell is unattributed' };
+  if (seller === origin) return { match: true, reason: 'same whale' };
+  return {
+    match: false,
+    reason: `sold by ${seller.slice(0, 8)}…, position originated from ${origin.slice(0, 8)}…`,
+    origin,
+    seller,
+  };
+}
+
+export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, now = Date.now(), source = null, demo = false, whaleSpendSol = null, originatingWhale = null }) {
   if (!mint) return { ok: false, reason: 'no mint' };
   if (!Number.isFinite(priceUsd) || priceUsd <= 0) return { ok: false, reason: 'no usable price' };
   if (book.positions[mint]) {
@@ -494,6 +529,11 @@ export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, no
     initialStakeSol: size,
     realisedSol: 0,
     firedRungs: [],
+    // The wallet whose buy opened this. Only its sells close it — see
+    // exitMatchesOrigin. Falls back to `source`, which already carried the
+    // address before this field existed, so positions written by an older
+    // build stay matchable rather than becoming unexitable.
+    originatingWhale: originatingWhale ?? source ?? null,
     // ── Sub-wallets ──────────────────────────────────────────────────────
     // Split at OPEN, so every sub-wallet shares one entry price. Splitting at
     // exit instead would be a different strategy wearing the same name: the
@@ -2052,6 +2092,12 @@ export async function runPaperTick({
           whaleSpendSol: t.solSpent,
           impliedPriceUsd: implied === null ? null : implied * (1 + cfg.copyImpactPct / 100),
           whaleFillUsd: implied,
+          // Carried through so the position can be tagged with the wallet that
+          // actually bought, not the primary target. Only the socket cluster
+          // attributes trades; the poll fallback leaves this undefined and the
+          // position falls back to the target, which is correct for a
+          // single-wallet poll.
+          wallet: t.wallet ?? null,
         };
       }),
     ...ledgerCandidates,
@@ -2095,6 +2141,10 @@ export async function runPaperTick({
       cfg,
       now,
       source: book.target?.address ?? null,
+      // The wallet that ACTUALLY made this buy, which under multi-wallet
+      // tracking is often not the primary target. Falling back to the target
+      // keeps single-wallet runs and ledger-sourced candidates unchanged.
+      originatingWhale: c.wallet ?? book.target?.address ?? null,
       whaleSpendSol: c.whaleSpendSol ?? null,
     });
     if (res.ok) {
@@ -2161,6 +2211,18 @@ export async function runPaperTick({
         prices.get(t.mint) ??
         p.markPriceUsd;
       if (!Number.isFinite(price) || price <= 0) continue;
+
+      // ── ONLY THE ORIGINATING WHALE CLOSES ITS OWN POSITION ────────────────
+      // Another whale selling this mint is that wallet exiting a thesis we did
+      // not copy. Ignored rather than acted on, so each position stays under
+      // the judgement of the wallet that opened it.
+      const origin = exitMatchesOrigin(p, t);
+      if (!origin.match) {
+        report.ignoredExits = (report.ignoredExits ?? 0) + 1;
+        report.ignoredExitDetail = [...(report.ignoredExitDetail ?? []), { mint: t.mint, ...origin }];
+        continue;
+      }
+
       const fraction = Number.isFinite(t.sellFraction) ? t.sellFraction : 1;
       const gainPct = p.entryPriceUsd > 0 ? (price / p.entryPriceUsd - 1) * 100 : null;
 
