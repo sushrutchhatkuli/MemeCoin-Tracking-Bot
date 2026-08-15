@@ -76,7 +76,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
-import { fetchPairsBatch } from './sources.mjs';
+import { fetchPairsBatch, fetchDexScreenerPrice } from './sources.mjs';
 import { loadObservations } from './wallet_observations.mjs';
 import { websocketUrlFor } from './discovery_daemon.mjs';
 import {
@@ -1647,19 +1647,41 @@ export async function fetchPrices(mints, { batchFetcher = fetchPairsBatch } = {}
  * "SOL" at five different prices — so it is never matched on, compared, or used
  * to identify a position. The mint remains the key everywhere.
  */
-export async function fetchMarketData(mints, { batchFetcher = fetchPairsBatch } = {}) {
+export async function fetchMarketData(
+  mints,
+  { batchFetcher = fetchPairsBatch, singleFetcher = fetchDexScreenerPrice, maxSingleLookups = 8 } = {}
+) {
   const out = new Map();
   if (!mints?.length) return out;
 
   const byAddress = await batchFetcher(mints).catch(() => new Map());
-  if (!byAddress || typeof byAddress.get !== 'function') return out;
+  const missing = [];
 
   for (const mint of mints) {
-    const pair = byAddress.get(String(mint).toLowerCase());
+    const pair = byAddress && typeof byAddress.get === 'function' ? byAddress.get(String(mint).toLowerCase()) : null;
     const priceUsd = Number(pair?.priceUsd);
-    if (!Number.isFinite(priceUsd) || priceUsd <= 0) continue;
+    if (!Number.isFinite(priceUsd) || priceUsd <= 0) {
+      missing.push(mint);
+      continue;
+    }
     const symbol = typeof pair?.baseToken?.symbol === 'string' ? pair.baseToken.symbol.trim() : null;
-    out.set(mint, { priceUsd, symbol: symbol || null });
+    out.set(mint, { priceUsd, symbol: symbol || null, source: 'batch' });
+  }
+
+  // ── PER-MINT FALLBACK ─────────────────────────────────────────────────────
+  // A mint can be absent from a batch response while a direct lookup finds it:
+  // the batch is chunked 30 at a time and one failed chunk silently drops
+  // thirty tokens, which reads downstream as thirty unpriceable positions
+  // rather than as one failed request.
+  //
+  // BOUNDED, because the fallback is the same host as the batch. If DexScreener
+  // is down or rate-limiting, retrying every miss individually turns one failed
+  // request into as many as there are open positions and guarantees the limit
+  // stays hit. A stale mark is recoverable; a self-inflicted outage is not.
+  if (!singleFetcher || !missing.length) return out;
+  for (const mint of missing.slice(0, maxSingleLookups)) {
+    const single = await singleFetcher(mint).catch(() => null);
+    if (single?.ok) out.set(mint, { priceUsd: single.priceUsd, symbol: single.symbol, source: 'dexscreener-single' });
   }
   return out;
 }

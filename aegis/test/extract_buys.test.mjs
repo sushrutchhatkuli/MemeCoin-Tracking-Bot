@@ -7602,6 +7602,173 @@ test('pure mirror holds an unpriceable position and says so', async () => {
  * Ticker resolution
  * ------------------------------------------------------------------ */
 
+test('DexScreener prices the right chain, not merely the right address', async () => {
+  const { fetchDexScreenerPrice, isSolanaPairFor } = await import('../sources.mjs');
+
+  // ── A MINT ADDRESS IS NOT UNIQUE ACROSS CHAINS ──────────────────────────
+  // MEASURED against the live API for WSOL: 30 pairs came back across two
+  // chains, and pairs[0] was "Wrapped FOGO" at $0.0086 against Solana's
+  // $75.30. Reading position 0 is a 100% error, and the array is not sorted by
+  // liquidity either, so its order carries no meaning at all.
+  const WSOL = 'So11111111111111111111111111111111111111112';
+  const mixed = {
+    ok: true,
+    data: {
+      pairs: [
+        { chainId: 'fogo', baseToken: { address: WSOL, symbol: 'FOGO' }, priceUsd: '0.008559', liquidity: { usd: 155413 } },
+        { chainId: 'solana', baseToken: { address: WSOL, symbol: 'SOL' }, priceUsd: '75.30', liquidity: { usd: 25912395 } },
+        { chainId: 'solana', baseToken: { address: WSOL, symbol: 'SOL' }, priceUsd: '75.10', liquidity: { usd: 1184588 } },
+      ],
+    },
+  };
+  const got = await fetchDexScreenerPrice(WSOL, { fetchJsonImpl: async () => mixed });
+  assert.equal(got.ok, true);
+  assert.equal(got.priceUsd, 75.30, 'the Solana pair, not the first one');
+  assert.equal(got.liquidityUsd, 25912395, 'and the deepest of them');
+  assert.equal(got.source, 'dexscreener');
+
+  assert.equal(isSolanaPairFor(mixed.data.pairs[0], WSOL), false, 'a fork chain is not Solana');
+  assert.equal(isSolanaPairFor(mixed.data.pairs[1], WSOL), true);
+
+  // A pair where our mint is the QUOTE side prices the other asset, not ours.
+  assert.equal(
+    isSolanaPairFor({ chainId: 'solana', baseToken: { address: 'OTHER' }, quoteToken: { address: WSOL } }, WSOL),
+    false
+  );
+
+  // An unknown mint answers HTTP 200 with pairs: null — a normal result, not
+  // an error, so it must not throw or be read as a price.
+  const unknown = await fetchDexScreenerPrice('NOPE', { fetchJsonImpl: async () => ({ ok: true, data: { pairs: null } }) });
+  assert.equal(unknown.ok, false);
+  assert.equal(unknown.unknownMint, true);
+
+  // Only fork-chain pairs is a miss, not a fallback to the wrong chain.
+  const forkOnly = await fetchDexScreenerPrice(WSOL, {
+    fetchJsonImpl: async () => ({ ok: true, data: { pairs: [mixed.data.pairs[0]] } }),
+  });
+  assert.equal(forkOnly.ok, false);
+  assert.match(forkOnly.error, /no Solana pair/);
+
+  // priceUsd arrives as a STRING. Number('') is 0, so an empty field would
+  // pass a truthiness check and mark a position at zero.
+  for (const bad of ['', '0', 'abc', null, undefined]) {
+    const r = await fetchDexScreenerPrice(WSOL, {
+      fetchJsonImpl: async () => ({ ok: true, data: { pairs: [{ chainId: 'solana', baseToken: { address: WSOL }, priceUsd: bad, liquidity: { usd: 1 } }] } }),
+    });
+    assert.equal(r.ok, false, `priceUsd ${JSON.stringify(bad)} must not be a price`);
+  }
+
+  // A failed request is reported, and a 429 is distinguishable so a caller can
+  // back off rather than hammer.
+  const down = await fetchDexScreenerPrice(WSOL, { fetchJsonImpl: async () => ({ ok: false, status: 429 }) });
+  assert.equal(down.ok, false);
+  assert.equal(down.throttled, true);
+  assert.equal((await fetchDexScreenerPrice(null)).ok, false);
+});
+
+test('the price fallback fills batch gaps but cannot become a stampede', async () => {
+  const { fetchMarketData } = await import('../paper_copytrade.mjs');
+
+  // A chunked batch drops thirty tokens when one chunk fails, which reads
+  // downstream as thirty unpriceable positions rather than one failed request.
+  const batchFetcher = async () => new Map([['mint1', { baseToken: { address: 'MINT1', symbol: 'A' }, priceUsd: '1' }]]);
+  const asked = [];
+  const singleFetcher = async (mint) => {
+    asked.push(mint);
+    return mint === 'MINT2' ? { ok: true, priceUsd: 5, symbol: 'B' } : { ok: false, error: 'no pairs' };
+  };
+
+  const out = await fetchMarketData(['MINT1', 'MINT2', 'MINT3'], { batchFetcher, singleFetcher });
+  assert.equal(out.get('MINT1').source, 'batch', 'the batch is still preferred');
+  assert.deepEqual(out.get('MINT2'), { priceUsd: 5, symbol: 'B', source: 'dexscreener-single' });
+  assert.equal(out.has('MINT3'), false, 'a genuine miss stays a miss');
+  assert.deepEqual(asked, ['MINT2', 'MINT3'], 'only the misses are retried');
+
+  // ── BOUNDED ─────────────────────────────────────────────────────────────
+  // The fallback is the SAME host as the batch. If DexScreener is rate-limiting,
+  // retrying every miss individually turns one failed request into as many as
+  // there are open positions and guarantees the limit stays hit.
+  const many = Array.from({ length: 50 }, (_, i) => `M${i}`);
+  const counted = [];
+  await fetchMarketData(many, {
+    batchFetcher: async () => new Map(),
+    singleFetcher: async (m) => { counted.push(m); return { ok: false }; },
+    maxSingleLookups: 8,
+  });
+  assert.equal(counted.length, 8, '50 misses must not become 50 requests');
+
+  // A throwing fallback degrades to "no price", never to a crash mid-tick.
+  const survived = await fetchMarketData(['X'], {
+    batchFetcher: async () => new Map(),
+    singleFetcher: async () => { throw new Error('network down'); },
+  });
+  assert.equal(survived.size, 0);
+
+  // And it can be switched off entirely.
+  const off = await fetchMarketData(['X'], { batchFetcher: async () => new Map(), singleFetcher: null });
+  assert.equal(off.size, 0);
+});
+
+test('a DexScreener-priced sample is recorded but quarantined from calibration', async () => {
+  const { planIntent, liveConfig, createCalibrationLedger, recordShadowEntry, recordShadowExit, calibrationSummary } = await LC();
+  const { paperConfig } = await PC();
+
+  // ── WHY THIS IS TAGGED AND NOT SIMPLY USED ──────────────────────────────
+  // Losing 995 quotes to throttling cost thirteen hours of collection, so a
+  // fallback price is better than a discarded sample. But an aggregator tick
+  // measured against the target's actual fill is EXACTLY the comparison that
+  // set copyImpactPct to 9 when the true figure at ~500ms was -8.9% — the
+  // opposite sign. Replaying 119 trades at 9% lost 13.12 SOL against 6.44 at 0.
+  // Pooled with clean samples it would be invisible; tagged, it is separable.
+  const cfg = liveConfig({ maxTradeSol: 1, maxExposureSol: 10, gasReserveSol: 0 });
+  const intent = await planIntent(
+    { kind: 'BUY', mint: 'M', solSpent: 1, signature: 'sigX', tokenDelta: 1000 },
+    {
+      cfg, paperCfg: paperConfig({ perTradeSol: 0.5 }), book: { positions: {} }, solUsd: 100,
+      userPublicKey: 'W', nativeSolBalance: 5,
+      quoteFn: async () => ({ ok: false, throttled: true, error: 'HTTP 400 (rate limited)' }),
+      priceFallback: async () => ({ ok: true, priceUsd: 0.12, source: 'dexscreener' }),
+      decimalsFor: async () => 6,
+    }
+  );
+  // It stays THROTTLED: without a route there is no transaction to sign, so a
+  // price alone can never become a trade.
+  assert.equal(intent.decision, 'THROTTLED');
+  assert.equal(intent.degraded, true);
+  assert.equal(intent.priceSource, 'dexscreener');
+  assert.equal(intent.ourFillUsd, 0.12, 'the measurement is still captured');
+  assert.ok(Number.isFinite(intent.quoteGapPct));
+
+  // With no fallback supplied — which is every live run — nothing is invented.
+  const bare = await planIntent(
+    { kind: 'BUY', mint: 'M', solSpent: 1, signature: 'sigY' },
+    {
+      cfg, paperCfg: paperConfig({ perTradeSol: 0.5 }), book: { positions: {} }, solUsd: 100,
+      userPublicKey: 'W', nativeSolBalance: 5,
+      quoteFn: async () => ({ ok: false, throttled: true, error: 'rate limited' }),
+      decimalsFor: async () => 6,
+    }
+  );
+  assert.equal(bare.decision, 'THROTTLED');
+  assert.equal(bare.degraded, undefined);
+  assert.equal(bare.ourFillUsd, undefined);
+
+  // ── THE QUARANTINE IS REAL, NOT DECORATIVE ──────────────────────────────
+  const led = createCalibrationLedger();
+  recordShadowEntry(led, { mint: 'CLEAN', ourFillUsd: 1, targetFillUsd: 1, ourTokens: 10, quoteGapPct: 0.5, targetSignature: 'c1' });
+  recordShadowExit(led, { mint: 'CLEAN', ourFillUsd: 2, targetFillUsd: 2, exitGapPct: -1, targetSignature: 'c2' });
+  recordShadowEntry(led, { mint: 'DEGRADED', ourFillUsd: 1, targetFillUsd: 1, ourTokens: 10, quoteGapPct: 40, degraded: true, targetSignature: 'd1' });
+  recordShadowExit(led, { mint: 'DEGRADED', ourFillUsd: 3, targetFillUsd: 2, exitGapPct: 50, targetSignature: 'd2' });
+
+  const s = calibrationSummary(led);
+  assert.equal(s.roundTrips, 1, 'only the clean pair counts toward the headline');
+  assert.equal(s.degradedRoundTrips, 1, 'and the degraded one is still visible');
+  assert.equal(s.entrySamples, 1, 'a degraded gap is not an entry sample');
+  assert.equal(s.exitSamples, 1);
+  // The degraded pair would have swung the median hard had it been pooled.
+  assert.ok(Math.abs(s.medianEntryGapPct - 0.5) < 1e-9);
+});
+
 test('fetchMarketData carries the ticker alongside the price', async () => {
   const { fetchMarketData, fetchPrices } = await import('../paper_copytrade.mjs');
   const batch = new Map([
@@ -7612,14 +7779,16 @@ test('fetchMarketData carries the ticker alongside the price', async () => {
   ]);
   const batchFetcher = async () => batch;
 
-  const data = await fetchMarketData(['MINT1', 'MINT2', 'MINT3', 'DEAD'], { batchFetcher });
-  assert.deepEqual(data.get('MINT1'), { priceUsd: 0.004, symbol: 'Call' });
-  assert.deepEqual(data.get('MINT2'), { priceUsd: 2, symbol: 'UNITE' }, 'trimmed');
-  assert.deepEqual(data.get('MINT3'), { priceUsd: 3, symbol: null }, 'no symbol is null, not empty string');
+  // singleFetcher off: this test is about the batch path, and leaving the
+  // fallback live would make it reach the network.
+  const data = await fetchMarketData(['MINT1', 'MINT2', 'MINT3', 'DEAD'], { batchFetcher, singleFetcher: null });
+  assert.deepEqual(data.get('MINT1'), { priceUsd: 0.004, symbol: 'Call', source: 'batch' });
+  assert.deepEqual(data.get('MINT2'), { priceUsd: 2, symbol: 'UNITE', source: 'batch' }, 'trimmed');
+  assert.deepEqual(data.get('MINT3'), { priceUsd: 3, symbol: null, source: 'batch' }, 'no symbol is null, not empty string');
   assert.equal(data.has('DEAD'), false, 'an unpriceable pair is omitted entirely');
 
   // fetchPrices stays a bare mint->price map so existing callers are unaffected.
-  const prices = await fetchPrices(['MINT1'], { batchFetcher });
+  const prices = await fetchPrices(['MINT1'], { batchFetcher, singleFetcher: null });
   assert.equal(prices.get('MINT1'), 0.004);
 });
 

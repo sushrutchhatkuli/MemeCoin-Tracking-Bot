@@ -756,6 +756,7 @@ export async function planIntent(
     quoteFn = fetchJupiterQuote,
     buildFn = buildSwapTransaction,
     jupiterKey = null,
+    priceFallback = null,
     now = Date.now(),
   } = {}
 ) {
@@ -817,6 +818,40 @@ export async function planIntent(
     apiKey: jupiterKey,
   });
   if (!quoted.ok) {
+    // ── DEXSCREENER FALLBACK: MEASUREMENT ONLY ────────────────────────────
+    // A throttled quote loses a calibration sample, and 995 of them lost
+    // thirteen hours. DexScreener can still put a price on the token, so the
+    // sample is recorded rather than discarded — but it is TAGGED, and the
+    // calibration summary excludes tagged samples from every headline figure.
+    //
+    // The tag is not bookkeeping fussiness. This is precisely the comparison
+    // that set copyImpactPct to 9: an aggregator's tick quote measured against
+    // the target's actual fill. Re-measured at ~500ms the true figure was
+    // -8.9%, the opposite sign, and replaying 119 trades at 9% lost 13.12 SOL
+    // against 6.44 at 0. A degraded sample pooled with clean ones is worse than
+    // no sample, because it is invisible.
+    //
+    // `priceFallback` is supplied ONLY in dry-run. A throttle in live mode
+    // stays a throttle: without a Jupiter route there is no transaction to
+    // sign, so a price alone cannot produce a trade.
+    if (quoted.throttled && priceFallback) {
+      const fb = await priceFallback(trade.mint).catch(() => null);
+      if (fb?.ok) {
+        const targetFillUsd = impliedEntryPriceUsd(trade, { solUsd, minSpendSol: paperCfg.impliedMinSpendSol });
+        return {
+          ...base,
+          decision: 'THROTTLED',
+          reason: quoted.error,
+          sizeSol: sized.sizeSol,
+          // Recorded and quarantined in the same breath.
+          priceSource: 'dexscreener',
+          degraded: true,
+          ourFillUsd: fb.priceUsd,
+          targetFillUsd,
+          quoteGapPct: fb.priceUsd && targetFillUsd ? (fb.priceUsd / targetFillUsd - 1) * 100 : null,
+        };
+      }
+    }
     return {
       ...base,
       // A refusal that survived a retry AND is throttle-shaped is reported as
@@ -1618,7 +1653,7 @@ export function recordShadowEntry(ledger, intent) {
   if (!mint || !(ourFillUsd > 0) || !(targetFillUsd > 0)) return null;
   // Tagged with the target's own signature so two collectors that both saw
   // this trade contribute one sample rather than two.
-  if (Number.isFinite(intent.quoteGapPct) && !intent.seeded) {
+  if (Number.isFinite(intent.quoteGapPct) && !intent.seeded && !intent.degraded) {
     ledger.entryGaps.push({ sig: intent.targetSignature ?? null, pct: intent.quoteGapPct });
   }
   // Scale-ins overwrite rather than average: the pairing is a round-trip
@@ -1630,9 +1665,14 @@ export function recordShadowEntry(ledger, intent) {
   // drift as much as copy cost — the precise error that produced
   // copyImpactPct 9 and cost a book. A drag built on one is not a measurement
   // of copying, whichever side the exit came from.
+  //
+  // `degraded` travels the same way and for the same reason: an entry priced
+  // from a DexScreener tick rather than a Jupiter quote is that same flawed
+  // comparison, so a round trip built on one is excluded from the headline too.
   ledger.open.set(mint, {
     ourEntryUsd: ourFillUsd, targetEntryUsd: targetFillUsd, ourTokens, sizeSol,
-    seeded: intent.seeded === true, at: intent.at ?? Date.now(),
+    seeded: intent.seeded === true, degraded: intent.degraded === true,
+    at: intent.at ?? Date.now(),
   });
   return ledger.open.get(mint);
 }
@@ -1650,7 +1690,8 @@ export function recordShadowExit(ledger, intent) {
   if (!open || !(ourFillUsd > 0) || !(targetFillUsd > 0)) return null;
   ledger.open.delete(mint);
   const seeded = open.seeded || intent.seeded === true;
-  if (Number.isFinite(intent.exitGapPct) && !seeded) {
+  const degraded = open.degraded === true || intent.degraded === true;
+  if (Number.isFinite(intent.exitGapPct) && !seeded && !degraded) {
     ledger.exitGaps.push({ sig: intent.targetSignature ?? null, pct: intent.exitGapPct });
   }
 
@@ -1659,6 +1700,7 @@ export function recordShadowExit(ledger, intent) {
   const pair = {
     mint,
     seeded,
+    degraded,
     // The identity a merge dedupes on: the exit that closed this round trip.
     exitSig: intent.targetSignature ?? null,
     ourReturnPct,
@@ -1691,12 +1733,13 @@ const median = (a) => {
  * true figure at ~500ms was -8.9%, the opposite sign.
  */
 export function calibrationSummary(ledger) {
-  const live = ledger.pairs.filter((p) => !p.seeded);
+  const live = ledger.pairs.filter((p) => !p.seeded && !p.degraded);
   const drags = live.map((p) => p.dragPct);
   const sorted = [...drags].sort((a, b) => a - b);
   const seededDrags = ledger.pairs.filter((p) => p.seeded).map((p) => p.dragPct);
   return {
     roundTrips: live.length,
+    degradedRoundTrips: ledger.pairs.filter((p) => p.degraded && !p.seeded).length,
     seededRoundTrips: seededDrags.length,
     seededMedianDragPct: median(seededDrags),
     entrySamples: ledger.entryGaps.length,
@@ -2178,6 +2221,18 @@ export async function main(argv = []) {
   // Decimals, cached — needed to put Jupiter's raw outAmount into the same
   // units as the target's UI-denominated fill. Immutable per mint, so one
   // lookup each is enough.
+  // ── Zero-cost backup price feed ─────────────────────────────────────────
+  // Cached per mint for the run: a throttled burst hits the same handful of
+  // tokens repeatedly, and DexScreener has its own rate limit to respect.
+  const { fetchDexScreenerPrice } = await import('./sources.mjs');
+  const dexCache = new Map();
+  const priceFallbackFor = async (mint) => {
+    if (dexCache.has(mint)) return dexCache.get(mint);
+    const r = await fetchDexScreenerPrice(mint).catch(() => ({ ok: false }));
+    dexCache.set(mint, r);
+    return r;
+  };
+
   const decimalsCache = new Map();
   const decimalsFor = async (mint) => {
     if (decimalsCache.has(mint)) return decimalsCache.get(mint);
@@ -2206,7 +2261,13 @@ export async function main(argv = []) {
           cfg, paperCfg, book, solUsd, userPublicKey, nativeSolBalance,
           // In-flight size counts against the cap, so concurrent buys cannot
           // each read the same stale exposure and all decide they fit.
-          exposureSol: exposure.inFlight, securityFor, decimalsFor, jupiterKey, now: Date.now(),
+          exposureSol: exposure.inFlight, securityFor, decimalsFor, jupiterKey,
+          // MEASUREMENT ONLY, and only in dry-run. A throttled quote in live
+          // mode has no route and therefore no transaction to sign, so a price
+          // could never become a trade — passing a fallback there would only
+          // create the appearance of one.
+          priceFallback: live ? null : priceFallbackFor,
+          now: Date.now(),
         });
       });
       intent.seeded = seeded;

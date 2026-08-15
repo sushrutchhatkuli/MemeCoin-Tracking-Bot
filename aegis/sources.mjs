@@ -125,6 +125,26 @@ export async function discoverCandidates(chains, discovery = {}) {
  * Market data for up to 30 token addresses per call. Returns a Map keyed by
  * lowercased token address holding that token's deepest-liquidity pair.
  */
+/**
+ * Is this pair actually the Solana token we asked about? PURE.
+ *
+ * ── A MINT ADDRESS IS NOT UNIQUE ACROSS CHAINS ──────────────────────────────
+ * DexScreener answers /tokens/<address> with pairs from EVERY chain where that
+ * address string exists, and SVM forks reuse the well-known ones verbatim.
+ * MEASURED on WSOL: 30 pairs came back across two chains, and the first was
+ * "Wrapped FOGO" at $0.0086 against Solana's $75.30 — a 100% error from
+ * reading pairs[0]. The list is not sorted by liquidity either, so position in
+ * the array carries no meaning at all.
+ *
+ * The base token also has to MATCH: a pair where our mint is the quote side
+ * prices the other asset, not ours.
+ */
+export function isSolanaPairFor(pair, address) {
+  if (!pair || pair.chainId !== 'solana') return false;
+  const base = pair.baseToken?.address;
+  return typeof base === 'string' && base.toLowerCase() === String(address).toLowerCase();
+}
+
 export async function fetchPairsBatch(addresses) {
   const out = new Map();
   for (let i = 0; i < addresses.length; i += 30) {
@@ -136,6 +156,10 @@ export async function fetchPairsBatch(addresses) {
       for (const pair of res.data.pairs) {
         const key = pair?.baseToken?.address?.toLowerCase();
         if (!key) continue;
+        // Chain-filtered. Without this, a fork chain whose pair happens to be
+        // deeper than Solana's wins the "deepest liquidity" comparison below
+        // and prices the position off the wrong asset entirely.
+        if (!isSolanaPairFor(pair, key)) continue;
         const incumbent = out.get(key);
         // Keep the pair with the deepest liquidity — that's the price-setting venue.
         if (!incumbent || (pair.liquidity?.usd ?? 0) > (incumbent.liquidity?.usd ?? 0)) {
@@ -146,6 +170,58 @@ export async function fetchPairsBatch(addresses) {
     await sleep(250);
   }
   return out;
+}
+
+/**
+ * One mint's Solana price from DexScreener. Zero cost, no key.
+ *
+ * ── WHAT THIS IS AND IS NOT FOR ─────────────────────────────────────────────
+ * It is an aggregator's tick-sampled quote, not a fill. That distinction has
+ * already cost this project once: copyImpactPct was set to 9 by comparing the
+ * target's own fill against a DexScreener quote taken 0.6-3.7 MINUTES later,
+ * and re-measuring at ~500ms gave -8.9% — the opposite sign. Replaying 119
+ * trades at 9% lost 13.12 SOL against 6.44 at 0.
+ *
+ * So it is sound for MARKING a position, valuing a book, or standing in when a
+ * priced feed is unavailable. It is not sound for measuring what a trade would
+ * have filled at, and callers that use it for a fill comparison must record
+ * that they did — see the priceSource tagging in live_copytrade.
+ *
+ * An unknown mint answers HTTP 200 with `pairs: null`, so the null case is a
+ * normal result rather than an error.
+ */
+export async function fetchDexScreenerPrice(mint, { fetchJsonImpl = getJson } = {}) {
+  if (!mint || typeof mint !== 'string') return { ok: false, error: 'no mint' };
+  const res = await fetchJsonImpl(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+  if (!res?.ok) return { ok: false, error: res?.error ?? 'request failed', throttled: res?.status === 429 };
+
+  const pairs = Array.isArray(res.data?.pairs) ? res.data.pairs : [];
+  if (!pairs.length) return { ok: false, error: 'no pairs', unknownMint: true };
+
+  const solana = pairs.filter((p) => isSolanaPairFor(p, mint));
+  if (!solana.length) return { ok: false, error: 'no Solana pair for this mint' };
+
+  // Deepest liquidity is the price-setting venue. Chosen explicitly rather
+  // than trusting array order, which is not sorted.
+  let best = solana[0];
+  for (const p of solana) {
+    if ((Number(p.liquidity?.usd) || 0) > (Number(best.liquidity?.usd) || 0)) best = p;
+  }
+
+  // priceUsd arrives as a STRING. Number('') is 0, so an empty field would
+  // otherwise pass a truthiness check and mark a position at zero.
+  const priceUsd = Number(best.priceUsd);
+  if (!Number.isFinite(priceUsd) || priceUsd <= 0) return { ok: false, error: 'no usable priceUsd' };
+
+  return {
+    ok: true,
+    priceUsd,
+    symbol: typeof best.baseToken?.symbol === 'string' ? best.baseToken.symbol.trim() || null : null,
+    liquidityUsd: Number(best.liquidity?.usd) || 0,
+    dexId: best.dexId ?? null,
+    pairAddress: best.pairAddress ?? null,
+    source: 'dexscreener',
+  };
 }
 
 export async function fetchSinglePair(address) {
