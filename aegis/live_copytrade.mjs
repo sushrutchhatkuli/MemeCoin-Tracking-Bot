@@ -68,6 +68,8 @@ import {
   createWhaleSocket,
   createWhaleCluster,
   createClusterTracker,
+  orderByRank,
+  rankLookup,
   fetchWhaleTrades,
   fetchLatestSignature,
   fetchSolUsd,
@@ -2853,11 +2855,14 @@ export async function main(argv = []) {
     bonus: config.live?.clusterConvictionBonus ?? 25,
   });
   const socket = cluster;
+  // Execution precedence reads the explicit rank field, not the array index —
+  // anything that filters or re-serialises the list silently renumbers it.
+  const rankOf = rankLookup(watchlist);
 
   book.lastSignature = (await fetchLatestSignature({ wallet: target.address, rpcUrl })).signature ?? null;
   console.log(`  tracking      ${cluster.size} wallet(s) — ${tracking.reason}`);
   for (const [i, t] of tracking.targets.entries()) {
-    console.log(`     ${i + 1}. ${t.address.slice(0, 16)}…${i === 0 ? '  ← MIRRORED' : '  (cluster signal only)'}`);
+    console.log(`     #${i + 1}  ${t.address.slice(0, 16)}…  copied · rank-${i + 1} precedence`);
   }
   console.log(`  cluster       +${clusterTracker ? (config.live?.clusterConvictionBonus ?? 25) : 0} conviction when 2+ co-buy within ${config.live?.clusterWindowMinutes ?? 3}m`);
   console.log(`\n  watching every ${intervalSec}s — Ctrl+C to stop\n`);
@@ -2918,10 +2923,20 @@ export async function main(argv = []) {
       }
       clusterTracker.prune();
 
-      // Only the mirrored wallet's trades reach the book. Acting on all five
-      // would multiply exposure fivefold against caps sized for one.
-      const mine = live.trades.filter((t) => !t.wallet || t.wallet === target.address);
-      if (mine.length) await handle(mine);
+      // ── ALL RANKED WHALES ARE COPIED ──────────────────────────────────────
+      // Every tracked wallet's trades reach the book, ordered chronologically
+      // with RANK breaking same-block ties — see orderByRank for why rank is a
+      // tie-break and not the primary key.
+      //
+      // WHAT BOUNDS THE RISK IS THE EXPOSURE LEDGER, NOT THE WALLET COUNT.
+      // Four whales do not produce four times the exposure: every buy reserves
+      // from one shared maxExposureSol before it is placed, so more whales mean
+      // more candidates competing for the SAME capital, and the ones that
+      // arrive after the cap is full are declined. That is the difference
+      // between copying more wallets and risking more money, and it is the
+      // reason this is safe to switch on.
+      const ordered = orderByRank(live.trades, rankOf);
+      if (ordered.length) await handle(ordered);
     }
   }
 }

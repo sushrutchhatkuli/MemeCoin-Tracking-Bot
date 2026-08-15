@@ -2594,7 +2594,7 @@ test('cache entries are classified fresh, incremental or miss', async () => {
   assert.equal(classifyCacheEntry({ ...base, at: now + 60_000 }, { now }), 'miss');
 });
 
-test('ranking sorts on lifetime USD profit, then win rate', async () => {
+test('ranking is a weighted composite, so one huge dimension cannot carry a wallet', async () => {
   const { applyEliteRules, rankingProfitUsd } = await import('../auto_top_whales.mjs');
 
   // Every rule off except the sort, so ordering is what is under test.
@@ -2608,13 +2608,18 @@ test('ranking sorts on lifetime USD profit, then win rate', async () => {
     onChain: { winRatePct: wr, trades: 60, netSol },
   });
 
-  // Deliberately ordered so netSol disagrees with USD: 'rich' has the most
-  // dollars but the least SOL. Under the old sort it ranked last.
+  // ── A WEIGHTED SUM REWARDS EXTREMES OVER BALANCE ───────────────────────
+  // 'rich' maxes profit and bottoms win rate; 'poor' is the mirror image. At
+  // 40/40/20 they SCORE THE SAME (0.6 each), and profit breaks the tie — so
+  // 'mid', which is middling on both, finishes last despite being nobody's
+  // worst. That is inherent to a weighted sum and worth pinning: the ranking
+  // prefers a wallet that is excellent at one thing over one that is adequate
+  // at everything.
   const { qualified } = applyEliteRules(
     [w('poor', 100, 90, 90), w('mid', 500, 50, 50), w('rich', 5000, 10, 1)],
     rules
   );
-  assert.deepEqual(qualified.map((c) => c.address), ['rich', 'mid', 'poor']);
+  assert.deepEqual(qualified.map((c) => c.address), ['rich', 'poor', 'mid']);
 
   // Win rate breaks a USD tie.
   const tied = applyEliteRules([w('lowWr', 500, 41, 9), w('highWr', 500, 88, 9)], rules);
@@ -2680,7 +2685,7 @@ test('auto-import resolves by precedence and refuses a mis-shaped file', async (
   assert.match(bad.warn, /no recognised address column/);
 });
 
-test('imported rows rank by realized profit, then win rate, then trades', async () => {
+test('imported rows rank by composite score, not by profit alone', async () => {
   const { applyEliteRules } = await import('../auto_top_whales.mjs');
   const rules = {
     minWinRatePct: 40, minGradedBuys: 0, minLifetimeTrades: 100, minNetProfitUsd: 100,
@@ -2702,7 +2707,13 @@ test('imported rows rank by realized profit, then win rate, then trades', async 
     ],
     rules
   );
-  assert.deepEqual(qualified.map((c) => c.address), ['Ar2Y', 'DZbg', 'Gsuc', 'BEvw']);
+  // Ar2Y still leads — it is top on all three dimensions, so no weighting
+  // changes that. Below it the order is NOT the profit order. BEvw ranks
+  // second on the SMALLEST P&L of the four, purely on win rate; Gsuc ranks
+  // last on the second-largest, because it is bottom on win rate and win rate
+  // carries 40%. Under the old profit-primary sort this read
+  // Ar2Y, DZbg, Gsuc, BEvw — the exact reverse for the lower three.
+  assert.deepEqual(qualified.map((c) => c.address), ['Ar2Y', 'BEvw', 'DZbg', 'Gsuc']);
 
   // Rules 4 and 5 are WAIVED for provider rows — none of these has any onChain
   // data, and under the observe path that is an automatic failure.
@@ -2742,12 +2753,22 @@ test('#1 follows the data, not the wallet — ranking is not pinned', async () =
   );
   assert.equal(now.qualified[0].address, 'Ar2Y');
 
-  // Give DZbg a larger figure and it takes #1 with no code change. Nothing
-  // about the ordering is attached to an address — if it were, a wallet whose
-  // record decayed would keep a rank it no longer earns, which is the exact
-  // failure a "permanently crowns X" ranking would produce.
-  const later = applyEliteRules(
+  // ── PROFIT ALONE NO LONGER BUYS #1 ─────────────────────────────────────
+  // Six times Ar2Y's profit is not enough on its own: DZbg still loses on win
+  // rate AND volume, so it scores 0.4 against 0.6. That is the composite
+  // working as specified — under a profit-primary sort this flipped the list.
+  const richerOnly = applyEliteRules(
     [row('Ar2Y', 1_500_000, 61.84, 12237), row('DZbg', 9_000_000, 46, 179)],
+    rules
+  );
+  assert.equal(richerOnly.qualified[0].address, 'Ar2Y');
+
+  // Nothing is attached to an ADDRESS, which is what this test exists for: win
+  // the dimensions and #1 changes hands with no code change. If rank were
+  // pinned, a wallet whose record decayed would keep a place it no longer
+  // earns.
+  const later = applyEliteRules(
+    [row('Ar2Y', 1_500_000, 61.84, 12237), row('DZbg', 9_000_000, 70, 20000)],
     rules
   );
   assert.equal(later.qualified[0].address, 'DZbg');
@@ -5197,6 +5218,99 @@ const whaleFile = {
 /* ------------------------------------------------------------------ *
  * Multi-wallet tracking and the whale cluster signal
  * ------------------------------------------------------------------ */
+
+test('the composite normalises first, or the weights are decoration', async () => {
+  const { compositeScore, compositeBounds, normaliseDimension, rankByComposite, COMPOSITE_WEIGHTS } =
+    await import('../auto_top_whales.mjs');
+
+  // ── THE RAW FORMULA IS A PROFIT SORT IN DISGUISE ────────────────────────
+  // The three inputs are incommensurable: win rate runs 0-100, profit to
+  // 1,500,000, volume to 12,237. MEASURED on the real watchlist, adding them
+  // raw at 40/40/20 gives the top wallet win rate 0.0041% of its score and
+  // profit 99.59% — so a wallet could win 5% of its trades and still rank
+  // first. Normalising to 0..1 first is what makes 40/40/20 mean anything.
+  const rows = [
+    { address: 'HIGH_WR', winRatePct: 90, netProfitUsd: 100, lifetimeTrades: 100 },
+    { address: 'HIGH_PROFIT', winRatePct: 10, netProfitUsd: 1_500_000, lifetimeTrades: 100 },
+  ];
+  const bounds = compositeBounds(rows);
+  const wr = compositeScore(rows[0], { bounds });
+  const pf = compositeScore(rows[1], { bounds });
+
+  // Each maxes exactly one 0.40 dimension and ties on volume, so they SCORE
+  // THE SAME. Under the raw formula the profit wallet wins by ~600,000 to 24.
+  assert.ok(Math.abs(wr.score - pf.score) < 1e-9, `expected a tie, got ${wr.score} vs ${pf.score}`);
+  assert.equal(wr.parts.winRate, 1);
+  assert.equal(wr.parts.profit, 0);
+  assert.equal(pf.parts.profit, 1);
+  assert.deepEqual(COMPOSITE_WEIGHTS, { winRate: 0.40, profit: 0.40, volume: 0.20 });
+
+  // A dimension where every candidate ties cannot separate them, so it scores
+  // 1 rather than 0 — scoring 0 would make a lone candidate, or a set that
+  // agrees, look like a failure where nothing is wrong.
+  assert.equal(normaliseDimension(5, { min: 5, max: 5 }), 1);
+  assert.equal(normaliseDimension(50, { min: 0, max: 100 }), 0.5);
+  assert.equal(normaliseDimension(null, { min: 0, max: 100 }), 0, 'missing is not average');
+  // Negative profit normalises rather than breaking the range.
+  assert.equal(normaliseDimension(-100, { min: -100, max: 100 }), 0);
+
+  // ── EXPLICIT RANK ───────────────────────────────────────────────────────
+  const ranked = rankByComposite(rows);
+  assert.deepEqual(ranked.map((r) => r.rank), [1, 2], 'ranks are 1-based and contiguous');
+  assert.ok(ranked.every((r) => typeof r.compositeScore === 'number'));
+
+  // Fast-tracked wallets keep precedence: they were admitted for catching
+  // mega-runners and were never judged on a win rate, so scoring them against
+  // one would rank them on the number the fast-track exists to ignore.
+  const withHunter = rankByComposite([
+    { address: 'BEST_SCORE', winRatePct: 99, netProfitUsd: 9_000_000, lifetimeTrades: 99_000 },
+    { address: 'HUNTER', winRatePct: 5, netProfitUsd: 1, lifetimeTrades: 1, fastTracked: true },
+  ]);
+  assert.equal(withHunter[0].address, 'HUNTER');
+  assert.equal(withHunter[0].rank, 1);
+});
+
+test('rank breaks same-block ties without ever reordering time', async () => {
+  const { orderByRank, rankLookup } = await PC();
+  const rankOf = rankLookup({ wallets: [
+    { address: 'W1', rank: 1 }, { address: 'W2', rank: 2 }, { address: 'W3', rank: 3 },
+  ] });
+
+  // ── CHRONOLOGY LEADS, ALWAYS ────────────────────────────────────────────
+  // The engine interleaves buys and sells in time order. Sorting by rank first
+  // would let a rank-1 SELL process before the rank-3 BUY that precedes it on
+  // chain — closing a position that was never opened.
+  const mixed = [
+    { wallet: 'W1', kind: 'SELL', blockTime: 300 },
+    { wallet: 'W3', kind: 'BUY', blockTime: 100 },
+  ];
+  assert.deepEqual(orderByRank(mixed, rankOf).map((t) => t.wallet), ['W3', 'W1'],
+    'a rank-1 trade must not jump ahead of an earlier rank-3 trade');
+
+  // Solana stamps blockTime at SECOND granularity, so co-buys inside a block
+  // are indistinguishable in time and something must break the tie
+  // deterministically. Rank is the order the operator approved; without it the
+  // order falls out of socket scheduling and changes between runs.
+  const sameBlock = [
+    { wallet: 'W3', blockTime: 500 }, { wallet: 'W1', blockTime: 500 }, { wallet: 'W2', blockTime: 500 },
+  ];
+  assert.deepEqual(orderByRank(sameBlock, rankOf).map((t) => t.wallet), ['W1', 'W2', 'W3']);
+
+  // An untracked wallet sorts last rather than first — unknown must never
+  // outrank an approved wallet.
+  assert.deepEqual(
+    orderByRank([{ wallet: 'STRANGER', blockTime: 500 }, { wallet: 'W2', blockTime: 500 }], rankOf).map((t) => t.wallet),
+    ['W2', 'STRANGER']
+  );
+
+  // The lookup reads the explicit rank field, falling back to position — the
+  // file's order IS the rank, and anything that re-serialises it renumbers it.
+  const byIndex = rankLookup({ wallets: [{ address: 'A' }, { address: 'B' }] });
+  assert.equal(byIndex('A'), 1);
+  assert.equal(byIndex('B'), 2);
+  assert.equal(byIndex('MISSING'), Infinity);
+  assert.deepEqual(orderByRank([], rankOf), []);
+});
 
 test('the approved target leads the tracked set and is never demoted by a re-rank', async () => {
   const { resolveTargets } = await PC();

@@ -1744,6 +1744,39 @@ export function createWhaleCluster({
  * measured, because a co-buy needs two tracked whales in one mint and this
  * watchlist has produced none yet.
  */
+/**
+ * Order a batch chronologically, breaking ties by whale rank. PURE.
+ *
+ * ── WHY RANK ONLY BREAKS TIES ───────────────────────────────────────────────
+ * Chronology has to lead. The engine interleaves buys and sells in time order,
+ * and a batch sorted by rank first would let a rank-1 SELL be processed before
+ * the rank-3 BUY it precedes on chain — closing a position that had not been
+ * opened yet, or worse, leaving one open that the chain says is closed.
+ *
+ * Rank decides only genuinely simultaneous signals. Two whales acting in the
+ * same block carry the SAME blockTime — Solana stamps at second granularity,
+ * so co-buys within a block are indistinguishable in time — and something has
+ * to break that tie deterministically. Rank is the honest choice: it is the
+ * order the operator approved. Without it the order falls out of socket
+ * scheduling, which is arbitrary and changes between runs.
+ */
+export function orderByRank(trades = [], rankOf = () => Infinity) {
+  return [...trades].sort(
+    (a, b) =>
+      (a.blockTime ?? 0) - (b.blockTime ?? 0) ||
+      (rankOf(a.wallet) ?? Infinity) - (rankOf(b.wallet) ?? Infinity)
+  );
+}
+
+/** address -> rank lookup built from a watchlist. PURE. */
+export function rankLookup(watchlist) {
+  const map = new Map();
+  for (const [i, w] of (watchlist?.wallets ?? []).entries()) {
+    if (w?.address) map.set(w.address, w.rank ?? i + 1);
+  }
+  return (address) => map.get(address) ?? Infinity;
+}
+
 export function createClusterTracker({ windowMs = 180_000, bonus = 25 } = {}) {
   const byMint = new Map();
   return {

@@ -294,6 +294,88 @@ export function rankingWinRate(candidate) {
  * catch runners, not wallets that are near them. Nor does it waive the
  * system-account screen, which runs before any of this.
  */
+export const COMPOSITE_WEIGHTS = { winRate: 0.40, profit: 0.40, volume: 0.20 };
+
+/**
+ * Scale a value into 0..1 against the candidate set's own range. PURE.
+ *
+ * A whole range of zero means every candidate ties on this dimension, so it
+ * cannot separate them — everyone scores 1 rather than 0. Scoring 0 would make
+ * a lone candidate, or a set that happens to agree, look like a failure on a
+ * dimension where nothing is actually wrong.
+ */
+export function normaliseDimension(value, { min, max }) {
+  if (!Number.isFinite(value)) return 0;
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max - min === 0) return 1;
+  return Math.min(1, Math.max(0, (value - min) / (max - min)));
+}
+
+/** The min/max of each scored dimension across a candidate set. PURE. */
+export function compositeBounds(candidates = []) {
+  const pick = (fn) => candidates.map(fn).filter((v) => Number.isFinite(v));
+  const range = (vals) => (vals.length ? { min: Math.min(...vals), max: Math.max(...vals) } : { min: 0, max: 0 });
+  return {
+    winRate: range(pick((c) => rankingWinRate(c))),
+    profit: range(pick((c) => rankingProfitUsd(c))),
+    volume: range(pick((c) => c.lifetimeTrades ?? c.onChain?.trades ?? null)),
+  };
+}
+
+/**
+ * Weighted composite of win rate, profit and volume. PURE.
+ *
+ * ── WHY THE DIMENSIONS ARE NORMALISED FIRST ─────────────────────────────────
+ * The three inputs are in incommensurable units: a win rate runs 0-100, a
+ * profit figure runs to 1,500,000, a trade count to 12,237. Adding them raw
+ * makes the largest unit the only one that matters. MEASURED on this exact
+ * watchlist, a raw (wr*0.40)+(profit*0.40)+(volume*0.20) gives the top wallet:
+ *
+ *   win rate 0.0041%   ·   profit 99.59%   ·   volume 0.41%
+ *
+ * That is a pure profit sort wearing a 40/40/20 label — the win-rate weight
+ * changes nothing at four decimal places, so a wallet could win 5% of its
+ * trades and still rank first on profit alone.
+ *
+ * Scaling each dimension to 0..1 against the candidate set's own range makes
+ * the weights mean what they say. The trade-off is that the score becomes
+ * RELATIVE: it ranks a set against itself and carries no meaning across runs,
+ * which is correct for choosing a top five and wrong for tracking a wallet's
+ * quality over time. It is a sort key, not a metric.
+ */
+export function compositeScore(candidate, { bounds, weights = COMPOSITE_WEIGHTS } = {}) {
+  const b = bounds ?? compositeBounds([candidate]);
+  const wr = normaliseDimension(rankingWinRate(candidate), b.winRate);
+  const pf = normaliseDimension(rankingProfitUsd(candidate), b.profit);
+  const vol = normaliseDimension(candidate?.lifetimeTrades ?? candidate?.onChain?.trades ?? null, b.volume);
+  return {
+    score: wr * weights.winRate + pf * weights.profit + vol * weights.volume,
+    parts: { winRate: wr, profit: pf, volume: vol },
+  };
+}
+
+/**
+ * Order candidates by composite score and stamp an explicit rank. PURE.
+ *
+ * Fast-tracked wallets keep their precedence: they were admitted for catching
+ * mega-runners early and were never judged on a win rate, so scoring them
+ * against one would rank them on a number they are exempt from.
+ */
+export function rankByComposite(candidates = [], { weights = COMPOSITE_WEIGHTS } = {}) {
+  const bounds = compositeBounds(candidates);
+  return candidates
+    .map((c) => {
+      const { score, parts } = compositeScore(c, { bounds, weights });
+      return { ...c, compositeScore: score, compositeParts: parts };
+    })
+    .sort(
+      (a, b) =>
+        Number(b.fastTracked ?? false) - Number(a.fastTracked ?? false) ||
+        b.compositeScore - a.compositeScore ||
+        (rankingProfitUsd(b) ?? -Infinity) - (rankingProfitUsd(a) ?? -Infinity)
+    )
+    .map((c, i) => ({ ...c, rank: i + 1 }));
+}
+
 export function applyEliteRules(candidates, rules = ELITE_RULES) {
   // Rule 2 is a LIFETIME metric. Observation cannot produce it: Aegis sees a
   // wallet's buys only on the tokens it happened to scan, over a window of
@@ -391,8 +473,15 @@ export function applyEliteRules(candidates, rules = ELITE_RULES) {
     return { ...c, checks, fastTracked, qualified: Object.values(checks).every(Boolean) };
   });
 
-  const qualified = evaluated
-    .filter((c) => c.qualified)
+  // ── COMPOSITE RANKING ─────────────────────────────────────────────────────
+  // Scored on normalised win rate, profit and volume at 40/40/20 — see
+  // compositeScore for why the dimensions are scaled before weighting, and what
+  // the raw form does instead. The chain below remains as the tie-break, so a
+  // set that ties on composite still orders deterministically rather than
+  // arbitrarily.
+  const scored = rankByComposite(evaluated.filter((c) => c.qualified));
+
+  const qualified = scored
     .sort(
       (a, b) =>
         // Alpha Hunters lead, then most mega-runners caught. They are on the
@@ -401,6 +490,7 @@ export function applyEliteRules(candidates, rules = ELITE_RULES) {
         // fast-track exists to ignore.
         Number(b.fastTracked ?? false) - Number(a.fastTracked ?? false) ||
         (b.megaWinCount ?? 0) - (a.megaWinCount ?? 0) ||
+        (b.compositeScore ?? 0) - (a.compositeScore ?? 0) ||
         // LIFETIME USD PROFIT is the primary sort for everyone else.
         (rankingProfitUsd(b) ?? -Infinity) - (rankingProfitUsd(a) ?? -Infinity) ||
         // Then the true win rate: GMGN's career figure where one exists, the
@@ -524,6 +614,24 @@ export function buildWatchlist(qualified, { source, rules }) {
     wallets: qualified.map((w, i) => {
       const entry = {
         address: w.address,
+        // Explicit rank, written because the file's ORDER is the rank and an
+        // order is easy to lose: anything that filters, merges or re-serialises
+        // the list silently renumbers it. Execution precedence reads this
+        // field, not the array index.
+        rank: i + 1,
+        ...(typeof w.compositeScore === 'number'
+          ? {
+              composite_score: Number(w.compositeScore.toFixed(4)),
+              // The parts, because a single scalar cannot be argued with. A
+              // wallet ranked first on volume alone should be visibly ranked
+              // first on volume alone.
+              composite_parts: {
+                win_rate: Number((w.compositeParts?.winRate ?? 0).toFixed(3)),
+                profit: Number((w.compositeParts?.profit ?? 0).toFixed(3)),
+                volume: Number((w.compositeParts?.volume ?? 0).toFixed(3)),
+              },
+            }
+          : {}),
         // Sample size in the label, not a profit figure. When profit is skipped
         // the number is an artifact of observed spend (often single dollars) and
         // putting it next to "Elite Whale" reads as a credential it has not
