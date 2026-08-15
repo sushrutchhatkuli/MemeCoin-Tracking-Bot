@@ -793,11 +793,36 @@
     "enabled": false,
     "cooldownSeconds": 300,
     "endpoints": [
-      { "label": "ankr", "url": "https://rpc.ankr.com/solana", "enabled": false, "verified": false },
-      { "label": "solana-foundation", "url": "https://api.mainnet-beta.solana.com", "enabled": false, "verified": false },
-      { "label": "drpc", "url": "https://solana.drpc.org", "enabled": false, "verified": false },
-      { "label": "publicnode", "url": "https://solana-rpc.publicnode.com", "enabled": false, "verified": false },
-      { "label": "quicknode", "url": "PASTE_YOUR_QUICKNODE_URL_HERE", "enabled": false, "verified": false }
+      {
+        "label": "ankr",
+        "url": "https://rpc.ankr.com/solana",
+        "enabled": false,
+        "verified": false
+      },
+      {
+        "label": "solana-foundation",
+        "url": "https://api.mainnet-beta.solana.com",
+        "enabled": false,
+        "verified": false
+      },
+      {
+        "label": "drpc",
+        "url": "https://solana.drpc.org",
+        "enabled": false,
+        "verified": false
+      },
+      {
+        "label": "publicnode",
+        "url": "https://solana-rpc.publicnode.com",
+        "enabled": false,
+        "verified": false
+      },
+      {
+        "label": "quicknode",
+        "url": "PASTE_YOUR_QUICKNODE_URL_HERE",
+        "enabled": false,
+        "verified": false
+      }
     ]
   },
   "jitoTips": {
@@ -846,7 +871,7 @@
       "Set false to use the pinned list only and make no third-party call."
     ],
     "enabled": true,
-    "minTipSolForBonus": 1.0,
+    "minTipSolForBonus": 1,
     "scoreBoost": 15,
     "launchWindowSeconds": 300,
     "maxSignatureLookups": 12,
@@ -1130,8 +1155,8 @@
       "hours ago is not a signal to enter now — it would buy a different token",
       "at a different price than the whale did, which is not a copy of anything."
     ],
-    "budgetSol": 10.0,
-    "perTradeSol": 1.0,
+    "budgetSol": 10,
+    "perTradeSol": 1,
     "_capacityNote": [
       "maxOpenPositions raised 6 -> 50 on 2026-08-13. AUDITED against chain at",
       "6: the book sat at 6/6 with 0 free balance for most of a run, mirrored 8",
@@ -1155,8 +1180,14 @@
     "maxOpenPositions": 50,
     "copyImpactPct": 0,
     "takeProfit": [
-      { "gainPct": 100, "sellFraction": 0.5 },
-      { "gainPct": 200, "sellFraction": 0.5 }
+      {
+        "gainPct": 100,
+        "sellFraction": 0.5
+      },
+      {
+        "gainPct": 200,
+        "sellFraction": 0.5
+      }
     ],
     "trailingStopPct": 30,
     "hardStopPct": 40,
@@ -1278,11 +1309,18 @@
       ],
       "enabled": true,
       "path": "../leaderboard.csv",
-      "requireColumns": ["address", "wallet", "walletaddress", "account", "owner", "trader"]
+      "requireColumns": [
+        "address",
+        "wallet",
+        "walletaddress",
+        "account",
+        "owner",
+        "trader"
+      ]
     },
-    "minWinRatePct":40,
-    "minNetProfitUsd": 100,
-    "minLifetimeTrades": 100,
+    "minWinRatePct": 30,
+    "minNetProfitUsd": 1000,
+    "minLifetimeTrades": 10,
     "topN": 50,
     "enrichShortlistCap": 200,
     "_enrichShortlistCapNote": [
@@ -1305,7 +1343,7 @@
       "the SECOND screening pass, which runs over the ranked finalists and is",
       "bounded by topN rather than by this cap."
     ],
-    "minAllTimeWinRatePct":40,
+    "minAllTimeWinRatePct": 40,
     "minAllTimeTrades": 50,
     "_minAllTimeTradesNote": [
       "RULE 4's SAMPLE FLOOR — the minimum number of CLOSED ROUND TRIPS a wallet",
@@ -1354,7 +1392,7 @@
       "fewer closed trades than it really has and can fail this floor on the page",
       "cap rather than on its record. all_time_complete false marks those."
     ],
-    "minAllTimeNetSol": 1.0,
+    "minAllTimeNetSol": 1,
     "alphaHunterMegaWins": 2,
     "alphaHunterMinMultiplier": 50,
     "alphaHunterMaxMultiplier": 500,
@@ -1510,7 +1548,7 @@
       "crediting one would fast-track a wallet on an artifact."
     ],
     "maxHistoryPages": 12,
-    "maxOnChainReplays": 40,
+    "maxOnChainReplays": 300,
     "historyCacheTtlHours": 24,
     "maxCacheEntries": 500,
     "maxCacheAgeDays": 30,
@@ -1618,10 +1656,26 @@
       "maxMarketCapUsd to 1000000 to close the upper gap."
     ],
     "walletProfiles": [
-      { "label": "GMGN", "url": "https://gmgn.ai/sol/address/{wallet}", "enabled": true },
-      { "label": "Solscan", "url": "https://solscan.io/account/{wallet}", "enabled": true },
-      { "label": "Birdeye", "url": "https://birdeye.so/profile/{wallet}", "enabled": true },
-      { "label": "MEME Terminal", "url": "https://memeterminal.com/solana/wallet/{wallet}", "enabled": false }
+      {
+        "label": "GMGN",
+        "url": "https://gmgn.ai/sol/address/{wallet}",
+        "enabled": true
+      },
+      {
+        "label": "Solscan",
+        "url": "https://solscan.io/account/{wallet}",
+        "enabled": true
+      },
+      {
+        "label": "Birdeye",
+        "url": "https://birdeye.so/profile/{wallet}",
+        "enabled": true
+      },
+      {
+        "label": "MEME Terminal",
+        "url": "https://memeterminal.com/solana/wallet/{wallet}",
+        "enabled": false
+      }
     ],
     "_walletProfilesNote": [
       "One-tap profile destinations, rendered for EVERY wallet in /whales, the",
@@ -1807,8 +1861,14 @@
       ],
       "enabled": true,
       "tiers": [
-        { "peakGainPct": 50, "lockGainPct": 20 },
-        { "peakGainPct": 100, "lockGainPct": 60 }
+        {
+          "peakGainPct": 50,
+          "lockGainPct": 20
+        },
+        {
+          "peakGainPct": 100,
+          "lockGainPct": 60
+        }
       ]
     },
     "_stopLossByCategoryNote": [
@@ -2081,9 +2141,24 @@
       "'0.01 SOL' with a straight face."
     ],
     "ladder": [
-      { "minScore": 90, "maxScore": 100, "sol": 2.0, "label": "HEAVY CONVICTION" },
-      { "minScore": 75, "maxScore": 89, "sol": 0.75, "label": "Standard Entry" },
-      { "minScore": 68, "maxScore": 74, "sol": 0.25, "label": "Light Scalp" }
+      {
+        "minScore": 90,
+        "maxScore": 100,
+        "sol": 2,
+        "label": "HEAVY CONVICTION"
+      },
+      {
+        "minScore": 75,
+        "maxScore": 89,
+        "sol": 0.75,
+        "label": "Standard Entry"
+      },
+      {
+        "minScore": 68,
+        "maxScore": 74,
+        "sol": 0.25,
+        "label": "Light Scalp"
+      }
     ]
   },
   "quotaSentinel": {

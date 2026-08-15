@@ -4,10 +4,10 @@
     "the next sync. Add hand-picked wallets to a separate file instead.",
     "",
     "Source: import:leaderboard.csv",
-    "Generated: 2026-08-12T08:26:50.126Z",
-    "Rules applied: win rate >= 40% over >= 3 graded buys,",
-    "net profit >= $100,",
-    "on-chain activity >= 100 signatures.",
+    "Generated: 2026-08-15T22:19:32.664Z",
+    "Rules applied: win rate >= 30% over >= 3 graded buys,",
+    "net profit >= $1,000,",
+    "on-chain activity >= 10 signatures.",
     "TRUE ON-CHAIN win rate >= 40% over >= 50 closed round trips.",
     "REALIZED net SOL > 1 over the replayed window (strictly greater; unmeasured counts as a failure).",
     "",
@@ -41,10 +41,10 @@
     "figures describe the most recent swaps rather than the whole career."
   ],
   "generated": {
-    "at": "2026-08-12T08:26:50.127Z",
+    "at": "2026-08-15T22:19:32.667Z",
     "source": "import:leaderboard.csv",
     "profitRuleSkipped": false,
-    "count": 4
+    "count": 5
   },
   "wallets": [
     {
@@ -56,7 +56,7 @@
       "onchain_signatures": 12237,
       "solscan": "https://solscan.io/account/Ar2Y6o1QmrRAskjii1cRfijeKugHH13ycxW5cd7rro1x",
       "source": "imported-leaderboard",
-      "stats_updated": "2026-08-12",
+      "stats_updated": "2026-08-15",
       "metrics_basis": "imported from leaderboard.csv",
       "enabled": true,
       "net_profit_usd": "+$1500k"
@@ -70,38 +70,52 @@
       "onchain_signatures": 179,
       "solscan": "https://solscan.io/account/DZbgq3yE3r41EFszV3XastvyS8j8QnmNT37nsq7sxR66",
       "source": "imported-leaderboard",
-      "stats_updated": "2026-08-12",
+      "stats_updated": "2026-08-15",
       "metrics_basis": "imported from leaderboard.csv",
       "enabled": true,
       "net_profit_usd": "+$25k"
     },
     {
       "address": "GsuchvzRPSiSFSvx2QUEzkxVhGemppuZaTzkhcjxiv8L",
-      "label": "Elite Whale #3 (43% WR | +$17k)",
-      "win_rate": "43%",
+      "label": "Elite Whale #3 (42% WR | +$4k)",
+      "win_rate": "42%",
       "graded_buys": null,
-      "all_time_net_profit_usd": "+$17k",
-      "onchain_signatures": 405,
+      "all_time_net_profit_usd": "+$4k",
+      "onchain_signatures": 131,
       "solscan": "https://solscan.io/account/GsuchvzRPSiSFSvx2QUEzkxVhGemppuZaTzkhcjxiv8L",
       "source": "imported-leaderboard",
-      "stats_updated": "2026-08-12",
+      "stats_updated": "2026-08-15",
       "metrics_basis": "imported from leaderboard.csv",
       "enabled": true,
-      "net_profit_usd": "+$17k"
+      "net_profit_usd": "+$4k"
     },
     {
-      "address": "BEvw9mQbfQwbnQKy4XJQuxDbADuJMAhKaUVtdjj4fz8N",
-      "label": "Elite Whale #4 (50% WR | +$14k)",
-      "win_rate": "50%",
+      "address": "8zkgFGVZrDLieViwqiXFCydSX6WL5hsxmUu55yBdsNsZ",
+      "label": "Elite Whale #4 (48% WR | +$4k)",
+      "win_rate": "48%",
       "graded_buys": null,
-      "all_time_net_profit_usd": "+$14k",
-      "onchain_signatures": 132,
-      "solscan": "https://solscan.io/account/BEvw9mQbfQwbnQKy4XJQuxDbADuJMAhKaUVtdjj4fz8N",
+      "all_time_net_profit_usd": "+$4k",
+      "onchain_signatures": 211,
+      "solscan": "https://solscan.io/account/8zkgFGVZrDLieViwqiXFCydSX6WL5hsxmUu55yBdsNsZ",
       "source": "imported-leaderboard",
-      "stats_updated": "2026-08-12",
+      "stats_updated": "2026-08-15",
       "metrics_basis": "imported from leaderboard.csv",
       "enabled": true,
-      "net_profit_usd": "+$14k"
+      "net_profit_usd": "+$4k"
+    },
+    {
+      "address": "kEFiAX3jo5NmemysQov342TZ9mGh6yp92GDRjhA8XDf",
+      "label": "Elite Whale #5 (57% WR | +$2k)",
+      "win_rate": "57%",
+      "graded_buys": null,
+      "all_time_net_profit_usd": "+$2k",
+      "onchain_signatures": 84,
+      "solscan": "https://solscan.io/account/kEFiAX3jo5NmemysQov342TZ9mGh6yp92GDRjhA8XDf",
+      "source": "imported-leaderboard",
+      "stats_updated": "2026-08-15",
+      "metrics_basis": "imported from leaderboard.csv",
+      "enabled": true,
+      "net_profit_usd": "+$2k"
     }
   ]
 }
