@@ -64,7 +64,10 @@ import {
   loadBook,
   createBook,
   resolveTarget,
+  resolveTargets,
   createWhaleSocket,
+  createWhaleCluster,
+  createClusterTracker,
   fetchWhaleTrades,
   fetchLatestSignature,
   fetchSolUsd,
@@ -2830,8 +2833,33 @@ export async function main(argv = []) {
     return;
   }
 
-  const socket = createWhaleSocket({ wallet: target.address, rpcUrl, cfg: config.rpcMirror ?? {}, log: () => {} });
+  // ── MULTI-WALLET TRACKING ────────────────────────────────────────────────
+  // One subscription per wallet: logsSubscribe filters on `mentions`, which
+  // takes a single address, so five whales is five sockets. The approved
+  // target leads the list and stays the one this book MIRRORS — the others are
+  // watched for the cluster signal, not copied. Copying five wallets at once
+  // would multiply exposure fivefold against caps sized for one.
+  const trackIdx = argv.indexOf('--track');
+  const trackLimit = trackIdx !== -1 ? Math.max(1, Number(argv[trackIdx + 1]) || 5) : 5;
+  const tracking = resolveTargets(watchlist, paperBook, { limit: trackLimit });
+  const cluster = createWhaleCluster({
+    wallets: tracking.targets,
+    rpcUrl,
+    cfg: config.rpcMirror ?? {},
+    log: () => {},
+  });
+  const clusterTracker = createClusterTracker({
+    windowMs: (config.live?.clusterWindowMinutes ?? 3) * 60_000,
+    bonus: config.live?.clusterConvictionBonus ?? 25,
+  });
+  const socket = cluster;
+
   book.lastSignature = (await fetchLatestSignature({ wallet: target.address, rpcUrl })).signature ?? null;
+  console.log(`  tracking      ${cluster.size} wallet(s) — ${tracking.reason}`);
+  for (const [i, t] of tracking.targets.entries()) {
+    console.log(`     ${i + 1}. ${t.address.slice(0, 16)}…${i === 0 ? '  ← MIRRORED' : '  (cluster signal only)'}`);
+  }
+  console.log(`  cluster       +${clusterTracker ? (config.live?.clusterConvictionBonus ?? 25) : 0} conviction when 2+ co-buy within ${config.live?.clusterWindowMinutes ?? 3}m`);
   console.log(`\n  watching every ${intervalSec}s — Ctrl+C to stop\n`);
 
   // SIGINT (Ctrl+C) works everywhere. SIGTERM is registered for Linux and
@@ -2861,8 +2889,40 @@ export async function main(argv = []) {
     const live = socket.isConnected()
       ? await socket.drain()
       : await fetchWhaleTrades({ wallet: target.address, rpcUrl, sinceSignature: book.lastSignature });
-    if (live.ok && live.newestSignature) book.lastSignature = live.newestSignature;
-    if (live.ok && live.trades.length) await handle(live.trades);
+    // The cluster drain returns per-wallet cursors; the single-wallet fallback
+    // returns one. Only the MIRRORED wallet's cursor advances the book.
+    if (live.ok && live.cursors?.[target.address]) book.lastSignature = live.cursors[target.address];
+    else if (live.ok && live.newestSignature) book.lastSignature = live.newestSignature;
+
+    if (live.ok && live.trades.length) {
+      // ── CLUSTER SIGNAL ────────────────────────────────────────────────────
+      // Every tracked wallet's buys feed the tracker; only the mirrored
+      // wallet's trades are acted on. A co-buy is reported rather than sized
+      // into, because nothing here has measured what a cluster is worth — and
+      // this codebase has already paid once for trading on an unmeasured
+      // number (copyImpactPct 9, true value -8.9%).
+      for (const t of live.trades) {
+        if (t.kind !== 'BUY') continue;
+        const c = clusterTracker.record({
+          mint: t.mint,
+          wallet: t.wallet ?? target.address,
+          at: (t.blockTime ?? 0) * 1000 || Date.now(),
+        });
+        if (c.cluster) {
+          console.log(
+            `  ★ WHALE CLUSTER  ${formatTicker(null, t.mint)}  ${c.wallets.length} whales co-bought ` +
+              `within ${(c.windowMs / 60_000).toFixed(0)}m  → +${c.convictionBonus} conviction`
+          );
+          for (const w of c.wallets) console.log(`      ${w.slice(0, 16)}…`);
+        }
+      }
+      clusterTracker.prune();
+
+      // Only the mirrored wallet's trades reach the book. Acting on all five
+      // would multiply exposure fivefold against caps sized for one.
+      const mine = live.trades.filter((t) => !t.wallet || t.wallet === target.address);
+      if (mine.length) await handle(mine);
+    }
   }
 }
 

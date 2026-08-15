@@ -5194,6 +5194,214 @@ const whaleFile = {
   ],
 };
 
+/* ------------------------------------------------------------------ *
+ * Multi-wallet tracking and the whale cluster signal
+ * ------------------------------------------------------------------ */
+
+test('the approved target leads the tracked set and is never demoted by a re-rank', async () => {
+  const { resolveTargets } = await PC();
+  const watchlist = { wallets: [
+    { address: 'NEW_NUMBER_ONE', label: 'promoted by the last sync' },
+    { address: 'APPROVED', label: 'operator-approved' },
+    { address: 'THIRD' }, { address: 'FOURTH' },
+    { address: 'OFF', enabled: false },
+    { address: 'FIFTH' }, { address: 'SIXTH' },
+  ] };
+
+  // ── THE PIN SURVIVES THE CLUSTER ────────────────────────────────────────
+  // resolveTarget pins the operator-approved wallet so a re-rank cannot
+  // silently repoint the book. Tracking five must not quietly undo that: with
+  // the approved wallet merely INCLUDED rather than first, every "which whale
+  // is this" readout would name the freshly promoted one instead.
+  const pinned = resolveTargets(watchlist, { target: { address: 'APPROVED' } }, { limit: 5 });
+  assert.equal(pinned.primary.address, 'APPROVED');
+  assert.equal(pinned.targets[0].address, 'APPROVED', 'the approved wallet leads');
+  assert.equal(pinned.targets.length, 5);
+  assert.ok(pinned.targets.some((t) => t.address === 'NEW_NUMBER_ONE'), 'the new #1 is still tracked, just not first');
+  assert.ok(!pinned.targets.some((t) => t.address === 'OFF'), 'disabled wallets are excluded');
+  assert.equal(new Set(pinned.targets.map((t) => t.address)).size, 5, 'no wallet is tracked twice');
+
+  // With no pin, the watchlist order stands.
+  assert.equal(resolveTargets(watchlist, null, { limit: 3 }).targets[0].address, 'NEW_NUMBER_ONE');
+  assert.equal(resolveTargets(watchlist, null, { limit: 3 }).targets.length, 3);
+
+  // Degenerate inputs never produce an empty subscription set silently.
+  assert.deepEqual(resolveTargets({ wallets: [] }).targets, []);
+  assert.equal(resolveTargets(watchlist, null, { limit: 0 }).targets.length, 1, 'a floor of one wallet');
+});
+
+test('one socket per wallet, merged in time order, and one failure blinds only itself', async () => {
+  const { createWhaleCluster } = await PC();
+
+  // logsSubscribe filters on `mentions`, which takes ONE address — there is no
+  // multi-address form, so five whales is five subscriptions.
+  const made = [];
+  const socketFactory = ({ wallet }) => {
+    made.push(wallet);
+    return {
+      isConnected: () => wallet !== 'DEAD',
+      close() { this.closed = true; },
+      drain: async () => {
+        if (wallet === 'THROWS') throw new Error('socket exploded');
+        if (wallet === 'DEAD') return { ok: false, error: 'disconnected', trades: [], newestSignature: null };
+        return {
+          ok: true,
+          newestSignature: `sig-${wallet}`,
+          trades: [{ kind: 'BUY', mint: 'M', blockTime: wallet === 'A' ? 300 : 100 }],
+        };
+      },
+    };
+  };
+
+  const cluster = createWhaleCluster({
+    wallets: [{ address: 'A', label: 'first' }, 'B', 'DEAD', 'THROWS'],
+    rpcUrl: 'https://x', socketFactory,
+  });
+  assert.deepEqual(made, ['A', 'B', 'DEAD', 'THROWS'], 'a subscription per wallet');
+  assert.equal(cluster.size, 4);
+
+  const out = await cluster.drain();
+  assert.equal(out.ok, true, 'a live socket keeps the drain usable');
+
+  // ── ATTRIBUTION IS THE POINT ────────────────────────────────────────────
+  // Without it a merged stream cannot tell two whales buying one mint from one
+  // whale buying it twice, and those mean opposite things.
+  assert.equal(out.trades.length, 2);
+  assert.deepEqual(out.trades.map((t) => t.wallet), ['B', 'A'], 'sorted by blockTime, not by wallet order');
+  assert.equal(out.trades.find((t) => t.wallet === 'A').walletLabel, 'first');
+
+  // Per-wallet cursors, so one wallet's progress never advances another's.
+  assert.equal(out.cursors.A, 'sig-A');
+  assert.equal(out.cursors.B, 'sig-B');
+  assert.equal(out.cursors.DEAD, undefined);
+
+  // A throwing socket is contained — the other three still delivered.
+  assert.ok(out.errors.some((e) => e.wallet === 'THROWS' && /exploded/.test(e.error)));
+  assert.ok(out.errors.some((e) => e.wallet === 'DEAD'));
+
+  // Connected if ANY socket is up; the others still deliver.
+  assert.equal(cluster.isConnected(), true);
+  assert.equal(cluster.connectedCount(), 3);
+  cluster.close();
+});
+
+test('a cluster needs DISTINCT whales, not one whale scaling in', async () => {
+  const { createClusterTracker } = await PC();
+  const t = createClusterTracker({ windowMs: 180_000, bonus: 25 });
+
+  // One whale buying is one wallet's opinion — no signal.
+  assert.deepEqual(
+    t.record({ mint: 'M', wallet: 'W1', at: 0 }),
+    { cluster: false, wallets: ['W1'], convictionBonus: 0, windowMs: 180_000 }
+  );
+
+  // ── SCALING IN IS NOT A CLUSTER ─────────────────────────────────────────
+  // The same whale re-buying fires the buy path repeatedly. Counting those
+  // would turn ordinary position-building into a maximum-conviction signal —
+  // inverting the score's meaning on exactly the trades where it fires most.
+  for (const at of [10_000, 20_000, 30_000]) {
+    const r = t.record({ mint: 'M', wallet: 'W1', at });
+    assert.equal(r.cluster, false, 'one wallet can never form a cluster');
+    assert.equal(r.convictionBonus, 0);
+  }
+
+  // A second, independent whale completes it.
+  const two = t.record({ mint: 'M', wallet: 'W2', at: 60_000 });
+  assert.equal(two.cluster, true);
+  assert.equal(two.convictionBonus, 25);
+  assert.deepEqual(two.wallets.sort(), ['W1', 'W2']);
+
+  // A third confirms but does not scale the bonus — one crowded mint must not
+  // dominate every other signal the scanner produces.
+  assert.equal(t.record({ mint: 'M', wallet: 'W3', at: 70_000 }).convictionBonus, 25);
+
+  // ── THE WINDOW IS REAL ──────────────────────────────────────────────────
+  const late = createClusterTracker({ windowMs: 180_000 });
+  late.record({ mint: 'Z', wallet: 'W1', at: 0 });
+  assert.equal(late.record({ mint: 'Z', wallet: 'W2', at: 179_000 }).cluster, true, 'inside the window');
+
+  const expired = createClusterTracker({ windowMs: 180_000 });
+  expired.record({ mint: 'Z', wallet: 'W1', at: 0 });
+  const out = expired.record({ mint: 'Z', wallet: 'W2', at: 181_000 });
+  assert.equal(out.cluster, false, 'past the window is two unrelated buys, not a cluster');
+  assert.deepEqual(out.wallets, ['W2'], 'the stale entry is dropped, not merely ignored');
+
+  // Different mints never combine.
+  const across = createClusterTracker({});
+  across.record({ mint: 'A', wallet: 'W1', at: 0 });
+  assert.equal(across.record({ mint: 'B', wallet: 'W2', at: 1000 }).cluster, false);
+
+  // Pruning bounds the map rather than letting it grow with every mint seen.
+  const p = createClusterTracker({ windowMs: 1000 });
+  p.record({ mint: 'OLD', wallet: 'W1', at: 0 });
+  p.record({ mint: 'NEW', wallet: 'W1', at: 5000 });
+  assert.equal(p.size, 2);
+  assert.equal(p.prune(5000).dropped, 1);
+  assert.equal(p.size, 1);
+
+  // Junk never becomes a data point.
+  assert.equal(t.record({ mint: null, wallet: 'W1' }).cluster, false);
+  assert.equal(t.record({ mint: 'M', wallet: null }).cluster, false);
+});
+
+test('a promotion proposes a switch and never applies one on its own', async () => {
+  const { switchKeyboard, parseCallbackData, handleSwitchCallback, SWITCH_PREFIX } = await import('../telegram.mjs');
+  const { resolveTarget } = await PC();
+
+  // ── A NEW #1 MUST NOT REPOINT A LIVE BOOK ───────────────────────────────
+  // The sync re-ranks every two hours. If the target followed the watchlist,
+  // a promotion would silently move a running book onto a different wallet
+  // mid-position — closing nothing, holding bags bought on another wallet's
+  // thesis. The approved target is pinned instead.
+  const afterRerank = { wallets: [{ address: 'FRESHLY_PROMOTED' }, { address: 'APPROVED' }] };
+  const r = resolveTarget(afterRerank, { target: { address: 'APPROVED' } });
+  assert.equal(r.target.address, 'APPROVED');
+  assert.equal(r.pinned, true);
+  assert.match(r.reason, /operator-approved/);
+
+  // It repoints ONLY when the approved wallet leaves the watchlist entirely —
+  // at that point there is nothing left to pin to.
+  const gone = resolveTarget({ wallets: [{ address: 'FRESHLY_PROMOTED' }] }, { target: { address: 'APPROVED' } });
+  assert.equal(gone.target.address, 'FRESHLY_PROMOTED');
+  assert.equal(gone.repointed, true);
+
+  // The buttons say what they do.
+  const kb = switchKeyboard('abc123');
+  assert.match(kb.inline_keyboard[0][0].text, /ACCEPT/);
+  assert.match(kb.inline_keyboard[0][1].text, /DENY/);
+  assert.equal(parseCallbackData(kb.inline_keyboard[0][0].callback_data).action, 'APPROVE');
+  assert.equal(parseCallbackData(kb.inline_keyboard[0][1].callback_data).action, 'KEEP');
+
+  // ── DENY LEAVES THE TARGET ALONE ────────────────────────────────────────
+  // A fresh proposal per assertion: handleSwitchCallback marks one resolved and
+  // short-circuits every later press, which is correct — a button pressed twice
+  // must not switch twice — but it means the two paths need separate fixtures.
+  const mkDeps = (store, sink) => ({
+    loadProposals: async () => store,
+    saveProposals: async () => {},
+    setPaperTarget: async (c) => { sink.applied = c?.address ?? c; },
+  });
+
+  const denied = { abc123: { challenger: { address: 'CHALLENGER' }, incumbent: { address: 'APPROVED' } } };
+  const denySink = { applied: null };
+  const deny = await handleSwitchCallback({ data: `${SWITCH_PREFIX}:k:abc123`, deps: mkDeps(denied, denySink) });
+  assert.equal(deny.action, 'KEEP');
+  assert.equal(denySink.applied, null, 'DENY must not move the target');
+  assert.equal(denied.abc123.resolved, 'KEEP', 'and the proposal is closed so it cannot be pressed again');
+
+  // ACCEPT is the only path that changes it.
+  const accepted = { abc123: { challenger: { address: 'CHALLENGER' }, incumbent: { address: 'APPROVED' } } };
+  const acceptSink = { applied: null };
+  const ok = await handleSwitchCallback({ data: `${SWITCH_PREFIX}:a:abc123`, deps: mkDeps(accepted, acceptSink) });
+  assert.equal(ok.action, 'APPROVE');
+  assert.equal(acceptSink.applied, 'CHALLENGER', 'only an explicit ACCEPT repoints the book');
+
+  // A second press of an answered proposal is refused rather than re-applied.
+  const twice = await handleSwitchCallback({ data: `${SWITCH_PREFIX}:a:abc123`, deps: mkDeps(accepted, acceptSink) });
+  assert.equal(twice.ok, false);
+  assert.match(twice.answer, /Already/);
+});
+
 test('GMGN figures reach the watchlist file and the alert, attributed as the provider’s', async () => {
   const { buildWatchlist, ELITE_RULES } = await import('../auto_top_whales.mjs');
 
@@ -6354,8 +6562,8 @@ test('callback data is parsed strictly and round-trips the keyboard', async () =
   const id = proposalId('SomeWalletAddress', 1234);
   const kb = switchKeyboard(id);
   const [approve, keep] = kb.inline_keyboard[0];
-  assert.match(approve.text, /APPROVE SWITCH/);
-  assert.match(keep.text, /KEEP CURRENT/);
+  assert.match(approve.text, /ACCEPT/);
+  assert.match(keep.text, /DENY/);
 
   // Telegram caps callback_data at 64 BYTES — an address would not leave room
   // for anything else, which is why an id is used.

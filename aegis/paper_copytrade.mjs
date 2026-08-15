@@ -1627,6 +1627,161 @@ export function detectConcurrentWriter(book, { pid = process.pid, now = Date.now
  * The batch helper already keeps the deepest-liquidity pair per token, so
  * there is no venue selection to redo here.
  */
+/**
+ * The top N enabled wallets to track at once. PURE.
+ *
+ * ── THE APPROVED TARGET IS ALWAYS FIRST, NEVER MERELY INCLUDED ──────────────
+ * resolveTarget pins the operator-approved wallet so a re-rank cannot silently
+ * repoint the book. Tracking a cluster must not quietly undo that: the pinned
+ * wallet leads the list, and the rest fill in behind it. Without this a sync
+ * that promoted a new #1 would leave the approved wallet tracked but demoted,
+ * and every "which whale is this" readout would name the wrong one.
+ */
+export function resolveTargets(watchlist, book = null, { limit = 5 } = {}) {
+  const enabled = (watchlist?.wallets ?? []).filter((w) => w?.address && w.enabled !== false);
+  if (!enabled.length) return { targets: [], primary: null, reason: 'watchlist is empty' };
+
+  const primary = resolveTarget(watchlist, book).target;
+  const ordered = primary
+    ? [
+        ...enabled.filter((w) => w.address === primary.address),
+        ...enabled.filter((w) => w.address !== primary.address),
+      ]
+    : enabled;
+
+  return {
+    targets: ordered.slice(0, Math.max(1, limit)).map((w) => ({ address: w.address, label: w.label ?? null })),
+    primary,
+    reason: `tracking ${Math.min(ordered.length, limit)} of ${enabled.length} enabled`,
+  };
+}
+
+/**
+ * One socket per tracked wallet, drained as a single ordered stream.
+ *
+ * ── WHY N SOCKETS AND NOT ONE SUBSCRIPTION ──────────────────────────────────
+ * logsSubscribe filters on `mentions`, which takes a single address. There is
+ * no multi-address form, so tracking five wallets is five subscriptions. They
+ * are independent by design: one wallet's socket dying must not blind the other
+ * four, which a shared connection would.
+ *
+ * Trades carry the wallet that made them. Without attribution a merged stream
+ * is unusable — the cluster signal cannot tell two whales buying one mint from
+ * one whale buying it twice, and those mean opposite things.
+ *
+ * Drains run CONCURRENTLY and the merged result is sorted by block time, so a
+ * slow socket delays only itself. Order matters downstream: the paper engine
+ * interleaves buys and sells chronologically, and a batch out of order can
+ * close a position before the buy that opened it.
+ */
+export function createWhaleCluster({
+  wallets = [],
+  rpcUrl,
+  cfg = {},
+  log = () => {},
+  socketFactory = createWhaleSocket,
+} = {}) {
+  const sockets = wallets.map((w) => {
+    const address = typeof w === 'string' ? w : w.address;
+    return { address, label: typeof w === 'string' ? null : (w.label ?? null), socket: socketFactory({ wallet: address, rpcUrl, cfg, log }) };
+  });
+
+  return {
+    size: sockets.length,
+    wallets: sockets.map((s) => s.address),
+    /** Connected if ANY socket is up — the others still deliver. */
+    isConnected: () => sockets.some((s) => s.socket.isConnected?.()),
+    connectedCount: () => sockets.filter((s) => s.socket.isConnected?.()).length,
+    async drain() {
+      const results = await Promise.all(
+        sockets.map(async (s) => {
+          try {
+            const r = await s.socket.drain();
+            return { ...r, address: s.address, label: s.label };
+          } catch (err) {
+            // One socket throwing must not lose the other four's trades.
+            return { ok: false, error: err?.message ?? String(err), trades: [], address: s.address };
+          }
+        })
+      );
+      const trades = [];
+      const cursors = {};
+      for (const r of results) {
+        if (r.newestSignature) cursors[r.address] = r.newestSignature;
+        for (const t of r.trades ?? []) trades.push({ ...t, wallet: r.address, walletLabel: r.label ?? null });
+      }
+      trades.sort((a, b) => (a.blockTime ?? 0) - (b.blockTime ?? 0));
+      return {
+        ok: results.some((r) => r.ok),
+        trades,
+        cursors,
+        errors: results.filter((r) => !r.ok).map((r) => ({ wallet: r.address, error: r.error })),
+      };
+    },
+    close() {
+      for (const s of sockets) s.socket.close?.();
+    },
+  };
+}
+
+/**
+ * Detects two or more tracked whales buying the same mint in a short window.
+ *
+ * ── WHY CO-BUYING IS WORTH A SCORE AT ALL ───────────────────────────────────
+ * One whale buying is one wallet's opinion. Two independent whales arriving at
+ * the same token within minutes is the same opinion reached twice, and that is
+ * a different kind of evidence — it is the one signal available here that is
+ * not just a louder version of "the target bought".
+ *
+ * DISTINCT WALLETS ONLY. The same whale scaling into a position fires the buy
+ * path repeatedly, and counting those as a cluster would turn ordinary
+ * position-building into a maximum-conviction signal — inverting the meaning of
+ * the score on exactly the trades where it fires most often.
+ *
+ * The window is a genuine judgement call and worth stating: three minutes is
+ * long enough for a second whale to see and act on the same setup, short enough
+ * that two unrelated buys of a popular token rarely coincide. It is not
+ * measured, because a co-buy needs two tracked whales in one mint and this
+ * watchlist has produced none yet.
+ */
+export function createClusterTracker({ windowMs = 180_000, bonus = 25 } = {}) {
+  const byMint = new Map();
+  return {
+    /** Record a buy and report whether it completes a cluster. */
+    record({ mint, wallet, at = Date.now() }) {
+      if (!mint || !wallet) return { cluster: false, wallets: [], convictionBonus: 0 };
+      const seen = (byMint.get(mint) ?? []).filter((e) => at - e.at <= windowMs);
+      const existing = seen.find((e) => e.wallet === wallet);
+      if (existing) existing.at = at;
+      else seen.push({ wallet, at });
+      byMint.set(mint, seen);
+
+      const distinct = [...new Set(seen.map((e) => e.wallet))];
+      const cluster = distinct.length >= 2;
+      return {
+        cluster,
+        wallets: distinct,
+        // Flat, not per-wallet: a third whale is more confirmation but not
+        // proportionally more, and a scaling bonus would let one crowded mint
+        // dominate every other signal the scanner produces.
+        convictionBonus: cluster ? bonus : 0,
+        windowMs,
+      };
+    },
+    /** Drop mints whose window has fully expired. */
+    prune(now = Date.now()) {
+      let dropped = 0;
+      for (const [mint, entries] of byMint) {
+        const live = entries.filter((e) => now - e.at <= windowMs);
+        if (!live.length) { byMint.delete(mint); dropped++; }
+        else byMint.set(mint, live);
+      }
+      return { dropped, tracked: byMint.size };
+    },
+    get size() { return byMint.size; },
+  };
+}
+
 export async function fetchPrices(mints, { batchFetcher = fetchPairsBatch } = {}) {
   const quotes = await fetchMarketData(mints, { batchFetcher });
   return new Map([...quotes].map(([mint, q]) => [mint, q.priceUsd]));

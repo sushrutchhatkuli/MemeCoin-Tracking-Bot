@@ -1671,8 +1671,8 @@ export function switchKeyboard(id) {
   return {
     inline_keyboard: [
       [
-        { text: '✅ APPROVE SWITCH', callback_data: `${SWITCH_PREFIX}:a:${id}` },
-        { text: '🛑 KEEP CURRENT #1', callback_data: `${SWITCH_PREFIX}:k:${id}` },
+        { text: '✅ ACCEPT', callback_data: `${SWITCH_PREFIX}:a:${id}` },
+        { text: '🛑 DENY', callback_data: `${SWITCH_PREFIX}:k:${id}` },
       ],
     ],
   };
