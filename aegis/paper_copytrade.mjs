@@ -2749,13 +2749,37 @@ export async function main(argv = []) {
   let socket = null;
   const socketEnabled = cfg.rpcMirror?.enabled && cfg.rpcMirror?.socket !== false && Boolean(intervalSec);
 
+  /**
+   * One subscription per ENABLED wallet, rebuilt only when the set changes.
+   *
+   * ── WHY THE WHOLE WATCHLIST, NOT JUST THE TARGET ──────────────────────────
+   * logsSubscribe filters on `mentions`, which takes one address, so four
+   * whales is four subscriptions. They are opened together and torn down
+   * together: rebuilding on every tick would drop and re-open four sockets a
+   * second, and a subscription only covers what happens AFTER it opens, so
+   * every rebuild is a hole in coverage.
+   *
+   * The identity key is the wallet SET, not the primary target. Keyed on the
+   * target alone, a sync that added a fifth whale would leave it unsubscribed
+   * until the target happened to change — silently tracking four of five while
+   * reporting five.
+   */
   const ensureSocket = () => {
     if (!socketEnabled) return null;
-    const wallet = book.target?.address;
-    if (!wallet) return null;
-    if (socket && socket.wallet === wallet) return socket;
+    const tracked = resolveTargets(watchlist, book, { limit: cfg.trackWallets ?? 5 }).targets;
+    if (!tracked.length) return null;
+
+    const key = tracked.map((t) => t.address).join(',');
+    if (socket && socket.key === key) return socket;
     socket?.close();
-    socket = createWhaleSocket({ wallet, rpcUrl: cfg.rpcMirror.url, cfg: cfg.rpcMirror, log: console.log });
+    socket = createWhaleCluster({
+      wallets: tracked,
+      rpcUrl: cfg.rpcMirror.url,
+      cfg: cfg.rpcMirror,
+      log: console.log,
+    });
+    socket.key = key;
+    console.log(`  socket: ${tracked.length} concurrent subscription(s) — ${tracked.map((t) => t.address.slice(0, 8)).join(', ')}`);
     return socket;
   };
 
@@ -2777,7 +2801,14 @@ export async function main(argv = []) {
 
     // Whatever the socket has resolved is always taken — it is free and already
     // parsed, and dropping it while catching up would lose live trades.
-    const fromSocket = socketLive ? await s.drain() : null;
+    const drained = socketLive ? await s.drain() : null;
+    // The cluster reports a cursor PER WALLET; the poll cursor belongs to the
+    // primary alone. Advancing it from another whale's signature would skip
+    // the primary's history between the two, which is how a poll fallback
+    // silently loses the trades it exists to catch.
+    const fromSocket = drained
+      ? { ...drained, newestSignature: drained.cursors?.[book.target?.address] ?? null }
+      : null;
 
     // Poll while the socket is down, and keep polling until the backlog it
     // inherited is drained. Once caught up the socket carries it alone.

@@ -5219,6 +5219,57 @@ const whaleFile = {
  * Multi-wallet tracking and the whale cluster signal
  * ------------------------------------------------------------------ */
 
+test('any tracked whale can close a position another whale opened', async () => {
+  const { createBook, runPaperTick, openPaperPosition, paperConfig } = await PC();
+
+  // ── THE CONSEQUENCE OF MIRRORING ALL FOUR ───────────────────────────────
+  // Exits are keyed on the MINT, not on which whale opened the position. So a
+  // position bought on whale #1's conviction is closed by whale #4's sell of
+  // the same token. That follows directly from "mirror any whale's buy/sell"
+  // and it is a real trade-off, not an oversight: it widens the exit signal
+  // (four wallets watching for trouble instead of one) at the cost of exiting
+  // on a wallet whose entry we never copied and whose thesis we never shared.
+  //
+  // Pinned here so the behaviour is a decision rather than a discovery.
+  const cfg = paperConfig({
+    budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0,
+    subWallets: 0, pureMirror: true,
+  });
+  const now = 1_000_000_000;
+  const book = createBook({ budgetSol: 10, target: { address: 'WHALE_1' } });
+  openPaperPosition(book, { mint: 'M', symbol: 'M', priceUsd: 1, cfg, now: now - 1000 });
+  assert.ok(book.positions.M, 'opened on whale #1');
+
+  const report = await runPaperTick({
+    book, observations: { wallets: {} },
+    watchlist: { wallets: [{ address: 'WHALE_1' }, { address: 'WHALE_4' }] },
+    cfg, now,
+    priceFetcher: async () => new Map([['M', 2]]),
+    // A DIFFERENT whale sells it.
+    tradeFetcher: async () => ({
+      ok: true, newestSignature: 'S1',
+      trades: [{ kind: 'SELL', mint: 'M', sellFraction: 1, blockTime: now, wallet: 'WHALE_4' }],
+    }),
+  });
+
+  assert.equal(book.positions.M, undefined, "whale #4's sell closes whale #1's position");
+  assert.ok(report.exits.some((e) => e.trigger === 'WHALE_SELL'));
+
+  // ── PURE MIRROR IS UNAFFECTED ───────────────────────────────────────────
+  // Multi-wallet tracking changes WHOSE sells count, not WHETHER the book
+  // takes exits of its own. Under pureMirror it still takes none: a position
+  // deep in profit with no whale sell stays open.
+  const held = createBook({ budgetSol: 10, target: { address: 'WHALE_1' } });
+  openPaperPosition(held, { mint: 'RUNNER', symbol: 'R', priceUsd: 1, cfg, now: now - 1000 });
+  await runPaperTick({
+    book: held, observations: { wallets: {} },
+    watchlist: { wallets: [{ address: 'WHALE_1' }] }, cfg, now,
+    priceFetcher: async () => new Map([['RUNNER', 50]]),   // +4900%
+    tradeFetcher: async () => ({ ok: true, newestSignature: 'S1', trades: [] }),
+  });
+  assert.ok(held.positions.RUNNER, 'pure mirror takes no take-profit of its own');
+});
+
 test('the composite normalises first, or the weights are decoration', async () => {
   const { compositeScore, compositeBounds, normaliseDimension, rankByComposite, COMPOSITE_WEIGHTS } =
     await import('../auto_top_whales.mjs');
