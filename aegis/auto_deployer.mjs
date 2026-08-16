@@ -19,7 +19,9 @@
  */
 
 import { createHash } from 'node:crypto';
-import { base58Decode, base58Encode } from './live_execute.mjs';
+import { base58Decode, base58Encode, buildJitoBundle, JITO_MAX_BUNDLE_SIZE } from './live_execute.mjs';
+
+const LAMPORTS = 1e9;
 
 /** Pump.fun bonding curve program. VERIFIED executable on mainnet, BPF loader. */
 export const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
@@ -287,4 +289,203 @@ export function derivePumpFunPDAs(
     programId,
     tokenProgram,
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * PHASE 2 — metadata upload and bundle assembly
+ * ------------------------------------------------------------------ */
+
+export const PUMP_IPFS_ENDPOINT = 'https://pump.fun/api/ipfs';
+
+/**
+ * Normalise whatever an IPFS service hands back into a usable URI. PURE.
+ *
+ * ── A BARE CID IS THE COMMON FAILURE, AND IT LOOKS FINE ─────────────────────
+ * Services variously return `Qm…`, `ipfs://Qm…`, or a full gateway URL. A bare
+ * CID written into a mint resolves nowhere, and in a log line it is
+ * indistinguishable from a working value — which is why buildTokenMetadata
+ * refuses one and why this normalises rather than passing it through.
+ *
+ * `ipfs://` is preferred over a gateway URL: a gateway is one company's uptime,
+ * and the pointer is permanent.
+ */
+export function normaliseIpfsUri(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return { ok: false, error: 'no URI returned' };
+  const v = raw.trim();
+
+  if (/^ipfs:\/\/.+/i.test(v)) return { ok: true, uri: v, cid: v.replace(/^ipfs:\/\//i, ''), form: 'ipfs' };
+  if (/^ar:\/\/.+/i.test(v)) return { ok: true, uri: v, cid: v.replace(/^ar:\/\//i, ''), form: 'arweave' };
+
+  const gateway = v.match(/^https?:\/\/[^/]+\/ipfs\/([A-Za-z0-9]+)/i);
+  if (gateway) return { ok: true, uri: `ipfs://${gateway[1]}`, cid: gateway[1], form: 'gateway', original: v };
+
+  // A plain https URL that is not a gateway is legitimate — Arweave and some
+  // hosts serve metadata directly — so it is kept rather than rewritten.
+  if (/^https?:\/\/.+/i.test(v)) return { ok: true, uri: v, cid: null, form: 'http' };
+
+  // CIDv0 starts Qm and is 46 chars; CIDv1 starts b and is longer. Anything
+  // else is not an identifier that can be turned into a pointer.
+  if (/^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,})$/.test(v)) {
+    return { ok: true, uri: `ipfs://${v}`, cid: v, form: 'bare-cid' };
+  }
+  return { ok: false, error: `unrecognised URI or CID: "${v.slice(0, 48)}"` };
+}
+
+/**
+ * Upload metadata JSON and return a validated URI.
+ *
+ * ── UNVERIFIED RESPONSE SHAPE, AND SAID SO ──────────────────────────────────
+ * The endpoint is live — it answers HTTP 500 to an empty body rather than 404 —
+ * but its SUCCESS shape has not been confirmed here, because confirming it means
+ * publishing content to IPFS, which is permanent and not a thing to do while
+ * testing. The parser therefore accepts several plausible field names, and any
+ * failure returns ok:false rather than a guessed URI.
+ *
+ * Re-check against a real response before this is load-bearing. The cost of
+ * being wrong is a mint pointing at nothing, forever.
+ */
+export async function uploadMetadataToIPFS({
+  metadata,
+  endpoint = PUMP_IPFS_ENDPOINT,
+  fetchImpl = fetch,
+  timeoutMs = 20_000,
+} = {}) {
+  if (!metadata || typeof metadata !== 'object') return { ok: false, error: 'no metadata' };
+  for (const field of ['name', 'symbol', 'image']) {
+    if (!metadata[field]) return { ok: false, error: `metadata.${field} is required — run buildTokenMetadata first` };
+  }
+
+  let res;
+  try {
+    res = await fetchImpl(endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(metadata),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+
+  if (!res.ok) return { ok: false, error: `HTTP ${res.status}`, status: res.status };
+
+  // Guards the HTML case: a docs or error page arrives as a 200, and JSON.parse
+  // would throw where the caller expects a result object.
+  const ctype = res.headers?.get?.('content-type') ?? '';
+  if (ctype && !ctype.includes('json')) return { ok: false, error: `expected JSON, got ${ctype.split(';')[0]}` };
+
+  let body;
+  try {
+    body = await res.json();
+  } catch {
+    return { ok: false, error: 'response was not JSON' };
+  }
+
+  const raw =
+    body?.metadataUri ?? body?.metadata_uri ?? body?.uri ?? body?.url ?? body?.IpfsHash ?? body?.cid ?? null;
+  const norm = normaliseIpfsUri(raw);
+  if (!norm.ok) return { ok: false, error: `could not read a URI from the response: ${norm.error}` };
+
+  return { ok: true, uri: norm.uri, cid: norm.cid, form: norm.form, raw: body };
+}
+
+/**
+ * Assemble the ordered legs of a Block-0 deployment. PURE apart from PDA work.
+ *
+ * ── ORDER IS SEMANTIC, NOT COSMETIC ─────────────────────────────────────────
+ * Jito executes a bundle in the order given and reverts the whole thing if any
+ * leg fails. `create` must therefore come first: a buy against a bonding curve
+ * that does not exist yet fails, and takes the create down with it.
+ *
+ * ── WHAT A BUNDLE DOES AND DOES NOT BUY ─────────────────────────────────────
+ * Atomicity across N transactions in one slot. With a SINGLE transaction that
+ * property already exists — atomicity is what a transaction IS — so a one-leg
+ * bundle buys auction priority and nothing else. Reported as `atomicityUseful`
+ * so a caller can see whether the tip is doing any work.
+ *
+ * Transactions are not built here. Phase 2 has no signer by design, so this
+ * returns the PLAN; pass `transactions` once they exist and the Jito payload is
+ * assembled from them.
+ */
+export function assembleDeployBundle({
+  name,
+  symbol,
+  description = '',
+  imageUri,
+  txInPct,
+  buySol = 0,
+  jitoTip = 0,
+  mint = null,
+  creatorWallet = null,
+  transactions = null,
+} = {}) {
+  const meta = buildTokenMetadata({ name, symbol, description, imageUri });
+  if (!meta.ok) return { ok: false, error: 'metadata invalid', errors: meta.errors };
+
+  const alloc = calculateTxInAllocation({ txInPct });
+  if (!alloc.ok) return { ok: false, error: alloc.error };
+
+  if (!Number.isFinite(buySol) || buySol < 0) return { ok: false, error: `buySol ${buySol} is not a SOL amount` };
+  if (!Number.isFinite(jitoTip) || jitoTip < 0) return { ok: false, error: `jitoTip ${jitoTip} is not a SOL amount` };
+
+  const pdas = mint ? derivePumpFunPDAs(mint) : null;
+  if (mint && !pdas.ok) return { ok: false, error: pdas.error };
+
+  // Order is the contract: create, then allocation, then buy.
+  const legs = [{ index: 0, kind: 'create', description: `mint ${symbol} and open the bonding curve` }];
+  if (alloc.allocationBase > 0) {
+    legs.push({
+      index: legs.length,
+      kind: 'creator-allocation',
+      description: `${alloc.pct}% (${alloc.allocationTokens.toLocaleString('en-US')} tokens) to the disclosed creator wallet`,
+      costSol: 0,
+      wallet: creatorWallet,
+    });
+  }
+  if (buySol > 0) {
+    legs.push({ index: legs.length, kind: 'creator-buy', description: `${buySol} SOL initial buy`, costSol: buySol });
+  }
+
+  if (legs.length > JITO_MAX_BUNDLE_SIZE) {
+    return { ok: false, error: `${legs.length} legs exceeds the ${JITO_MAX_BUNDLE_SIZE}-transaction bundle limit` };
+  }
+
+  const warnings = [];
+  if (jitoTip > 0 && legs.length === 1) {
+    warnings.push('a one-leg bundle buys auction priority, not atomicity — a single transaction is already atomic');
+  }
+  const spend = buySol + jitoTip;
+  if (jitoTip > 0 && spend > 0 && jitoTip / spend > 0.2) {
+    warnings.push(`the tip is ${((jitoTip / spend) * 100).toFixed(0)}% of what this deploy spends`);
+  }
+
+  const plan = {
+    ok: true,
+    legs,
+    legCount: legs.length,
+    // False for a single leg: there is nothing to be atomic ACROSS.
+    atomicityUseful: legs.length > 1,
+    metadata: meta.metadata,
+    allocation: alloc,
+    mint,
+    pdas: pdas?.ok ? pdas : null,
+    creatorWallet,
+    buySol,
+    jitoTipSol: jitoTip,
+    jitoTipLamports: Math.round(jitoTip * LAMPORTS),
+    // The creator's own outlay. The allocation is minted supply and costs zero,
+    // so it is deliberately not part of this sum.
+    totalSpendSol: spend,
+    warnings,
+  };
+
+  if (!transactions) {
+    return { ...plan, bundle: null, note: 'no transactions supplied — plan only, nothing to submit' };
+  }
+  if (transactions.length !== legs.length) {
+    return { ...plan, ok: false, error: `${transactions.length} transactions for ${legs.length} legs — they pair by index` };
+  }
+  const bundle = buildJitoBundle(transactions);
+  if (!bundle.ok) return { ...plan, ok: false, error: bundle.error };
+  return { ...plan, bundle };
 }
