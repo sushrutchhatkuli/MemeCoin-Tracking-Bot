@@ -1,19 +1,25 @@
 ---
 title: Transparent Pump.fun Token Deployer — Implementation Plan
-status: design
+status: phase 1 built
 module: aegis/auto_deployer.mjs
 builds-on: aegis/live_execute.mjs
 created: 2026-08-16
+updated: 2026-08-16
 ---
 
 # Transparent Pump.fun Token Deployer — Implementation Plan
 
-A standalone launcher: metadata upload, mint creation, one **disclosed** creator
-allocation, atomic Jito deployment, and a `--paper` mode that costs nothing.
+A standalone launcher: viral-narrative naming, metadata upload, mint creation,
+one **disclosed** creator allocation, atomic Jito deployment, and a `--paper`
+mode that costs nothing.
 
-This note records what was **verified against the live chain and the live APIs**
-today, and corrects two things in the draft that would have cost real SOL to
-discover.
+This note records what was **verified against the live chain and the live APIs**,
+and corrects the things in the draft that would have cost real SOL to discover.
+
+> [!success] Phase 1 is built and on `main` — commit `99001bb`
+> `buildTokenMetadata`, `calculateTxInAllocation`, `derivePumpFunPDAs`.
+> 476 tests pass. PDAs verified **3 of 3** against mainnet.
+> See [[#Phase 1 — what shipped]].
 
 > [!info] What changed from the first draft, and why it matters
 > The original plan bundled a 5% free allocation with **five sub-wallets sniping
@@ -110,7 +116,68 @@ where landing one without the other is a real failure mode.
 
 ---
 
+## Correction 3 — the AI modules score tokens, they do not name them
+
+The draft says the deployer *"integrates with `news_sentinel.mjs` and
+`ai_narrative_scorer.mjs` to generate trending token names, symbols and
+metadata."* Both files exist and the model id is right (`DEFAULT_MODEL =
+'gemini-flash-lite-latest'`), but **neither generates anything.** They run in the
+opposite direction:
+
+| Function | Signature | Direction |
+|---|---|---|
+| `matchTokenToNews` | `({ pair, news, … })` | takes a token that **already exists** |
+| `extractNarrativeMetadata` | `(pair)` | reads an existing pair's name/socials |
+| `buildPrompt` | `(metadata)` | prompts the model to **score** that pair |
+| `parseNarrativeScore` | `(text)` | reads a score back out |
+
+They are an **analysis** pipeline: given a token, how well does it ride a story.
+Naming is the reverse — given a story, what token should exist. That is new code,
+not an integration.
+
+What genuinely is reusable:
+
+- `fetchBreakingNews({ config, cryptoPanicToken })` — the headline feed
+- `DEFAULT_FEEDS` — the sources already curated
+- `extractKeywords(title, keywords)` — headline → candidate terms
+
+The naming step itself (`headline → { name, symbol, description }`) has to be
+written, and its output then flows into the **existing** `buildTokenMetadata()`,
+which already enforces the 32/10-character caps and the URI rules.
+
+> [!warning] `--auto-news` needs a content gate before it is ever unattended
+> A feed of *breaking* headlines is disproportionately disasters, deaths and
+> attacks. An unattended `--auto-news` deploys a token named after whichever one
+> broke first, and that is not a hypothetical edge case — it is the median
+> breaking story.
+>
+> Minimum bar before this runs without a human: a refusal list on the naming step
+> (death, casualties, disaster, attack, victim, missing, obituary…), and a
+> `--confirm` gate that prints the proposed name and waits. `--paper` is not that
+> gate; it stops SOL leaving, not a name being chosen.
+
+> [!info] Worth noticing: Aegis discounts exactly what this would produce
+> From `telegram.mjs:719` — *"A token named after a breaking story is the
+> signature of an opportunistic launch as often as a real one. This adds no
+> score; every safety gate still applied."*
+>
+> The scanner declines to reward news-named tokens. That is not a reason the
+> deployer cannot make them — but the two halves of the project now hold opposite
+> views, and the scanner's view is the one backed by measurement.
+
+---
+
 ## Component: `aegis/auto_deployer.mjs`
+
+### 0. Viral narrative naming (`--auto-news`)
+
+- `fetchBreakingNews()` for headlines; `extractKeywords()` for candidate terms.
+- A **new** naming function turns a headline into `{ name, symbol, description }`
+  via Gemini, then hands off to `buildTokenMetadata()` for validation.
+- Refusal list applied to the headline **before** the model sees it — cheaper and
+  more reliable than asking a model to decline.
+- `--confirm` prints the proposal and waits. Unattended naming is the mode that
+  gets someone in trouble, and it is the one worth making opt-in.
 
 ### 1. Metadata & IPFS
 
@@ -177,6 +244,10 @@ where landing one without the other is a real failure mode.
 node aegis/auto_deployer.mjs --paper --name "Aegis AI" --symbol "AEGIS" `
   --image ./assets/logo.png --creator-pct 5 --buy-sol 1.0
 
+# Same, with the narrative pipeline choosing the name. --confirm shows the
+# proposal and waits; without it nothing is unattended.
+node aegis/auto_deployer.mjs --paper --auto-news --confirm --buy-sol 1.0
+
 # Mainnet. Requires --keyfile OUTSIDE the repo, as live_copytrade.mjs does.
 node aegis/auto_deployer.mjs --live --keyfile C:/Users/sushr/.solana/deployer.json `
   --name "Aegis AI" --symbol "AEGIS" --image ./assets/logo.png `
@@ -189,18 +260,65 @@ someone thinks they deployed and did not, and defaulting to live is unthinkable.
 
 ---
 
+## Phase 1 — what shipped
+
+Commit `99001bb`. Three pure functions, no network, no keys. **476 tests pass.**
+
+| Export | Does |
+|---|---|
+| `buildTokenMetadata()` | validates and shapes the JSON, refuses a bare CID or local path |
+| `calculateTxInAllocation()` | integer base units via basis points; no default percentage |
+| `derivePumpFunPDAs()` | bonding curve + associated bonding curve |
+| `findProgramAddress()` / `isOnCurve()` | the ed25519 machinery underneath |
+
+> [!danger] The bug only chain verification caught
+> **Pump.fun mints are Token-2022, not classic SPL**, and the token program id is
+> a *seed* of the associated token account. The classic seed derives a real,
+> valid, off-curve address that is simply the wrong account:
+>
+> | | |
+> |---|---|
+> | classic seed derives | `9xCa3ZwS…` |
+> | the curve actually holds | `EaEWpMQc…` |
+> | all three mints owned by | `TokenzQdB…` (Token-2022) |
+>
+> Both look equally plausible in review. The wrong one surfaces as a transaction
+> that fails on chain **after** paying a fee. First verification run scored 0/3;
+> after the fix, **3/3**.
+
+A second near-miss worth keeping: one mint's ATA looked mis-derived because
+`getAccountInfo` returned null — but `getTokenAccountsByOwner` showed the account
+exists with reclaimed rent. **Null is not absent.** Chasing that would have meant
+"fixing" correct code.
+
+`isOnCurve` is the load-bearing half: a PDA must have no private key, which is
+what off-curve *means*. Without the check, `findProgramAddress` returns an
+ordinary public key someone could hold the key to — for an account the program
+believes only it can sign for.
+
+---
+
 ## Tests — `aegis/test/auto_deployer.test.mjs`
 
-1. **Metadata**: required fields present, URI validated before mint, a missing
-   image file refused rather than uploaded empty.
-2. **Instruction/PDA**: bonding-curve PDA derives to a known address for a known
-   mint; a changed seed produces a different address (so the test fails when the
-   derivation drifts, not merely when it throws).
-3. **Creator allocation**: percentage arithmetic in integer base units, summing
-   exactly to supply — the same reason `partitionSizeSol()` works in lamports.
-4. **Bundle**: order preserved, 5-transaction cap enforced, tip attached only when
-   bundled, `submitJitoBundle` refuses without `allowSend`.
-5. **Mode gate**: no signer is constructed under `--paper`, asserted at the seam
+Phase 1 (built, 4 tests):
+
+1. **Metadata** — required fields, URI scheme enforced, all failures collected
+   rather than just the first.
+2. **Allocation** — integer base units, parts re-sum to supply, no default pct.
+3. **PDA off-curve** — a real wallet tests on-curve, every derived address off;
+   canonical bump walks 255 down; seed- and program-sensitive so the test fails
+   when derivation *drifts*, not only when it throws.
+4. **PDAs vs mainnet** — pinned against two live mints, plus an assertion that
+   the classic-token-program seed produces the **wrong** address, so the
+   Token-2022 lesson cannot be silently undone.
+
+Later phases:
+
+5. **Naming** — refusal list applied to the headline before the model call;
+   generated name/symbol survive `buildTokenMetadata()`'s caps.
+6. **Bundle** — order preserved, 5-transaction cap, tip only when bundled,
+   `submitJitoBundle` refuses without `allowSend`.
+7. **Mode gate** — no signer constructed under `--paper`, asserted at the seam
    rather than by reading a flag.
 
 ---
@@ -216,6 +334,11 @@ someone thinks they deployed and did not, and defaulting to live is unthinkable.
 - **Nothing here improves the copytrade edge.** Current clean-cohort round-trip
   drag is about **−4%** and entries are near parity — the losses are on exits.
   A deployer is a different business, not a fix for that one.
+- **Who is meant to buy these?** Worth answering before the naming pipeline is
+  automated. The disclosed-creator design is honest about supply, but a token
+  minted from a headline minutes after it broke has no product behind it, and the
+  exit ladders assume someone arrives to sell into. That assumption is the whole
+  business model and it is currently unexamined.
 
 ---
 
