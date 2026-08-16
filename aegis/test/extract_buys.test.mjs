@@ -5219,6 +5219,59 @@ const whaleFile = {
  * Multi-wallet tracking and the whale cluster signal
  * ------------------------------------------------------------------ */
 
+test('--track-whales bounds subscriptions and execution together', async () => {
+  const { parseTrackWhales, trackingHeader, resolveTargets } = await PC();
+
+  assert.equal(parseTrackWhales([]).count, 5, 'unpassed defaults to 5');
+  assert.equal(parseTrackWhales([]).defaulted, true);
+  assert.equal(parseTrackWhales(['--track-whales', '1']).count, 1);
+  assert.equal(parseTrackWhales(['--track-whales', '3']).count, 3);
+
+  // Five is Jito's bundle ceiling and the watchlist's own top-N; a larger
+  // request is clamped rather than silently honoured.
+  assert.equal(parseTrackWhales(['--track-whales', '99']).count, 5);
+  assert.equal(parseTrackWhales(['--track-whales', '99']).clamped, true);
+
+  // ── JUNK FALLS BACK, IT DOES NOT COLLAPSE TO ZERO ───────────────────────
+  // Math.max(1, Number(x) || 5) would turn '0' into 5 and 'abc' into 5 while
+  // reporting nothing. A count of 0 would be worse still — no subscriptions,
+  // no trades, and a dashboard that looks merely quiet.
+  for (const bad of ['0', '-2', 'abc', undefined]) {
+    const r = parseTrackWhales(['--track-whales', bad]);
+    assert.equal(r.count, 5, `${bad} must fall back, not disable tracking`);
+    assert.equal(r.invalid, true, 'and say so rather than failing silently');
+  }
+
+  // --track shipped first and still works; a flag that silently stops working
+  // is worse than two spellings of one idea.
+  assert.equal(parseTrackWhales(['--track', '2']).count, 2);
+  assert.equal(parseTrackWhales(['--track-whales', '1', '--track', '4']).count, 1, 'the named flag wins');
+
+  // ── THE HEADER REPORTS THE ACTUAL COUNT ─────────────────────────────────
+  // --track-whales 5 against a four-wallet watchlist tracks four. A header
+  // echoing the request would claim a subscription that does not exist, and a
+  // cluster signal needing "2 of 5" would really need 2 of 4.
+  assert.equal(trackingHeader(1), 'TRACKING: 1 Whale (Target #1)');
+  assert.equal(trackingHeader(5), 'TRACKING: 5 Whales (Top 5 Cluster)');
+  assert.equal(trackingHeader(4, { requested: 5 }), 'TRACKING: 4 Whales (Top 4 Cluster)  (asked for 5; 4 enabled)');
+  // No note when the request was met.
+  assert.equal(trackingHeader(5, { requested: 5 }), 'TRACKING: 5 Whales (Top 5 Cluster)');
+
+  // ── ONE LIMIT DRIVES BOTH SUBSCRIPTIONS AND TRADES ──────────────────────
+  // The cluster is built from resolveTargets, and only tracked wallets produce
+  // trades — so a run can never subscribe to more wallets than it will act on,
+  // nor act on one it never subscribed to.
+  const watchlist = { wallets: [
+    { address: 'W1', rank: 1 }, { address: 'W2', rank: 2 },
+    { address: 'W3', rank: 3 }, { address: 'OFF', enabled: false },
+  ] };
+  const one = resolveTargets(watchlist, { target: { address: 'W1' } }, { limit: parseTrackWhales(['--track-whales', '1']).count });
+  assert.deepEqual(one.targets.map((t) => t.address), ['W1'], 'N=1 is the approved target alone');
+
+  const all = resolveTargets(watchlist, { target: { address: 'W1' } }, { limit: parseTrackWhales([]).count });
+  assert.deepEqual(all.targets.map((t) => t.address), ['W1', 'W2', 'W3'], 'disabled wallets never enter the set');
+});
+
 test('activity lines name the whale by rank, and prefer the honest win rate', async () => {
   const { whaleTag } = await PC();
   const watchlist = { wallets: [

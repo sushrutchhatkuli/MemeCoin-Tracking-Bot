@@ -1818,6 +1818,43 @@ export function rankLookup(watchlist) {
 }
 
 /**
+ * How many whales to track this run. PURE.
+ *
+ * `--track` is kept as an alias because it shipped first and a flag that
+ * silently stops working is worse than two spellings of one idea.
+ */
+export function parseTrackWhales(argv = [], { fallback = 5, max = 5 } = {}) {
+  for (const flag of ['--track-whales', '--track']) {
+    const i = argv.indexOf(flag);
+    if (i === -1) continue;
+    const raw = argv[i + 1];
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 1) {
+      return { count: fallback, requested: raw ?? null, invalid: true, flag };
+    }
+    return { count: Math.min(Math.trunc(n), max), requested: Math.trunc(n), clamped: n > max, flag };
+  }
+  return { count: fallback, requested: null, defaulted: true };
+}
+
+/**
+ * The header line. PURE.
+ *
+ * ── IT REPORTS THE ACTUAL COUNT, NOT THE REQUESTED ONE ──────────────────────
+ * `--track-whales 5` against a four-wallet watchlist tracks four. A header that
+ * echoed the request would claim a fifth subscription that does not exist, and
+ * the operator would read a cluster signal as needing two of five when it needs
+ * two of four. The requested number is shown alongside only when it differs.
+ */
+export function trackingHeader(actual, { requested = null } = {}) {
+  const n = Math.max(0, Math.trunc(actual));
+  const noun = n === 1 ? 'Whale' : 'Whales';
+  const shape = n === 1 ? 'Target #1' : `Top ${n} Cluster`;
+  const short = Number.isFinite(requested) && requested > n ? `  (asked for ${requested}; ${n} enabled)` : '';
+  return `TRACKING: ${n} ${noun} (${shape})${short}`;
+}
+
+/**
  * A short, readable credit for the wallet behind a trade. PURE.
  *
  * ── WHY A LOG LINE NEEDS THIS AT ALL ────────────────────────────────────────
@@ -2596,6 +2633,14 @@ export async function main(argv = []) {
   const cfg = paperConfig(config.paperCopytrade ?? {});
   const watchlist = await loadJson(join(HERE, config.smartMoney?.watchlistFile ?? 'smart_wallets.json'), { wallets: [] });
 
+  // --track-whales 1 restricts BOTH the subscriptions and the trades to the
+  // approved target; 5 opens the whole cluster. Parsed once and used for both,
+  // so a run can never subscribe to more wallets than it will act on.
+  const trackWhales = parseTrackWhales(argv);
+  if (trackWhales.invalid) {
+    console.error(`  --track-whales ${trackWhales.requested} is not a wallet count; using ${trackWhales.count}.`);
+  }
+
   // --budget and --starting-balance are the same thing; both names are accepted
   // because both were asked for and silently honouring one would be worse than
   // accepting two.
@@ -2867,7 +2912,7 @@ export async function main(argv = []) {
    */
   const ensureSocket = () => {
     if (!socketEnabled) return null;
-    const tracked = resolveTargets(watchlist, book, { limit: cfg.trackWallets ?? 5 }).targets;
+    const tracked = resolveTargets(watchlist, book, { limit: trackWhales.count }).targets;
     if (!tracked.length) return null;
 
     const key = tracked.map((t) => t.address).join(',');
@@ -2880,6 +2925,7 @@ export async function main(argv = []) {
       log: console.log,
     });
     socket.key = key;
+    console.log(`  ${trackingHeader(tracked.length, { requested: trackWhales.requested })}`);
     console.log(`  socket: ${tracked.length} concurrent subscription(s) — ${tracked.map((t) => t.address.slice(0, 8)).join(', ')}`);
     return socket;
   };

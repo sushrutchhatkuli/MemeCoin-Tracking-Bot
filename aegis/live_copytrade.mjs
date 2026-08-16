@@ -67,6 +67,8 @@ import {
   resolveTargets,
   exitMatchesOrigin,
   whaleTag,
+  parseTrackWhales,
+  trackingHeader,
   createWhaleSocket,
   createWhaleCluster,
   createClusterTracker,
@@ -2864,9 +2866,11 @@ export async function main(argv = []) {
   // target leads the list and stays the one this book MIRRORS — the others are
   // watched for the cluster signal, not copied. Copying five wallets at once
   // would multiply exposure fivefold against caps sized for one.
-  const trackIdx = argv.indexOf('--track');
-  const trackLimit = trackIdx !== -1 ? Math.max(1, Number(argv[trackIdx + 1]) || 5) : 5;
-  const tracking = resolveTargets(watchlist, paperBook, { limit: trackLimit });
+  const trackWhales = parseTrackWhales(argv);
+  if (trackWhales.invalid) {
+    console.error(`  --track-whales ${trackWhales.requested} is not a wallet count; using ${trackWhales.count}.`);
+  }
+  const tracking = resolveTargets(watchlist, paperBook, { limit: trackWhales.count });
   const cluster = createWhaleCluster({
     wallets: tracking.targets,
     rpcUrl,
@@ -2883,7 +2887,7 @@ export async function main(argv = []) {
   const rankOf = rankLookup(watchlist);
 
   book.lastSignature = (await fetchLatestSignature({ wallet: target.address, rpcUrl })).signature ?? null;
-  console.log(`  tracking      ${cluster.size} wallet(s) — ${tracking.reason}`);
+  console.log(`  ${trackingHeader(cluster.size, { requested: trackWhales.requested })}`);
   for (const [i, t] of tracking.targets.entries()) {
     console.log(`     #${i + 1}  ${t.address.slice(0, 16)}…  copied · rank-${i + 1} precedence`);
   }
