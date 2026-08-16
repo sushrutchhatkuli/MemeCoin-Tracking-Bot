@@ -209,6 +209,11 @@ export const PAPER_DEFAULTS = {
   // ways is 0.0033 each against 0.00204 of ATA rent plus fees — 91% overhead,
   // against the ~5% exit drag the split is meant to work around. Pass
   // --sub-wallets 3 when trade size makes that arithmetic work.
+  // Scale sizing with BANKED equity — see compoundSizing. Off by default:
+  // it multiplies both wins and mistakes, and the pools cap the upside long
+  // before the formula does.
+  autoCompound: false,
+
   subWallets: 0,
 
   rpcMirror: {
@@ -1818,6 +1823,83 @@ export function rankLookup(watchlist) {
 }
 
 /**
+ * Equity excluding unrealized marks: cash plus the cost basis still deployed.
+ *
+ * ── WHY NOT equitySol ───────────────────────────────────────────────────────
+ * equitySol marks open positions to market, and on these tokens a mark is the
+ * softest number in the book. A position showing +500% that cannot be sold at
+ * that price still inflates equity — and if sizing keys on it, the engine
+ * scales up on a gain it never banked and then takes real losses at the larger
+ * size. That is the classic compounding death spiral, and this codebase has
+ * already measured how unreliable exit prices are: the entire Phase 3 effort
+ * exists because exits were ASSUMED to fill at the whale's price.
+ *
+ * Cash plus cost basis equals budget plus realized P&L, which is the "banked
+ * profits" figure compounding is supposed to follow.
+ */
+export function realizedEquitySol(book) {
+  const staked = Object.values(book?.positions ?? {}).reduce((a, p) => a + (p.stakeSol ?? 0), 0);
+  return (book?.balanceSol ?? 0) + staked;
+}
+
+/**
+ * Scale position sizing with banked equity. PURE.
+ *
+ * effectivePctWhale = basePctWhale × (currentEquity / startingEquity)
+ *
+ * ── THE MULTIPLE IS BOUNDED AT BOTH ENDS, AND BOTH BOUNDS ARE LOAD-BEARING ──
+ * ABOVE: the formula is unbounded, the pools are not. MEASURED on tokens this
+ * book actually held, a single buy costs
+ *
+ *      $75  →  2.29% / 4.60% / 3.13%   price impact
+ *    $1,500 →  6.30% / 34.42% / 16.76%
+ *    $3,000 → 10.13% / 50.65% / 27.50%
+ *
+ * against pools of $53,750 / $4,692 / $15,656. Doubling equity twice and
+ * letting size follow would walk straight into that curve — and impact is paid
+ * on entry AND exit, against a measured round-trip drag of about 4%. A 4x
+ * ceiling keeps sizing inside the same order of magnitude as the measurements
+ * this book was calibrated on. Raise it only with fresh impact numbers.
+ *
+ * BELOW: a floor of 0.25x. A book down 90% would otherwise size at a tenth,
+ * making every position dust and mathematically unable to recover — the
+ * drawdown protection would become the thing that prevents recovery.
+ */
+export function compoundSizing({
+  basePctWhale = null,
+  startingEquity = 0,
+  currentEquity = 0,
+  minMultiple = 0.25,
+  maxMultiple = 4,
+  enabled = false,
+} = {}) {
+  if (!enabled || basePctWhale === null || basePctWhale === undefined) {
+    return { active: false, multiple: 1, effectivePctWhale: basePctWhale ?? null };
+  }
+  if (!(startingEquity > 0) || !Number.isFinite(currentEquity)) {
+    // No baseline is not a reason to guess. Sizing stays at base.
+    return { active: true, multiple: 1, effectivePctWhale: basePctWhale, reason: 'no starting equity on record' };
+  }
+
+  const raw = currentEquity / startingEquity;
+  const multiple = Math.min(maxMultiple, Math.max(minMultiple, raw));
+  return {
+    active: true,
+    raw,
+    multiple,
+    clamped: multiple !== raw,
+    // Rounded so a log line does not read 14.999999999999998%.
+    effectivePctWhale: Number((basePctWhale * multiple).toFixed(4)),
+    reason:
+      multiple === maxMultiple && raw > maxMultiple
+        ? `capped at ${maxMultiple}x — pool depth, not equity, is the binding constraint`
+        : multiple === minMultiple && raw < minMultiple
+          ? `floored at ${minMultiple}x so a drawdown cannot size the book into dust`
+          : null,
+  };
+}
+
+/**
  * How many whales to track this run. PURE.
  *
  * `--track` is kept as an alias because it shipped first and a flag that
@@ -2203,6 +2285,23 @@ export async function runPaperTick({
   // driven by the second row's own spend when it is reached.
   const candidateByMint = new Map(candidates.map((c) => [c.mint, c]));
 
+  // ── COMPOUND SIZING ───────────────────────────────────────────────────────
+  // Recomputed every tick from BANKED equity, so a position opened after a win
+  // is sized on that win and one opened during a drawdown is sized down. The
+  // baseline is the book's original budget, which is fixed at creation and
+  // survives restarts — anchoring to anything recomputed would let the ratio
+  // drift toward 1 and quietly stop compounding.
+  const compound = compoundSizing({
+    basePctWhale: cfg.pctWhale,
+    startingEquity: book.budgetSol,
+    currentEquity: realizedEquitySol(book),
+    enabled: cfg.autoCompound === true,
+    minMultiple: cfg.compoundMinMultiple ?? 0.25,
+    maxMultiple: cfg.compoundMaxMultiple ?? 4,
+  });
+  report.compound = compound;
+  const sizingCfg = compound.active ? { ...cfg, pctWhale: compound.effectivePctWhale } : cfg;
+
   const openCandidate = (c) => {
     // The swap's own price wins when it exists; the pair lookup is the
     // fallback for a spend too small to imply one, or a ledger candidate.
@@ -2212,7 +2311,7 @@ export async function runPaperTick({
       // A chain buy arrives with no symbol; the quote that priced it has one.
       symbol: c.symbol ?? quotes.get(c.mint)?.symbol ?? null,
       priceUsd: price,
-      cfg,
+      cfg: sizingCfg,
       now,
       source: book.target?.address ?? null,
       // The wallet that ACTUALLY made this buy, which under multi-wallet
@@ -2636,6 +2735,8 @@ export async function main(argv = []) {
   // --track-whales 1 restricts BOTH the subscriptions and the trades to the
   // approved target; 5 opens the whole cluster. Parsed once and used for both,
   // so a run can never subscribe to more wallets than it will act on.
+  if (argv.includes('--auto-compound')) cfg.autoCompound = true;
+
   const trackWhales = parseTrackWhales(argv);
   if (trackWhales.invalid) {
     console.error(`  --track-whales ${trackWhales.requested} is not a wallet count; using ${trackWhales.count}.`);
@@ -2734,7 +2835,7 @@ export async function main(argv = []) {
 
   // Fetched once up front: every USD figure on the dashboard derives from it,
   // and a book opened with a USD budget cannot be sized without it.
-  const solUsd = await fetchSolUsd();
+  const solUsd = (await fetchSolUsd()) ?? 75.30;
   if (budgetUsd !== null && !solUsd) {
     console.error('Error: a USD budget needs a live SOL/USD rate, and it could not be fetched.');
     process.exitCode = 1;
@@ -3071,6 +3172,16 @@ export async function main(argv = []) {
     if (canClear) process.stdout.write(CLEAR_SCREEN);
     console.log(renderScorecard(paperScorecard(book, cfg), { solUsd: spot }));
     console.log(renderPositions(book, spot));
+    if (report.compound?.active) {
+      const c = report.compound;
+      console.log(
+        `
+  COMPOUND SIZING: Active (Effective %-Whale: ${c.effectivePctWhale}%)` +
+          `  ${c.multiple.toFixed(2)}x of base ${cfg.pctWhale}%` +
+          (c.reason ? `
+     ${c.reason}` : '')
+      );
+    }
     if (recent.length) {
       console.log('\n  RECENT ACTIVITY');
       // Resolved at render time from whatever the book knows NOW — an open

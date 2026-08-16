@@ -69,6 +69,8 @@ import {
   whaleTag,
   parseTrackWhales,
   trackingHeader,
+  compoundSizing,
+  realizedEquitySol,
   createWhaleSocket,
   createWhaleCluster,
   createClusterTracker,
@@ -991,6 +993,7 @@ export async function planIntent(
     buildFn = buildSwapTransaction,
     jupiterKey = null,
     priceFallback = null,
+    compound = null,
     now = Date.now(),
   } = {}
 ) {
@@ -1016,7 +1019,11 @@ export async function planIntent(
     };
   }
 
-  const wanted = mirrorPositionSize(paperCfg, {
+  // Compound sizing substitutes the effective percentage. Every cap below it —
+  // maxTradeSol, the gas reserve, the exposure ledger — still applies after,
+  // so a compounded size can never exceed a hard limit.
+  const sizingCfg = compound?.active ? { ...paperCfg, pctWhale: compound.effectivePctWhale } : paperCfg;
+  const wanted = mirrorPositionSize(sizingCfg, {
     whaleSpendSol: trade.solSpent,
     balanceSol: nativeSolBalance,
   });
@@ -2231,6 +2238,11 @@ export async function main(argv = []) {
   const pctIdx = argv.indexOf('--pct-whale');
   if (pctIdx !== -1 && Number(argv[pctIdx + 1]) > 0) paperCfg.pctWhale = Number(argv[pctIdx + 1]);
 
+  // Sizing follows BANKED equity when asked. The live book anchors to its own
+  // starting balance, not the paper budget — compounding one engine off the
+  // other would size real money on virtual gains.
+  const autoCompound = argv.includes('--auto-compound');
+
   const { loadEnv } = await import('./telegram.mjs');
   const dotenv = await loadEnv(join(HERE, '.env')).catch(() => ({}));
 
@@ -2589,6 +2601,12 @@ export async function main(argv = []) {
           // In-flight size counts against the cap, so concurrent buys cannot
           // each read the same stale exposure and all decide they fit.
           exposureSol: exposure.inFlight, securityFor, decimalsFor, jupiterKey, holderEntryFor,
+          compound: compoundSizing({
+            basePctWhale: paperCfg.pctWhale,
+            startingEquity: book.startingBalanceSol ?? nativeSolBalance,
+            currentEquity: realizedEquitySol(book) || nativeSolBalance,
+            enabled: autoCompound,
+          }),
           // MEASUREMENT ONLY, and only in dry-run. A throttled quote in live
           // mode has no route and therefore no transaction to sign, so a price
           // could never become a trade — passing a fallback there would only

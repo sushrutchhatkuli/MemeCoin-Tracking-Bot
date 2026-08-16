@@ -5219,6 +5219,78 @@ const whaleFile = {
  * Multi-wallet tracking and the whale cluster signal
  * ------------------------------------------------------------------ */
 
+test('compounding follows BANKED equity, never an unrealized mark', async () => {
+  const { compoundSizing, realizedEquitySol } = await PC();
+
+  // ── WHY NOT MARK-TO-MARKET ──────────────────────────────────────────────
+  // equitySol marks open positions to market, and on these tokens a mark is
+  // the softest number in the book. A position showing +500% that cannot be
+  // sold at that price would still scale sizing up — the engine then takes
+  // REAL losses at a size justified by a gain it never banked. The entire
+  // Phase 3 calibration effort exists because exit prices were assumed.
+  const book = {
+    balanceSol: 6,
+    positions: {
+      A: { stakeSol: 2, entryPriceUsd: 1, markPriceUsd: 50 },   // +4900% on paper
+      B: { stakeSol: 2, entryPriceUsd: 1, markPriceUsd: 0.1 },
+    },
+  };
+  assert.equal(realizedEquitySol(book), 10, 'cash plus cost basis — the paper gain is excluded');
+  assert.equal(realizedEquitySol({ balanceSol: 10, positions: {} }), 10);
+  assert.equal(realizedEquitySol({}), 0);
+
+  // Doubling banked equity doubles the size.
+  const doubled = compoundSizing({ basePctWhale: 15, startingEquity: 10, currentEquity: 20, enabled: true });
+  assert.equal(doubled.multiple, 2);
+  assert.equal(doubled.effectivePctWhale, 30);
+
+  // $2k -> $10k is 5x on the formula and CAPPED at 4x.
+  const big = compoundSizing({ basePctWhale: 15, startingEquity: 2000, currentEquity: 10000, enabled: true });
+  assert.equal(big.multiple, 4);
+  assert.equal(big.effectivePctWhale, 60);
+  assert.equal(big.clamped, true);
+  assert.match(big.reason, /pool depth, not equity/);
+
+  // ── THE CEILING IS THE POOLS, NOT THE FORMULA ───────────────────────────
+  // MEASURED on tokens this book held: a $3,000 buy costs 10.13% / 50.65% /
+  // 27.50% price impact against pools of $53,750 / $4,692 / $15,656, and
+  // impact is paid on entry AND exit against a ~4% round-trip drag. Letting
+  // the multiple run free walks straight into that curve.
+  assert.equal(compoundSizing({ basePctWhale: 15, startingEquity: 1, currentEquity: 1e9, enabled: true }).multiple, 4);
+
+  // ── AND A FLOOR, SO A DRAWDOWN CANNOT PREVENT RECOVERY ──────────────────
+  // Down 90% would size at a tenth, making every position dust and recovery
+  // mathematically impossible — the drawdown protection becoming the thing
+  // that prevents recovery.
+  const crashed = compoundSizing({ basePctWhale: 15, startingEquity: 100, currentEquity: 5, enabled: true });
+  assert.equal(crashed.multiple, 0.25);
+  assert.match(crashed.reason, /cannot size the book into dust/);
+
+  // A mild drawdown scales down proportionally, un-clamped.
+  const dip = compoundSizing({ basePctWhale: 20, startingEquity: 100, currentEquity: 60, enabled: true });
+  assert.ok(Math.abs(dip.multiple - 0.6) < 1e-9);
+  assert.equal(dip.effectivePctWhale, 12);
+  assert.equal(dip.clamped, false);
+
+  // ── OFF AND DEGENERATE CASES ────────────────────────────────────────────
+  const off = compoundSizing({ basePctWhale: 15, startingEquity: 10, currentEquity: 999, enabled: false });
+  assert.equal(off.active, false);
+  assert.equal(off.effectivePctWhale, 15, 'the base is untouched when disabled');
+  assert.equal(off.multiple, 1);
+
+  // Flat sizing (no pctWhale) has no percentage to scale.
+  assert.equal(compoundSizing({ basePctWhale: null, enabled: true }).active, false);
+
+  // No baseline is not a licence to guess — sizing stays at base.
+  const noBase = compoundSizing({ basePctWhale: 15, startingEquity: 0, currentEquity: 500, enabled: true });
+  assert.equal(noBase.multiple, 1);
+  assert.equal(noBase.effectivePctWhale, 15);
+  assert.match(noBase.reason, /no starting equity/);
+
+  // Rounded, so a dashboard never prints 14.999999999999998%.
+  assert.equal(compoundSizing({ basePctWhale: 15, startingEquity: 3, currentEquity: 1, enabled: true }).effectivePctWhale, 5);
+});
+
 test('--track-whales bounds subscriptions and execution together', async () => {
   const { parseTrackWhales, trackingHeader, resolveTargets } = await PC();
 
