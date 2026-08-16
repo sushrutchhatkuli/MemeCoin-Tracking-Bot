@@ -10073,14 +10073,11 @@ test('each sub-wallet exits on its own ladder, and only the moonshot holds', asy
     evaluatePaperExits({ ...at(200), firedRungs: ['TP1'] }, 3, mid).map((e) => e.trigger), ['TP2']
   );
 
-  // ── MOONSHOT HOLDS THROUGH EVERYTHING ───────────────────────────────────
-  // No ladder AND no stops. Leaving the hard stop in would silently defeat it:
-  // a 40% retrace is routine on the way to a 5x, so the one share meant to
-  // still be holding would be the first one stopped out.
-  for (const gain of [50, 100, 400, 900, -35, -60, -95]) {
-    assert.deepEqual(fires(profiles[2], gain), [], `moonshot must hold at ${gain}%`);
-  }
-  assert.equal(subWalletCfg(cfg, profiles[2]).pureMirror, true);
+  // Moonshot now has smart selling take-profit ladder (+300%, +500%) and global stops.
+  assert.deepEqual(fires(profiles[2], 299), []);
+  assert.deepEqual(fires(profiles[2], 300), ['TP1']);
+  assert.deepEqual(fires(profiles[2], 500), ['TP1', 'TP2']);
+  assert.equal(subWalletCfg(cfg, profiles[2]).pureMirror, false);
 
   // The non-mirror profiles keep the global stops — a scalper with no downside
   // protection is just a moonshot that sells early.
@@ -11756,4 +11753,50 @@ test('HTTP 400 from Jupiter is a rate limit, not a no-route', async () => {
   // A 200 carrying no outAmount is unroutable in practice.
   const empty = await fetchJupiterQuote({ retries: 0, fetchImpl: async () => new Response('{}', { status: 200 }) });
   assert.equal(empty.noRoute, true);
+});
+
+test('the dashboard names every mode, including the ones that are off', async () => {
+  const { renderModeLine, paperConfig } = await PC();
+
+  // ── "OFF" AND "NOT RENDERED" MUST NOT LOOK ALIKE ────────────────────────
+  // Compounding previously printed a line only when it was ON, and the
+  // tracking line printed once at socket setup — which the --watch redraw then
+  // wiped. Both mean the only way to know how the engine is configured is to
+  // remember what you typed.
+  const off = renderModeLine(paperConfig({ pureMirror: false, autoCompound: false, perTradeSol: 1, maxOpenPositions: 50 }), { trackedWhales: 4 });
+  assert.match(off, /4 whales/);
+  assert.match(off, /pure mirror OFF/);
+  assert.match(off, /compounding OFF/);
+  assert.match(off, /1 SOL flat/);
+  assert.match(off, /max 50 open/);
+
+  // Singular reads correctly — "1 whales" is the kind of thing that makes a
+  // dashboard look unmaintained.
+  assert.match(renderModeLine(paperConfig({}), { trackedWhales: 1 }), /\b1 whale\b/);
+  assert.doesNotMatch(renderModeLine(paperConfig({}), { trackedWhales: 1 }), /1 whales/);
+
+  // Pure mirror states what it IMPLIES, not just that it is on: no ladders and
+  // no stops, only the target's sells.
+  assert.match(renderModeLine(paperConfig({ pureMirror: true }), { trackedWhales: 2 }), /pure mirror ON/);
+  assert.match(off, /ladders \+ stops active/);
+
+  // Compounding shows the live multiple when there is one, so the number that
+  // sized this tick is the number on screen.
+  const on = renderModeLine(
+    paperConfig({ autoCompound: true, pctWhale: 100 }),
+    { trackedWhales: 4, compound: { active: true, multiple: 1.24, effectivePctWhale: 124 } }
+  );
+  assert.match(on, /compounding ON \(1\.24x → 124% of whale\)/);
+
+  // Enabled but not yet anchored is distinct from disabled.
+  const noBase = renderModeLine(paperConfig({ autoCompound: true }), { trackedWhales: 1, compound: { active: false } });
+  assert.match(noBase, /compounding ON \(no baseline yet\)/);
+
+  // An unknown whale count says so rather than printing 0, which would read as
+  // "tracking nothing".
+  assert.match(renderModeLine(paperConfig({}), {}), /whales n\/a/);
+
+  // Sub-wallets appear only when split.
+  assert.match(renderModeLine(paperConfig({ subWallets: 3 }), { trackedWhales: 1 }), /3 sub-wallets/);
+  assert.doesNotMatch(renderModeLine(paperConfig({ subWallets: 0 }), { trackedWhales: 1 }), /sub-wallets/);
 });

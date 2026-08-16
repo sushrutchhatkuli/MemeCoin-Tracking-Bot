@@ -865,6 +865,39 @@ export async function fetchSolUsd({ batchFetcher = fetchPairsBatch } = {}) {
  * than smoothed over: when a starting USD budget was set, the drift line shows
  * how much of the USD change is the SOL price rather than the strategy.
  */
+/**
+ * One line stating how the engine is configured. PURE.
+ *
+ * ── EVERY MODE IS NAMED, INCLUDING THE OFF ONES ─────────────────────────────
+ * The previous behaviour printed a compounding line only when compounding was
+ * ON, and the tracking line once at socket setup — which the --watch redraw
+ * then wiped. Both add up to the same defect: a dashboard where "off" and
+ * "not rendered" look identical, so the only way to know what the engine is
+ * doing is to remember what you typed. Every mode is stated on every frame,
+ * whichever way it is set.
+ */
+export function renderModeLine(cfg = {}, { trackedWhales = null, compound = null } = {}) {
+  const whales =
+    trackedWhales === null || trackedWhales === undefined
+      ? 'whales n/a'
+      : `${trackedWhales} whale${trackedWhales === 1 ? '' : 's'}`;
+
+  // pureMirror is the exit policy: ON means only the target's sells close a
+  // position and the book takes no take-profit or stop of its own.
+  const mirror = cfg.pureMirror ? 'pure mirror ON' : 'pure mirror OFF (ladders + stops active)';
+
+  const compounding = !cfg.autoCompound
+    ? 'compounding OFF'
+    : compound?.active
+      ? `compounding ON (${compound.multiple.toFixed(2)}x → ${compound.effectivePctWhale}% of whale)`
+      : 'compounding ON (no baseline yet)';
+
+  const sizing = cfg.pctWhale ? `${cfg.pctWhale}% of whale` : `${cfg.perTradeSol} SOL flat`;
+  const subs = cfg.subWallets > 0 ? ` · ${cfg.subWallets} sub-wallets` : '';
+
+  return `  MODE   ${whales} · ${mirror} · ${compounding}\n  SIZING ${sizing}${subs} · max ${cfg.maxOpenPositions} open`;
+}
+
 export function renderScorecard(card, { title = 'PAPER COPYTRADE SCORECARD', solUsd = null, width = 64 } = {}) {
   const bar = '═'.repeat(Math.max(8, width));
   if (!Number.isFinite(solUsd) || solUsd <= 0) {
@@ -891,6 +924,7 @@ export function renderScorecard(card, { title = 'PAPER COPYTRADE SCORECARD', sol
     bar,
     `  Target         ${card.target?.label ?? card.target?.address?.slice(0, 20) ?? '(none selected)'}`,
     `  SOL spot       ${usd(solUsd, { sign: false })}`,
+    ...(card.modeLine ? [card.modeLine] : []),
     '',
     `  Virtual budget ${usd(toUsd(card.budgetSol), { sign: false }).padStart(14)}   (${card.budgetSol.toFixed(3)} SOL)`,
     `  Balance free   ${usd(toUsd(card.balanceSol), { sign: false }).padStart(14)}   (${card.balanceSol.toFixed(3)} SOL)`,
@@ -2968,7 +3002,10 @@ export async function main(argv = []) {
   }
 
   if (argv.includes('--scorecard')) {
-    console.log(renderScorecard(paperScorecard(book, cfg), { solUsd }));
+    // No socket on the one-shot path, so the count comes from what a watch run
+    // WOULD subscribe to rather than from a live cluster.
+    const wouldTrack = resolveTargets(watchlist, book, { limit: trackWhales.count }).targets.length;
+    console.log(renderScorecard({ ...paperScorecard(book, cfg), modeLine: renderModeLine(cfg, { trackedWhales: wouldTrack }) }, { solUsd }));
     console.log(renderPositions(book, solUsd));
     return;
   }
@@ -2994,6 +3031,8 @@ export async function main(argv = []) {
   // means an outage costs latency instead of coverage. Both feed the same
   // signature dedupe in runPaperTick, so an overlap cannot double-apply.
   let socket = null;
+  let trackedWhaleCount = null;
+  let lastCompound = null;
   const socketEnabled = cfg.rpcMirror?.enabled && cfg.rpcMirror?.socket !== false && Boolean(intervalSec);
 
   /**
@@ -3026,6 +3065,7 @@ export async function main(argv = []) {
       log: console.log,
     });
     socket.key = key;
+    trackedWhaleCount = tracked.length;
     console.log(`  ${trackingHeader(tracked.length, { requested: trackWhales.requested })}`);
     console.log(`  socket: ${tracked.length} concurrent subscription(s) — ${tracked.map((t) => t.address.slice(0, 8)).join(', ')}`);
     return socket;
@@ -3113,6 +3153,10 @@ export async function main(argv = []) {
   const tick = async () => {
     const observations = intervalSec ? await loadObservationsCached() : await loadObservations(obsPath);
     const report = await runPaperTick({ book, observations, watchlist, cfg, tradeFetcher: chainFetcher, solUsd: spotCache.value });
+    // Remembered so the MODE line reports the live multiple rather than
+    // re-deriving it and risking a different answer from the one that sized
+    // the trades in this very tick.
+    lastCompound = report.compound ?? lastCompound;
     await saveBook(book);
 
     let spot = spotCache.value;
@@ -3170,7 +3214,7 @@ export async function main(argv = []) {
     // anything else writing to stdout between them, which shows as a flash of
     // empty terminal on a fast cadence.
     if (canClear) process.stdout.write(CLEAR_SCREEN);
-    console.log(renderScorecard(paperScorecard(book, cfg), { solUsd: spot }));
+    console.log(renderScorecard({ ...paperScorecard(book, cfg), modeLine: renderModeLine(cfg, { trackedWhales: trackedWhaleCount, compound: lastCompound }) }, { solUsd: spot }));
     console.log(renderPositions(book, spot));
     if (report.compound?.active) {
       const c = report.compound;
