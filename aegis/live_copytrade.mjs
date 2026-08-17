@@ -117,6 +117,87 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export const INTENT_LOG_PATH = join(HERE, '.state', 'live_intents.json');
 
 /**
+ * How long a pushed trade waits for company before it is handled.
+ *
+ * ── WHY A PUSH PATH NEEDS A WINDOW AT ALL ───────────────────────────────────
+ * orderByRank only works on a BATCH. Handling each trade the instant it
+ * arrives would hand ordering to socket scheduling, which is arbitrary and
+ * changes between runs — and with five whales mirrored, rank is the operator's
+ * approved execution precedence, not a cosmetic sort. Losing it is a
+ * behavioural change, not an optimisation.
+ *
+ * 120ms is chosen against the thing it has to span: whales acting in the same
+ * block carry the SAME blockTime, because Solana stamps at second granularity,
+ * and a Solana slot targets 400ms. A window shorter than a slot cannot reliably
+ * collect two co-buys; a window near a full slot gives back most of what the
+ * push path was for. 120ms sits inside a slot and costs about 5% of the 2500ms
+ * mean it replaces.
+ *
+ * It is a TIE-BREAK window, not a batching delay: the timer starts on the first
+ * arrival and is not extended by later ones, so a burst cannot walk the flush
+ * forward indefinitely.
+ */
+export const SLOT_COALESCE_MS = 120;
+
+/**
+ * Collect pushed trades into slot-sized batches and hand them on in order.
+ *
+ * ── WHY BATCHES ARE CHAINED AND NOT RUN CONCURRENTLY ────────────────────────
+ * `handle` already fans out internally — runBounded at burstLimit, 4 by
+ * default. Letting two batches overlap multiplies that rather than adding to
+ * it, so a burst of five whales could put twenty handleOne calls in flight,
+ * each making Jupiter round trips against a limiter budgeted at 8 per TEN
+ * seconds. The mint lock and the exposure ledger would keep the RESULT correct
+ * — they are built for concurrency — but the throughput would collapse into
+ * throttling.
+ *
+ * Chaining also preserves the property the tick loop had for free: batch N is
+ * fully applied before batch N+1 starts, so a BUY and a later SELL of one mint
+ * cannot interleave across batches.
+ */
+export function createSlotCoalescer({
+  windowMs = SLOT_COALESCE_MS,
+  flush,
+  onError = () => {},
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
+} = {}) {
+  let pending = [];
+  let timer = null;
+  let chain = Promise.resolve();
+
+  const fire = () => {
+    timer = null;
+    if (!pending.length) return;
+    const batch = pending;
+    pending = [];
+    chain = chain.then(() => flush(batch)).catch(onError);
+  };
+
+  return {
+    push(trade) {
+      pending.push(trade);
+      // The timer is NOT restarted by later arrivals. Extending the window on
+      // every push would let a steady stream defer the flush indefinitely,
+      // which is the failure the tick loop already had and this replaces.
+      if (timer) return;
+      timer = setTimeoutImpl(fire, windowMs);
+      timer?.unref?.();
+    },
+    pendingCount: () => pending.length,
+    /** Flush immediately and wait for everything in flight. Shutdown and tests. */
+    async settle() {
+      if (timer) {
+        clearTimeoutImpl(timer);
+        timer = null;
+      }
+      fire();
+      await chain;
+    },
+  };
+}
+
+/**
  * The live book is a SEPARATE FILE from the paper book, and must stay that way.
  *
  * They describe different wallets. Sharing one file means reconcile compares
@@ -1243,10 +1324,31 @@ export async function planLiveSell(
  * not linear: three 0.0033 SOL swaps do not quote as one 0.01 SOL swap, and
  * pricing all three off a single quote would misstate every entry.
  *
- * Built SEQUENTIALLY through the shared rate limiter rather than in parallel.
- * Parallel would be faster by roughly a second, and would also be the same
+ * ── BUILT IN BOUNDED WAVES, AND WHY THAT BUYS LESS THAN IT LOOKS ────────────
+ * This was SEQUENTIAL, with a comment saying parallel "would be the same
  * mistake that held the collector at a 1% success rate — the limiter would
- * serialise them anyway, just after they had already spent their retries.
+ * serialise them anyway, just after they had already spent their retries."
+ * That warning is still correct and is the reason concurrency is BOUNDED here
+ * rather than unleashed, so it is restated rather than deleted.
+ *
+ * MEASURED against the shipped `jupiterLimiter` (perWindow 8, windowMs
+ * 10_000), five sub-wallets are ten requests — one quote and one build each:
+ *
+ *     requests 1-8   0ms
+ *     requests 9-10  10_016ms      (waiting for the window to roll)
+ *
+ * The loop shape does not appear in that number. The BUDGET is the binding
+ * constraint, so parallelising reorders the waiting rather than removing it,
+ * and the honest expected gain at default settings is close to zero.
+ *
+ * What it does buy: when the limiter has headroom — a raised budget, a paid
+ * Jupiter tier, or fewer than five sub-wallets — the legs now overlap instead
+ * of queueing behind each other's round trips. `cfg.quoteConcurrency` is the
+ * dial, defaulting to 5, and lowering it to 1 restores the old behaviour
+ * exactly.
+ *
+ * THE REAL FIX FOR THIS PATH IS THE LIMITER BUDGET, NOT THIS FUNCTION. Ten
+ * requests will not fit in eight no matter how they are scheduled.
  */
 export async function buildSubWalletEntries(
   { trade, parts, signers, cfg, slippageBps, jupiterKey, quoteFn = quoteWithDirectPreference, buildFn = buildSwapTransaction } = {}
@@ -1254,43 +1356,80 @@ export async function buildSubWalletEntries(
   if (parts.length !== signers.length) {
     return { ok: false, error: `${parts.length} parts against ${signers.length} signers` };
   }
-  const legs = [];
-  for (const [i, sizeSol] of parts.entries()) {
-    const quoted = await quoteFn({
-      inputMint: WSOL_MINT,
-      outputMint: trade.mint,
-      amountLamports: Math.floor(sizeSol * LAMPORTS),
-      slippageBps: slippageBps ?? cfg.slippageBps,
-      base: cfg.jupiterBase,
-      apiKey: jupiterKey,
-      onlyDirectRoutes: cfg.onlyDirectRoutes !== false,
-    });
-    if (!quoted.ok) {
-      // One leg failing kills the whole entry. A bundle is atomic, so a partial
-      // set would either be rejected wholesale or — worse, if submitted as
-      // singles — leave the sub-wallets holding unequal shares of a position
-      // whose exit profiles assume they are equal.
-      return { ok: false, error: `sub-wallet ${i + 1}: ${quoted.error}`, failedLeg: i, throttled: quoted.throttled };
-    }
-    const built = await buildFn({
-      quote: quoted.quote,
-      userPublicKey: signers[i].publicKey,
-      cfg,
-      apiKey: jupiterKey,
+
+  const results = await runBounded(
+    parts.map((sizeSol, i) => ({ sizeSol, i })),
+    {
+      // Bounded, never unleashed. Above the limiter's budget the extra workers
+      // only queue inside acquire() while holding their retry allowance, which
+      // is the 1% failure described above.
+      limit: Math.max(1, Math.min(parts.length, cfg?.quoteConcurrency ?? 5)),
+      worker: async ({ sizeSol, i }) => {
+        const quoted = await quoteFn({
+          inputMint: WSOL_MINT,
+          outputMint: trade.mint,
+          amountLamports: Math.floor(sizeSol * LAMPORTS),
+          slippageBps: slippageBps ?? cfg.slippageBps,
+          base: cfg.jupiterBase,
+          apiKey: jupiterKey,
+          onlyDirectRoutes: cfg.onlyDirectRoutes !== false,
+        });
+        // One leg failing kills the whole entry. A bundle is atomic, so a
+        // partial set would either be rejected wholesale or — worse, if
+        // submitted as singles — leave the sub-wallets holding unequal shares
+        // of a position whose exit profiles assume they are equal.
+        if (!quoted.ok) return { ok: false, leg: i, error: quoted.error, throttled: quoted.throttled };
+
+        const built = await buildFn({
+          quote: quoted.quote,
+          userPublicKey: signers[i].publicKey,
+          cfg,
+          apiKey: jupiterKey,
       // The one path that reaches Jito's auction, so the one that may tip.
       bundled: true,
     });
-    if (!built.ok) return { ok: false, error: `sub-wallet ${i + 1} build: ${built.error}`, failedLeg: i };
-    legs.push({
-      subId: i + 1,
-      wallet: signers[i].publicKey,
-      sizeSol,
-      transactionBase64: built.transactionBase64,
-      outAmount: Number(quoted.quote.outAmount),
-      priceImpactPct: Number(quoted.quote.priceImpactPct ?? 0),
-    });
+        if (!built.ok) return { ok: false, leg: i, error: `build: ${built.error}` };
+
+        return {
+          ok: true,
+          leg: i,
+          entry: {
+            subId: i + 1,
+            wallet: signers[i].publicKey,
+            sizeSol,
+            transactionBase64: built.transactionBase64,
+            outAmount: Number(quoted.quote.outAmount),
+            priceImpactPct: Number(quoted.quote.priceImpactPct ?? 0),
+          },
+        };
+      },
+    }
+  );
+
+  // ── DETERMINISTIC FAILURE REPORTING ──────────────────────────────────────
+  // Serially the first failure encountered WAS the lowest leg index. In
+  // parallel every leg is in flight at once, so "whichever rejected first" is
+  // a race: the same inputs would name sub-wallet 4 on one run and sub-wallet
+  // 2 on the next, and an error message that moves is one nobody can act on.
+  // The lowest index wins instead, which is what the serial path reported.
+  //
+  // runBounded turns a THROWN worker error into `{ error }` carrying no `leg`,
+  // so the index comes from the result's position, which it preserves.
+  const failures = [];
+  for (const [i, r] of results.entries()) {
+    if (r?.ok) continue;
+    failures.push({ leg: r?.leg ?? i, error: r?.error ?? 'unknown failure', throttled: r?.throttled });
   }
-  return { ok: true, legs };
+  if (failures.length) {
+    failures.sort((a, b) => a.leg - b.leg);
+    const first = failures[0];
+    return { ok: false, error: `sub-wallet ${first.leg + 1}: ${first.error}`, failedLeg: first.leg, throttled: first.throttled };
+  }
+
+  // Ordered by sub-wallet, not by completion. runBounded writes each result to
+  // its input index, so the bundle's leg order is the partition's order — and
+  // Jito executes a bundle in the order given.
+  return { ok: true, legs: results.map((r) => r.entry) };
 }
 
 /**
@@ -1776,10 +1915,43 @@ export const CALIBRATION_PATH = join(HERE, '.state', 'calibration.json');
  * The tag is derived from position and value, which every reader of the same
  * file computes identically, so independent processes agree without
  * coordinating. Once merged and saved, the rows carry it permanently.
+ *
+ * ── THE SECOND UNTAGGED SHAPE, WHICH THIS MISSED FOR LONGER ─────────────────
+ * Tagging only bare numbers left `{sig: null, pct}` anonymous — and that is
+ * the shape recordShadowEntry and recordShadowExit actually write, every time
+ * the caller has no targetSignature to hand. The same doubling followed, from
+ * the same cause, for rows written AFTER the schema existed.
+ *
+ * MEASURED: exitGaps reached the 5000-row save cap holding three distinct
+ * values, 4999 rows sig-less duplicates of one another. p10, median and p90
+ * all read -1.12%, which is one value repeated rather than a distribution —
+ * and CAPITAL_TIERS gates promotion on minExitSamples (20 / 60 / 150), every
+ * one of which that count passed on a true sample of two.
  */
 export function tagLegacySample(s, index) {
-  if (typeof s !== 'number') return s;
-  return { sig: `legacy:${index}:${s.toFixed(6)}`, pct: s };
+  // Shape one: a bare number, from files written before {sig, pct} existed.
+  if (typeof s === 'number') return { sig: `legacy:${index}:${s.toFixed(6)}`, pct: s };
+
+  // Shape two: an object carrying a value but no identity.
+  //
+  // Identity is derived from the VALUE ALONE, deliberately not from position.
+  // The bare-number scheme keys on the index, which is stable only while array
+  // order is — and a re-append shifts every index, so a positional tag cannot
+  // recognise the duplicate it exists to catch. Value is what two readers of
+  // the same file agree on without coordinating.
+  //
+  // The cost is chosen rather than overlooked: two genuinely distinct exits
+  // whose gaps match to six decimals collapse into one sample. Under-counting
+  // is the safe direction for the reason above — the tier gate opens on sample
+  // SIZE, so an inflated count unlocks real capital on imaginary evidence. It
+  // is also what saveCalibration already does for `pairs`, which fall back to a
+  // content key of `mint:heldMs:dragPct` when exitSig is null. This brings the
+  // gap arrays in line with the array that never had the bug.
+  if (s && typeof s === 'object' && !s.sig && Number.isFinite(s.pct)) {
+    return { ...s, sig: `anon:${s.pct.toFixed(6)}` };
+  }
+
+  return s;
 }
 
 export async function loadCalibration(path = CALIBRATION_PATH) {
@@ -1803,19 +1975,27 @@ export async function loadCalibration(path = CALIBRATION_PATH) {
  *
  * The target's own signature is the identity: the same observed trade always
  * carries the same one, so two processes that both saw it contribute one
- * sample, not two. Samples without a signature are legacy rows from before
- * this schema and are kept as-is rather than dropped.
+ * sample, not two. Samples arriving without one are given a derived identity
+ * by tagLegacySample rather than kept as-is — an untagged row is re-appended
+ * on every merge, which is the doubling that filled exitGaps with 4999 copies
+ * of two values.
  */
 export function mergeSamples(mine = [], theirs = []) {
   const out = [];
   const seen = new Set();
-  for (const s of [...theirs, ...mine]) {
-    const sig = typeof s === 'object' && s !== null ? s.sig : null;
+  const rows = [...theirs, ...mine];
+  for (const [index, s] of rows.entries()) {
+    // Tagged HERE as well as in loadCalibration, because `mine` comes straight
+    // from recordShadowExit and has never been through a load. Without this,
+    // the freshest rows are precisely the ones that stay anonymous — the merge
+    // would dedupe history correctly and re-append everything gathered since.
+    const tagged = tagLegacySample(s, index);
+    const sig = tagged && typeof tagged === 'object' ? tagged.sig : null;
     if (sig) {
       if (seen.has(sig)) continue;
       seen.add(sig);
     }
-    out.push(s);
+    out.push(tagged);
   }
   return out;
 }
@@ -2889,20 +3069,72 @@ export async function main(argv = []) {
     console.error(`  --track-whales ${trackWhales.requested} is not a wallet count; using ${trackWhales.count}.`);
   }
   const tracking = resolveTargets(watchlist, paperBook, { limit: trackWhales.count });
-  const cluster = createWhaleCluster({
-    wallets: tracking.targets,
-    rpcUrl,
-    cfg: config.rpcMirror ?? {},
-    log: () => {},
-  });
   const clusterTracker = createClusterTracker({
     windowMs: (config.live?.clusterWindowMinutes ?? 3) * 60_000,
     bonus: config.live?.clusterConvictionBonus ?? 25,
   });
-  const socket = cluster;
   // Execution precedence reads the explicit rank field, not the array index —
   // anything that filters or re-serialises the list silently renumbers it.
   const rankOf = rankLookup(watchlist);
+
+  // ── ONE BATCH PATH, TWO SOURCES ──────────────────────────────────────────
+  // The push path and the tick sweep both land here. Two copies of this would
+  // drift: the cluster signal would be recorded on one path and not the other,
+  // and a trade recovered by a retry would skip the co-buy tracking that the
+  // same trade would have had if the socket had read it first time.
+  const processBatch = async (trades) => {
+    if (!trades?.length) return;
+
+    // ── CLUSTER SIGNAL ────────────────────────────────────────────────────
+    // Every tracked wallet's buys feed the tracker; only the mirrored wallet's
+    // trades are acted on. A co-buy is reported rather than sized into,
+    // because nothing here has measured what a cluster is worth — and this
+    // codebase has already paid once for trading on an unmeasured number
+    // (copyImpactPct 9, true value -8.9%).
+    for (const t of trades) {
+      if (t.kind !== 'BUY') continue;
+      const c = clusterTracker.record({
+        mint: t.mint,
+        wallet: t.wallet ?? target.address,
+        at: (t.blockTime ?? 0) * 1000 || Date.now(),
+      });
+      if (c.cluster) {
+        console.log(
+          `  ★ WHALE CLUSTER  ${formatTicker(null, t.mint)}  ${c.wallets.length} whales co-bought ` +
+            `within ${(c.windowMs / 60_000).toFixed(0)}m  → +${c.convictionBonus} conviction`
+        );
+        for (const w of c.wallets) console.log(`      ${w.slice(0, 16)}…`);
+      }
+    }
+
+    // ── ALL RANKED WHALES ARE COPIED ──────────────────────────────────────
+    // Ordered chronologically with RANK breaking same-block ties — see
+    // orderByRank for why rank is a tie-break and not the primary key.
+    //
+    // WHAT BOUNDS THE RISK IS THE EXPOSURE LEDGER, NOT THE WALLET COUNT.
+    // Five whales do not produce five times the exposure: every buy reserves
+    // from one shared maxExposureSol before it is placed, so more whales mean
+    // more candidates competing for the SAME capital, and the ones arriving
+    // after the cap is full are declined.
+    const ordered = orderByRank(trades, rankOf);
+    if (ordered.length) await handle(ordered);
+  };
+
+  const coalescer = createSlotCoalescer({
+    flush: processBatch,
+    onError: (err) => console.error(`  batch failed: ${err?.message ?? err}`),
+  });
+
+  const cluster = createWhaleCluster({
+    wallets: tracking.targets,
+    rpcUrl,
+    cfg: config.rpcMirror ?? {},
+    // Trades now arrive HERE, within SLOT_COALESCE_MS of the socket reading
+    // them, rather than waiting up to `intervalSec` for the next tick.
+    onTrade: (trade) => coalescer.push(trade),
+    log: () => {},
+  });
+  const socket = cluster;
 
   book.lastSignature = (await fetchLatestSignature({ wallet: target.address, rpcUrl })).signature ?? null;
   console.log(`  ${trackingHeader(cluster.size, { requested: trackWhales.requested })}`);
@@ -2925,14 +3157,32 @@ export async function main(argv = []) {
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    // Close FIRST so no further notifications enter the coalescer, then let
+    // what is already in flight finish. A batch abandoned mid-way would leave
+    // an intent logged as SENT with nothing having reconciled it.
+    socket.close();
+    await coalescer.settle().catch(() => {});
     await saveCalibration(calibration).catch(() => {});
     summary();
-    socket.close();
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
+  // ── THE TICK, DEMOTED TO A SWEEP ─────────────────────────────────────────
+  // Live trades no longer arrive here. onTrade delivers them within
+  // SLOT_COALESCE_MS, so what is left is the work only a periodic pass can do:
+  //
+  //   1. pendingRetry — signatures the socket saw but could not read yet. The
+  //      notification is the only time a signature is ever offered, so without
+  //      this sweep a trade the socket missed is lost outright. That is not
+  //      hypothetical: an audit found a target BUY that never reached the book
+  //      against a feed line reading "1 notified, 0 resolved".
+  //   2. The poll fallback, while the socket is down.
+  //   3. Pruning the cluster tracker's window.
+  //
+  // The interval no longer bounds copy latency, so raising it is now a cost
+  // question about RPC quota rather than a latency one.
   // eslint-disable-next-line no-constant-condition
   while (true) {
     await new Promise((r) => setTimeout(r, intervalSec * 1000));
@@ -2944,45 +3194,17 @@ export async function main(argv = []) {
     if (live.ok && live.cursors?.[target.address]) book.lastSignature = live.cursors[target.address];
     else if (live.ok && live.newestSignature) book.lastSignature = live.newestSignature;
 
+    // Recovered retries and poll-fallback trades take the SAME path as pushed
+    // ones, through the coalescer, so a batch from either source cannot be
+    // applied while the other is mid-flight. Ordering across the two sources is
+    // what the chain in createSlotCoalescer exists to keep.
     if (live.ok && live.trades.length) {
-      // ── CLUSTER SIGNAL ────────────────────────────────────────────────────
-      // Every tracked wallet's buys feed the tracker; only the mirrored
-      // wallet's trades are acted on. A co-buy is reported rather than sized
-      // into, because nothing here has measured what a cluster is worth — and
-      // this codebase has already paid once for trading on an unmeasured
-      // number (copyImpactPct 9, true value -8.9%).
-      for (const t of live.trades) {
-        if (t.kind !== 'BUY') continue;
-        const c = clusterTracker.record({
-          mint: t.mint,
-          wallet: t.wallet ?? target.address,
-          at: (t.blockTime ?? 0) * 1000 || Date.now(),
-        });
-        if (c.cluster) {
-          console.log(
-            `  ★ WHALE CLUSTER  ${formatTicker(null, t.mint)}  ${c.wallets.length} whales co-bought ` +
-              `within ${(c.windowMs / 60_000).toFixed(0)}m  → +${c.convictionBonus} conviction`
-          );
-          for (const w of c.wallets) console.log(`      ${w.slice(0, 16)}…`);
-        }
-      }
-      clusterTracker.prune();
-
-      // ── ALL RANKED WHALES ARE COPIED ──────────────────────────────────────
-      // Every tracked wallet's trades reach the book, ordered chronologically
-      // with RANK breaking same-block ties — see orderByRank for why rank is a
-      // tie-break and not the primary key.
-      //
-      // WHAT BOUNDS THE RISK IS THE EXPOSURE LEDGER, NOT THE WALLET COUNT.
-      // Four whales do not produce four times the exposure: every buy reserves
-      // from one shared maxExposureSol before it is placed, so more whales mean
-      // more candidates competing for the SAME capital, and the ones that
-      // arrive after the cap is full are declined. That is the difference
-      // between copying more wallets and risking more money, and it is the
-      // reason this is safe to switch on.
-      const ordered = orderByRank(live.trades, rankOf);
-      if (ordered.length) await handle(ordered);
+      for (const t of live.trades) coalescer.push(t);
     }
+
+    // Pruned every tick now, not only on ticks that carried trades: the window
+    // is time-based, so a quiet period is exactly when it goes stale.
+    clusterTracker.prune();
   }
 }
 
