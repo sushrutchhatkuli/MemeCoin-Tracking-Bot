@@ -67,14 +67,12 @@ export const SUB_WALLET_PROFILES = [
   {
     id: 3,
     name: 'moonshot',
-    // No ladder and no stops: it exits only when the target does. That is the
-    // point — it is the sub-wallet that can still be holding at 5-10x — but it
-    // also means no downside protection at all, so a rug takes this share in
-    // full. It is also the only sub-wallet whose drag remains a valid
-    // calibration sample.
-    takeProfit: [],
-    pureMirror: true,
-    note: 'pure mirror; holds until the target sells',
+    takeProfit: [
+      { gainPct: 300, sellFraction: 0.5 },
+      { gainPct: 500, sellFraction: 0.5 },
+    ],
+    pureMirror: false,
+    note: 'half at +300%, the rest at +500%',
   },
   {
     id: 4,
@@ -91,7 +89,7 @@ export const SUB_WALLET_PROFILES = [
     name: 'diamond',
     takeProfit: [],
     pureMirror: true,
-    note: 'second pure-mirror share',
+    note: 'pure mirror; holds until target sells 100%',
   },
 ];
 

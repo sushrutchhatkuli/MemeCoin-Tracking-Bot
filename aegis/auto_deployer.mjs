@@ -820,9 +820,19 @@ export async function main(argv = []) {
     return;
   }
 
+  const { fileURLToPath } = await import('url');
+  const { dirname, join } = await import('path');
+  const here = dirname(fileURLToPath(import.meta.url));
   const { loadEnv } = await import('./telegram.mjs');
-  const dotenv = await loadEnv(new URL('./.env', import.meta.url).pathname.replace(/^\//, '')).catch(() => ({}));
-  const geminiKey = process.env.GEMINI_API_KEY || dotenv.geminiKey || null;
+  const dotenv = await loadEnv(join(here, '.env')).catch(() => ({}));
+  const geminiKey = process.env.GEMINI_API_KEY || dotenv?.geminiKey || dotenv?.GEMINI_API_KEY || null;
+
+  const { readFileSync } = await import('fs');
+  let config = {};
+  try {
+    const rawCfg = readFileSync(new URL('./config.json', import.meta.url), 'utf8');
+    config = JSON.parse(rawCfg);
+  } catch {}
 
   const buySol = Number(flagValue(argv, '--buy-sol', '0')) || 0;
   const jitoTip = Number(flagValue(argv, '--jito-tip', '0')) || 0;
@@ -837,8 +847,11 @@ export async function main(argv = []) {
   console.log('  PUMP.FUN DEPLOYER — PAPER SIMULATION');
   console.log('═'.repeat(64));
 
+  const freshnessMinutes = Number(flagValue(argv, '--freshness-minutes', '720')) || 720;
+  const activeConfig = { ...config, newsSentinel: { ...(config?.newsSentinel ?? {}), headlineWindowMinutes: freshnessMinutes } };
+
   if (argv.includes('--auto-news')) {
-    const picked = await selectViralTopic({});
+    const picked = await selectViralTopic({ config: activeConfig, cryptoPanicToken: process.env.CRYPTOPANIC_TOKEN || dotenv?.cryptoPanicToken });
     if (!picked.ok) {
       console.error(`  no usable headline: ${picked.error}`);
       if (picked.refusedBy && Object.keys(picked.refusedBy).length) {

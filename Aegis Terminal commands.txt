@@ -1,0 +1,40 @@
+Aegis Night command: cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; Stop-Process -Name node -Force; node aegis/loop.mjs
+
+
+Main: cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; Stop-Process -Name node -Force; node aegis/loop.mjs
+
+Open 2 PowerShell tabs or launch both commands:
+
+Tab 1 (Fast-Loop Scanner):
+
+powershell
+
+cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; node aegis/paper_copytrade.mjs --reset --starting-balance 3153.44 --sub-wallets 5 --pct-whale 200 --watch 1
+
+
+
+cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; Stop-Process -Name node -Force; node aegis/loop.mjs
+
+cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; node aegis/bot.mjs
+
+cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; node aegis/liquidity_watch.mjs
+
+
+cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; node aegis/paper_copytrade.mjs --budget 50 --demo --watch 15
+
+Multi Wallet tracking:
+Paper Trading
+cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; node aegis/paper_copytrade.mjs --reset --starting-balance 2000 --track-whales 5 --min-trade-sol 0.5 --pct-whale 100 --pure-mirror --watch 1
+
+Auto compound: 
+cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; node aegis/paper_copytrade.mjs --auto-compound --starting-balance 2000 --track-whales 1 --pct-whale 100 --pure-mirror --watch 1
+
+Real Money:
+cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; node aegis/live_copytrade.mjs --live --keys-dir C:\Users\sushr\.solana\sub_wallets --track-whales 5 --min-trade-sol 0.5 --pct-whale 100 --pure-mirror --max-slippage 1.0 --jito-tip 0.001 --watch 1
+
+
+Brand new: cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; Stop-Process -Name node -Force; node aegis/paper_copytrade.mjs --starting-balance 10000 --reset --track-whales 5 --sub-wallets 5 --pct-whale 100 --watch 1
+
+Real Money Start: cd "c:\Users\sushr\Documents\Memecoin Potential Finder"; node aegis/live_copytrade.mjs --live --keys-dir C:\Users\sushr\.solana\sub_wallets --pct-whale 100 --watch 1
+
+wallets save to GitHub (After the wallets are elite): Please commit and push the current database files (`smart_wallets.json`, `dev_blacklist.json`, `learning_history.json`, and `.state/wallet_observations.json`) to GitHub for cloud backup
