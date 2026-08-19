@@ -8335,7 +8335,11 @@ test('the price fallback fills batch gaps but cannot become a stampede', async (
 
   const out = await fetchMarketData(['MINT1', 'MINT2', 'MINT3'], { batchFetcher, singleFetcher });
   assert.equal(out.get('MINT1').source, 'batch', 'the batch is still preferred');
-  assert.deepEqual(out.get('MINT2'), { priceUsd: 5, symbol: 'B', source: 'dexscreener-single' });
+  // poolSol null, not absent: the single lookup DID report on depth and had
+  // none to give, which is the case poolFloorSol answers. A quote with no
+  // poolSol key at all means the source cannot speak about depth — see
+  // resolvePoolSol, where those two take different paths.
+  assert.deepEqual(out.get('MINT2'), { priceUsd: 5, symbol: 'B', source: 'dexscreener-single', poolSol: null });
   assert.equal(out.has('MINT3'), false, 'a genuine miss stays a miss');
   assert.deepEqual(asked, ['MINT2', 'MINT3'], 'only the misses are retried');
 
@@ -8437,9 +8441,11 @@ test('fetchMarketData carries the ticker alongside the price', async () => {
   // singleFetcher off: this test is about the batch path, and leaving the
   // fallback live would make it reach the network.
   const data = await fetchMarketData(['MINT1', 'MINT2', 'MINT3', 'DEAD'], { batchFetcher, singleFetcher: null });
-  assert.deepEqual(data.get('MINT1'), { priceUsd: 0.004, symbol: 'Call', source: 'batch' });
-  assert.deepEqual(data.get('MINT2'), { priceUsd: 2, symbol: 'UNITE', source: 'batch' }, 'trimmed');
-  assert.deepEqual(data.get('MINT3'), { priceUsd: 3, symbol: null, source: 'batch' }, 'no symbol is null, not empty string');
+  // poolSol rides along on the same payload at no extra request — these fixture
+  // pairs carry no `liquidity`, so it is null: looked at, none reported.
+  assert.deepEqual(data.get('MINT1'), { priceUsd: 0.004, symbol: 'Call', source: 'batch', poolSol: null });
+  assert.deepEqual(data.get('MINT2'), { priceUsd: 2, symbol: 'UNITE', source: 'batch', poolSol: null }, 'trimmed');
+  assert.deepEqual(data.get('MINT3'), { priceUsd: 3, symbol: null, source: 'batch', poolSol: null }, 'no symbol is null, not empty string');
   assert.equal(data.has('DEAD'), false, 'an unpriceable pair is omitted entirely');
 
   // fetchPrices stays a bare mint->price map so existing callers are unaffected.
@@ -8684,7 +8690,7 @@ const wsSwapTx = (sig, wallet, { mint = 'MINT', sol = -1e9 } = {}) => ({
   },
 });
 
-test('the socket subscribes to the wallet at processed and reads at confirmed', async () => {
+test('the socket subscribes at processed and reads at processed before confirmed', async () => {
   const { createWhaleSocket } = await import('../paper_copytrade.mjs');
   const { FakeWS, made } = fakeSocketClass();
   const lookups = [];
@@ -8712,9 +8718,16 @@ test('the socket subscribes to the wallet at processed and reads at confirmed', 
   assert.equal(sub.params[1].commitment, 'processed');
 
   await made[0].notify({ signature: 'SIG1', err: null, logs: [] });
-  // ...but READ at confirmed: a processed notification refers to a transaction
-  // a default read cannot see yet.
-  assert.equal(lookups[0].commitment, 'confirmed');
+  // ...and READ at processed first. A default (finalized) read cannot see the
+  // transaction a processed notification refers to; confirmed can, but only
+  // after a measured 396-779ms and 2-3 attempts. The processed read is tried
+  // ahead of that ladder and, where the endpoint answers it, removes the wait.
+  assert.equal(lookups[0].commitment, 'processed');
+  // This stub answers, so the confirmed ladder is never reached and the probe
+  // records the endpoint as supporting it.
+  assert.equal(lookups.length, 1, 'an early answer costs exactly one call');
+  assert.equal(s.status().processedProbe.supported, true);
+  assert.equal(s.status().stats.fastResolved, 1);
 
   const drained = await s.drain();
   assert.equal(drained.trades.length, 1);
@@ -8746,6 +8759,559 @@ test('the socket resolves eagerly, so drain does no network', async () => {
   // Oldest first, so a buy and a later sell of one mint apply in order.
   assert.deepEqual(out.trades.map((t) => t.signature), ['A', 'B']);
   s.close();
+});
+
+// A WebSocket stand-in for the MULTIPLEXED feed: it can confirm subscriptions
+// with server-assigned ids, refuse them, and deliver notifications tagged with
+// the subscription they belong to.
+function fakeMuxSocketClass() {
+  const made = [];
+  class FakeWS {
+    constructor(url) {
+      this.url = url;
+      this.sent = [];
+      this.confirmedUpTo = 0;
+      made.push(this);
+    }
+    send(payload) { this.sent.push(JSON.parse(payload)); }
+    close() { this.onclose?.({ code: 1000 }); }
+    open() { this.onopen?.(); }
+    drop(code = 1006) { this.onclose?.({ code }); }
+    subscribeRequests() { return this.sent.filter((m) => m.method === 'logsSubscribe'); }
+    /** Confirm every subscribe request not yet answered. Returns the sub ids. */
+    confirmAll(startId = 100) {
+      const reqs = this.subscribeRequests().slice(this.confirmedUpTo);
+      const ids = [];
+      for (const [i, m] of reqs.entries()) {
+        const subId = startId + this.confirmedUpTo + i;
+        ids.push(subId);
+        this.onmessage?.({ data: JSON.stringify({ jsonrpc: '2.0', id: m.id, result: subId }) });
+      }
+      this.confirmedUpTo += reqs.length;
+      return ids;
+    }
+    refuseNext(message = 'connection limit exceeded') {
+      const reqs = this.subscribeRequests().slice(this.confirmedUpTo);
+      const m = reqs[0];
+      this.confirmedUpTo += 1;
+      this.onmessage?.({ data: JSON.stringify({ jsonrpc: '2.0', id: m.id, error: { code: -32600, message } }) });
+    }
+    notify(subId, value, slot = 1) {
+      return this.onmessage?.({
+        data: JSON.stringify({ method: 'logsNotification', params: { subscription: subId, result: { value, context: { slot } } } }),
+      });
+    }
+  }
+  return { FakeWS, made };
+}
+
+test('five wallets share ONE connection, not five', async () => {
+  const { createWhaleFeed } = await PC();
+  const { FakeWS, made } = fakeMuxSocketClass();
+  const wallets = ['WA', 'WB', 'WC', 'WD', 'WE'];
+
+  // ── THE BUG THIS FIXES, MEASURED ────────────────────────────────────────
+  // One connection per wallet hit Helius's concurrent-connection cap: opened
+  // together, 1 of 5 survived; 1.5s apart, 3 of 5; multiplexed, 5 of 5. The
+  // surplus was dropped with close code 1006 — no close frame, no error body —
+  // so the bot reported a healthy feed while watching a fraction of the list,
+  // and WHICH wallet survived was a race that changed between runs.
+  const feed = createWhaleFeed({
+    wallets, rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    rpcImpl: async (_u, _m, params) => ({ ok: true, result: wsSwapTx(params[0], 'WB') }),
+  });
+
+  assert.equal(made.length, 1, 'one connection for five wallets');
+  assert.equal(feed.size, 5);
+
+  made[0].open();
+  assert.equal(made[0].subscribeRequests().length, 5, 'one logsSubscribe per wallet');
+  assert.deepEqual(made[0].subscribeRequests().map((m) => m.params[0].mentions[0]), wallets);
+  assert.equal(made[0].subscribeRequests()[0].params[1].commitment, 'processed');
+
+  // Request ids must be distinct, or two wallets share one reply.
+  assert.equal(new Set(made[0].subscribeRequests().map((m) => m.id)).size, 5);
+
+  // Open but nothing confirmed yet is NOT connected: an open socket with no
+  // live subscription delivers nothing, and reporting it as connected is
+  // exactly how the dropped connections stayed invisible — the caller would
+  // stop polling.
+  assert.equal(feed.isConnected(), false, 'open but unsubscribed is not connected');
+
+  const ids = made[0].confirmAll();
+  assert.equal(feed.isConnected(), true);
+  assert.equal(feed.subscribedCount(), 5);
+  assert.deepEqual(feed.missingWallets(), []);
+
+  // Attribution is by subscription id. The connection no longer identifies the
+  // wallet, so this mapping is the only thing that can.
+  await made[0].notify(ids[1], { signature: 'SIG_B', err: null });
+  const drained = await feed.drain();
+  assert.equal(drained.trades.length, 1);
+  assert.equal(drained.trades[0].wallet, 'WB', 'attributed to the subscription that carried it');
+  assert.equal(drained.scanned, 1, 'scanned is carried — the old cluster dropped it and the dashboard read 0 forever');
+  feed.close();
+});
+
+test('a notification on an unknown subscription is never guessed at', async () => {
+  const { createWhaleFeed } = await PC();
+  const { FakeWS, made } = fakeMuxSocketClass();
+
+  const feed = createWhaleFeed({
+    wallets: ['WA', 'WB'], rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    rpcImpl: async (_u, _m, params) => ({ ok: true, result: wsSwapTx(params[0], 'WA') }),
+  });
+  made[0].open();
+  const ids = made[0].confirmAll();
+
+  // Crediting a trade to the wrong whale would corrupt the cluster signal and
+  // the exit-origin check, both of which key on wallet. Dropping it loses one
+  // trade; guessing loses trust in every wallet field in the book.
+  await made[0].notify(99999, { signature: 'ORPHAN', err: null });
+  assert.equal(feed.status().stats.unattributed, 1);
+  assert.equal((await feed.drain()).trades.length, 0, 'nothing invented');
+
+  await made[0].notify(ids[0], { signature: 'REAL', err: null });
+  assert.equal((await feed.drain()).trades.length, 1);
+  feed.close();
+});
+
+test('a reconnect resubscribes every wallet and voids the old ids', async () => {
+  const { createWhaleFeed } = await PC();
+  const { FakeWS, made } = fakeMuxSocketClass();
+
+  // The stub builds each transaction for the wallet that signature belongs to.
+  // A tx built for the wrong wallet would be declined by parseWalletSwap and
+  // look like a routing failure, hiding whatever the test meant to check.
+  const ownerOf = { STALE: 'WA', FRESH: 'WC' };
+  const feed = createWhaleFeed({
+    wallets: ['WA', 'WB', 'WC'], rpcUrl: 'https://n/r',
+    cfg: { reconnectBackoffMs: 1 }, WebSocketImpl: FakeWS,
+    rpcImpl: async (_u, _m, params) => ({ ok: true, result: wsSwapTx(params[0], ownerOf[params[0]] ?? 'WA') }),
+  });
+  made[0].open();
+  const oldIds = made[0].confirmAll(100);
+  assert.equal(feed.subscribedCount(), 3);
+
+  // The connection drops. Every subscription dies with it, so the feed must
+  // report itself unsubscribed rather than keep claiming three.
+  made[0].drop(1006);
+  assert.equal(feed.isConnected(), false);
+  assert.equal(feed.subscribedCount(), 0);
+  assert.deepEqual(feed.missingWallets(), ['WA', 'WB', 'WC']);
+
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(made.length, 2, 'reconnected');
+  made[1].open();
+
+  // ATOMIC: the whole set is re-established, not whichever half succeeded.
+  assert.equal(made[1].subscribeRequests().length, 3, 'all three resubscribed as a unit');
+  const newIds = made[1].confirmAll(500);
+  assert.equal(feed.subscribedCount(), 3);
+  assert.deepEqual(feed.missingWallets(), []);
+
+  // A notification carrying an id from the DEAD connection must not resolve.
+  // Ids are server-assigned and can repeat across connections, so a stale map
+  // would attribute the new connection's traffic to the old connection's
+  // wallet — silently, and only under reconnect.
+  await made[1].notify(oldIds[0], { signature: 'STALE', err: null });
+  assert.equal(feed.status().stats.unattributed, 1);
+  assert.equal((await feed.drain()).trades.length, 0);
+
+  await made[1].notify(newIds[2], { signature: 'FRESH', err: null });
+  const out = await feed.drain();
+  assert.equal(out.trades.length, 1);
+  assert.equal(out.trades[0].wallet, 'WC');
+  feed.close();
+});
+
+test('a refused subscription is reported, not silently absorbed', async () => {
+  const { createWhaleFeed } = await PC();
+  const { FakeWS, made } = fakeMuxSocketClass();
+
+  const feed = createWhaleFeed({
+    wallets: ['WA', 'WB', 'WC'], rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    rpcImpl: async (_u, _m, params) => ({ ok: true, result: wsSwapTx(params[0], 'WB') }),
+  });
+  made[0].open();
+
+  // Whatever the provider's limit turns out to be, a wallet without a live
+  // subscription must be NAMED. Four quiet whales and four unsubscribed ones
+  // are indistinguishable in the book, and that is what cost a whole watchlist.
+  made[0].refuseNext('connection limit exceeded');
+  made[0].confirmAll(200);
+
+  assert.equal(feed.subscribedCount(), 2, 'two of three');
+  assert.deepEqual(feed.missingWallets(), ['WA']);
+  assert.equal(feed.status().stats.refusedSubs, 1);
+  assert.match(feed.status().lastError, /connection limit/);
+  // Still connected: two live subscriptions do deliver, and dropping to the
+  // poll fallback would lose them too.
+  assert.equal(feed.isConnected(), true);
+  feed.close();
+});
+
+test('the cluster multiplexes by default and keeps the old mode on request', async () => {
+  const { createWhaleCluster } = await PC();
+  const { FakeWS, made } = fakeMuxSocketClass();
+
+  const mux = createWhaleCluster({
+    wallets: [{ address: 'WA', label: 'alpha' }, 'WB'],
+    rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    rpcImpl: async (_u, _m, params) => ({ ok: true, result: wsSwapTx(params[0], 'WA') }),
+  });
+  assert.equal(made.length, 1, 'default is one connection');
+  assert.equal(mux.status().transport, 'multiplexed');
+  made[0].open();
+  const ids = made[0].confirmAll();
+
+  // Labels survive the transport change — orderByRank and the cluster signal
+  // both read the wallet off the trade.
+  await made[0].notify(ids[0], { signature: 'S1', err: null });
+  const d = await mux.drain();
+  assert.equal(d.trades[0].wallet, 'WA');
+  assert.equal(d.trades[0].walletLabel, 'alpha');
+  mux.close();
+
+  // socketFactory still selects connection-per-wallet, which is what the
+  // per-socket tests drive and the escape hatch for an endpoint that dislikes
+  // many subscriptions on one connection.
+  const opened = [];
+  const legacy = createWhaleCluster({
+    wallets: ['X', 'Y'], rpcUrl: 'https://n/r',
+    socketFactory: ({ wallet }) => {
+      opened.push(wallet);
+      return { wallet, isConnected: () => true, drain: async () => ({ ok: true, trades: [] }), close() {} };
+    },
+  });
+  assert.deepEqual(opened, ['X', 'Y'], 'one socket per wallet on the legacy path');
+  assert.equal(legacy.size, 2);
+});
+
+test('onTrade delivers on arrival instead of waiting for the tick', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+  const pushed = [];
+
+  const s = createWhaleSocket({
+    wallet: 'W', rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    onTrade: (t) => { pushed.push(t); },
+    rpcImpl: async (_u, _m, params) => ({ ok: true, result: wsSwapTx(params[0], 'W') }),
+  });
+  made[0].open();
+
+  // ── THE TERM THIS REMOVES ───────────────────────────────────────────────
+  // Buffered, a resolved trade waits for the next --watch tick: 0-5000ms at
+  // the default interval, a mean of 2500ms — MEASURED as the single largest
+  // term in a copy budget of roughly 6000ms, and costing nothing to remove
+  // because the trade was already resolved and sitting in memory.
+  await made[0].notify({ signature: 'A', err: null });
+  assert.equal(pushed.length, 1, 'delivered without anyone calling drain');
+  assert.equal(pushed[0].kind, 'BUY');
+
+  // And NOT also buffered. Both would mean the tick handles it a second time,
+  // which alreadyExecuted would catch in live mode but only after paying for
+  // a quote — and would not catch at all in dry-run.
+  assert.deepEqual((await s.drain()).trades, []);
+  s.close();
+});
+
+test('without onTrade the buffer is untouched, because paper still drains', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+
+  // paper_copytrade's own --watch path has no onTrade and must keep working
+  // exactly as before. The push path is additive, not a migration.
+  const s = createWhaleSocket({
+    wallet: 'W', rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    rpcImpl: async (_u, _m, params) => ({ ok: true, result: wsSwapTx(params[0], 'W') }),
+  });
+  made[0].open();
+  await made[0].notify({ signature: 'A', err: null });
+
+  const out = await s.drain();
+  assert.equal(out.trades.length, 1, 'buffered as before');
+  assert.equal(s.status().stats.pushed, 0);
+  s.close();
+});
+
+test('an endpoint that refuses processed is asked exactly once', async () => {
+  const { createWhaleSocket, isUnsupportedCommitment } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+  const commitments = [];
+
+  // ── WHY THIS IS PROBED RATHER THAN ASSUMED ──────────────────────────────
+  // The Solana JSON-RPC spec lists `processed` as NOT supported on
+  // getTransaction — account and signature-status methods take it, the
+  // transaction and block lookups do not. Providers differ in how they say so.
+  // Trying it unconditionally on every resolve would therefore be a latency
+  // REGRESSION, one wasted round trip per trade, forever.
+  const s = createWhaleSocket({
+    wallet: 'W', rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    cfg: { lookupRetries: 0, lookupRetryDelayMs: 0 },
+    rpcImpl: async (_u, _m, params) => {
+      commitments.push(params[1].commitment);
+      if (params[1].commitment === 'processed') {
+        return { ok: false, error: 'Invalid param: commitment processed is not supported' };
+      }
+      return { ok: true, result: wsSwapTx(params[0], 'W') };
+    },
+  });
+  made[0].open();
+
+  await made[0].notify({ signature: 'A', err: null });
+  await made[0].notify({ signature: 'B', err: null });
+  await made[0].notify({ signature: 'C', err: null });
+
+  assert.deepEqual(commitments, ['processed', 'confirmed', 'confirmed', 'confirmed'],
+    'one probe, then the ladder alone');
+  assert.equal(s.status().processedProbe.supported, false);
+  assert.equal(s.status().stats.resolved, 3, 'every trade still resolved');
+  assert.equal(s.status().stats.fastResolved, 0);
+  s.close();
+
+  // The message is what distinguishes it. JSON-RPC error CODES are not
+  // distinctive — the same -32602 covers a malformed signature, and treating
+  // that as "unsupported" would disable the fast path on one bad signature.
+  assert.equal(isUnsupportedCommitment('Invalid param: commitment processed is not supported'), true);
+  assert.equal(isUnsupportedCommitment('processed is not supported'), true);
+  assert.equal(isUnsupportedCommitment('Invalid commitment'), true);
+  assert.equal(isUnsupportedCommitment('Invalid param: WrongSize'), false);
+  assert.equal(isUnsupportedCommitment('HTTP 429'), false);
+  assert.equal(isUnsupportedCommitment(null), false);
+});
+
+test('an endpoint that takes processed but never answers early stops being asked', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+  const commitments = [];
+
+  // The quieter failure: the parameter is accepted and coerced, so nothing
+  // errors and nothing arrives early either. Without a bound this costs an
+  // extra round trip on every trade for the life of the process.
+  const s = createWhaleSocket({
+    wallet: 'W', rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    cfg: { lookupRetries: 0, lookupRetryDelayMs: 0, processedProbeLimit: 3 },
+    rpcImpl: async (_u, _m, params) => {
+      commitments.push(params[1].commitment);
+      if (params[1].commitment === 'processed') return { ok: true, result: null };
+      return { ok: true, result: wsSwapTx(params[0], 'W') };
+    },
+  });
+  made[0].open();
+
+  for (const sig of ['A', 'B', 'C', 'D', 'E']) await made[0].notify({ signature: sig, err: null });
+
+  assert.equal(commitments.filter((c) => c === 'processed').length, 3, 'bounded by processedProbeLimit');
+  assert.equal(commitments.filter((c) => c === 'confirmed').length, 5, 'every trade still went through the ladder');
+  assert.equal(s.status().processedProbe.supported, false);
+  assert.equal(s.status().stats.resolved, 5);
+  s.close();
+});
+
+test('a retry never probes, so a failing signature does not cost double', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+  const commitments = [];
+
+  const s = createWhaleSocket({
+    wallet: 'W', rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    cfg: { lookupRetries: 0, lookupRetryDelayMs: 0, retryAttempts: 4 },
+    rpcImpl: async (_u, _m, params) => {
+      commitments.push(params[1].commitment);
+      return { ok: false, error: 'not found yet' };
+    },
+  });
+  made[0].open();
+  await made[0].notify({ signature: 'SLOW', err: null });
+  await s.drain();
+  await s.drain();
+
+  // A signature coming back through pendingRetry is already seconds late, so
+  // an early read has nothing left to win — and probing on every retry would
+  // double the calls on exactly the signatures that are already failing.
+  assert.equal(commitments.filter((c) => c === 'processed').length, 1, 'probed on arrival only');
+  assert.equal(commitments.filter((c) => c === 'confirmed').length, 3, 'notify plus two retries');
+  s.close();
+});
+
+test('processedFirst false keeps the old confirmed-only behaviour', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+  const commitments = [];
+
+  // The escape hatch, for an endpoint known to be slow to refuse rather than
+  // quick, where even the one probe is unwanted.
+  const s = createWhaleSocket({
+    wallet: 'W', rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    cfg: { lookupRetries: 0, lookupRetryDelayMs: 0, processedFirst: false },
+    rpcImpl: async (_u, _m, params) => {
+      commitments.push(params[1].commitment);
+      return { ok: true, result: wsSwapTx(params[0], 'W') };
+    },
+  });
+  made[0].open();
+  await made[0].notify({ signature: 'A', err: null });
+
+  assert.deepEqual(commitments, ['confirmed'], 'no probe at all');
+  assert.equal(s.status().stats.resolved, 1);
+  s.close();
+});
+
+test('a throwing onTrade costs one trade, not the connection', async () => {
+  const { createWhaleSocket } = await import('../paper_copytrade.mjs');
+  const { FakeWS, made } = fakeSocketClass();
+  const seen = [];
+
+  const s = createWhaleSocket({
+    wallet: 'W', rpcUrl: 'https://n/r', WebSocketImpl: FakeWS,
+    onTrade: (t) => (t.signature === 'BAD'
+      ? Promise.reject(new Error('handler blew up'))
+      : void seen.push(t.signature)),
+    rpcImpl: async (_u, _m, params) => ({ ok: true, result: wsSwapTx(params[0], 'W') }),
+  });
+  made[0].open();
+
+  // An unhandled rejection inside ws.onmessage takes the CONNECTION down, and
+  // the reconnect then loses every signature arriving during the backoff
+  // window — turning one bad trade into a blind period. The socket must
+  // outlive its consumer's mistakes.
+  await made[0].notify({ signature: 'BAD', err: null });
+  await made[0].notify({ signature: 'GOOD', err: null });
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.equal(s.isConnected(), true, 'the socket survived the handler');
+  assert.deepEqual(seen, ['GOOD'], 'the trade after the failure still arrived');
+  assert.equal(s.status().stats.handlerErrors, 1);
+  s.close();
+});
+
+test('a pushed trade carries the wallet that produced it', async () => {
+  const { createWhaleCluster } = await PC();
+  const pushed = [];
+  const sockets = [];
+
+  const cluster = createWhaleCluster({
+    wallets: [{ address: 'WA', label: 'alpha' }, 'WB'],
+    rpcUrl: 'https://n/r',
+    onTrade: (t) => pushed.push(t),
+    socketFactory: ({ wallet, onTrade }) => {
+      const s = { wallet, onTrade, isConnected: () => true, drain: async () => ({ ok: true, trades: [] }), close() {} };
+      sockets.push(s);
+      return s;
+    },
+  });
+  assert.equal(cluster.size, 2);
+
+  // ── WHY THE STAMP IS LOAD-BEARING ───────────────────────────────────────
+  // parseWalletSwap describes the swap, not the subscription, so a resolved
+  // trade carries no wallet field. drain() has always stamped it on the way
+  // out; the push path has to do the same or orderByRank sees undefined,
+  // ranks every whale at Infinity, and the operator-approved precedence
+  // silently becomes socket scheduling order.
+  sockets[0].onTrade({ mint: 'M', kind: 'BUY' });
+  sockets[1].onTrade({ mint: 'M', kind: 'BUY' });
+
+  assert.equal(pushed[0].wallet, 'WA');
+  assert.equal(pushed[0].walletLabel, 'alpha');
+  assert.equal(pushed[1].wallet, 'WB');
+  assert.equal(pushed[1].walletLabel, null, 'a bare string wallet has no label');
+});
+
+test('the slot coalescer groups one slot and hands on one batch', async () => {
+  const { createSlotCoalescer, SLOT_COALESCE_MS } = await LC();
+  const { orderByRank } = await PC();
+
+  assert.equal(SLOT_COALESCE_MS, 120);
+
+  // A hand-driven clock, so the grouping is proven to come from the window
+  // rather than from real elapsed time making it look grouped.
+  let fire = null;
+  const windows = [];
+  const setTimeoutImpl = (fn, ms) => { fire = fn; windows.push(ms); return { unref() {} }; };
+  const batches = [];
+
+  const c = createSlotCoalescer({
+    setTimeoutImpl,
+    clearTimeoutImpl: () => {},
+    flush: async (batch) => { batches.push(batch); },
+  });
+
+  // Three whales inside one block. Solana stamps blockTime at SECOND
+  // granularity, so co-buys in a block are indistinguishable in time and rank
+  // is the only thing that can order them — and orderByRank needs a BATCH.
+  c.push({ mint: 'M', kind: 'BUY', wallet: 'w3', blockTime: 100 });
+  c.push({ mint: 'M', kind: 'BUY', wallet: 'w1', blockTime: 100 });
+  c.push({ mint: 'M', kind: 'BUY', wallet: 'w2', blockTime: 100 });
+
+  assert.equal(c.pendingCount(), 3);
+  assert.equal(batches.length, 0, 'nothing is handled before the window closes');
+  assert.deepEqual(windows, [120], 'one window for three arrivals — later pushes must not restart it');
+
+  fire();
+  await c.settle();
+
+  assert.equal(batches.length, 1, 'three arrivals, ONE batch');
+  const rankOf = (w) => ({ w1: 1, w2: 2, w3: 3 })[w] ?? Infinity;
+  assert.deepEqual(orderByRank(batches[0], rankOf).map((t) => t.wallet), ['w1', 'w2', 'w3'],
+    'the batch is what makes rank precedence recoverable');
+});
+
+test('coalesced batches are chained, so two never run at once', async () => {
+  const { createSlotCoalescer } = await LC();
+  let fire = null;
+  const setTimeoutImpl = (fn) => { fire = fn; return { unref() {} }; };
+
+  let active = 0;
+  let maxActive = 0;
+  const c = createSlotCoalescer({
+    setTimeoutImpl,
+    clearTimeoutImpl: () => {},
+    flush: async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, 5));
+      active--;
+    },
+  });
+
+  // `handle` already fans out internally at burstLimit (4 by default). Two
+  // batches overlapping MULTIPLIES that rather than adding to it, so a burst
+  // could put twenty handleOne calls against a rate limiter set to 8/s. The
+  // mint lock and exposure ledger keep the result correct either way; what
+  // chaining protects is throughput.
+  c.push({ mint: 'A' }); fire();
+  c.push({ mint: 'B' }); fire();
+  c.push({ mint: 'C' }); fire();
+  await c.settle();
+
+  assert.equal(maxActive, 1, 'batches are serialised, not merely bounded');
+});
+
+test('settle flushes what is pending, so shutdown does not drop a batch', async () => {
+  const { createSlotCoalescer } = await LC();
+  const batches = [];
+  let cleared = 0;
+
+  const c = createSlotCoalescer({
+    setTimeoutImpl: () => ({ unref() {} }),
+    clearTimeoutImpl: () => { cleared++; },
+    flush: async (batch) => { batches.push(batch); },
+  });
+
+  // A batch abandoned mid-flight at shutdown would leave an intent logged as
+  // SENT with nothing having reconciled it.
+  c.push({ mint: 'A' });
+  c.push({ mint: 'B' });
+  await c.settle();
+
+  assert.equal(cleared, 1, 'the pending timer is cancelled, not left to fire after exit');
+  assert.deepEqual(batches.map((b) => b.length), [2]);
+  assert.equal(c.pendingCount(), 0);
+
+  // Idempotent: a second settle has nothing to do and must not invent a batch.
+  await c.settle();
+  assert.equal(batches.length, 1);
 });
 
 test('the socket ignores failures, duplicates and unresolvable signatures', async () => {
@@ -8914,8 +9480,16 @@ test('a mirrored entry prices itself without a pair lookup', async () => {
   // did not wait on a network round trip.
   assert.deepEqual(askedFor, [], 'no lookup for a swap-priced candidate');
   assert.equal(r.opened.length, 1);
-  // 1 SOL / 1000 tokens x $100 = $0.10.
-  assert.ok(Math.abs(book.positions.M.entryPriceUsd - 0.1) < 1e-12);
+  // 1 SOL / 1000 tokens x $100 = $0.10 — the price the SWAP implies.
+  //
+  // ── AND THEN THE POOL IT NEVER LOOKED UP ────────────────────────────────
+  // Skipping the pair lookup means skipping the pool depth with it, so this
+  // fill is priced against poolFloorSol: 1 SOL through an assumed 30 SOL pool
+  // is 1/31 = 3.226% impact, and $0.10 x 31/30 = $0.10333. The floor is the
+  // stated cost of the fast path, not a measurement — cfg.poolDepthLookup buys
+  // the real number back for one batch call.
+  assert.ok(Math.abs(book.positions.M.entryPriceUsd - 0.1 * (31 / 30)) < 1e-12);
+  assert.equal(r.liquidity.flooredFills, 1, 'and the tick says how many fills were priced that way');
 });
 
 test('the copy-impact premium is applied on top of the whale fill', async () => {
@@ -8933,21 +9507,36 @@ test('the copy-impact premium is applied on top of the whale fill', async () => 
   // after, because their own buy moves it and everything watching follows.
   // Booking at their fill would make the book optimistic by that margin on
   // every mirrored trade.
+  // ── THREE COSTS, THREE LEVERS, AND THEY MULTIPLY ────────────────────────
+  // copyImpactPct is arriving late. slippagePct is the spread crossed. The
+  // pool term is depth, and it is x/(pool+x) rather than a constant — here the
+  // swap-priced candidate was never looked up, so it pays poolFloorSol: 1 SOL
+  // through an assumed 30 SOL pool, x31/30. Kept as an explicit factor in
+  // every expectation below so a change to any one of the three shows up as a
+  // change to exactly one term.
+  const pool = 31 / 30;
+
   const withImpact = args(paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 9 }));
   await runPaperTick(withImpact);
-  assert.ok(Math.abs(withImpact.book.positions.M.entryPriceUsd - 0.109) < 1e-12, '$0.10 fill + 9%');
+  assert.ok(Math.abs(withImpact.book.positions.M.entryPriceUsd - 0.109 * pool) < 1e-12, '$0.10 fill + 9%');
 
   // Zero shows the optimistic version, which is what booking at their fill
   // would have silently produced.
   const noImpact = args(paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 0 }));
   await runPaperTick(noImpact);
-  assert.ok(Math.abs(noImpact.book.positions.M.entryPriceUsd - 0.1) < 1e-12);
+  assert.ok(Math.abs(noImpact.book.positions.M.entryPriceUsd - 0.1 * pool) < 1e-12);
 
   // Slippage still stacks on top of the impact — they model different things:
   // one is the spread we cross, the other is arriving late.
   const both = args(paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 10, feeSol: 0, copyImpactPct: 9 }));
   await runPaperTick(both);
-  assert.ok(Math.abs(both.book.positions.M.entryPriceUsd - 0.109 * 1.1) < 1e-12);
+  assert.ok(Math.abs(both.book.positions.M.entryPriceUsd - 0.109 * 1.1 * pool) < 1e-12);
+
+  // And the pool term drops out entirely when the model is off, which is the
+  // only way back to the arithmetic this test asserted before depth existed.
+  const noPool = args(paperConfig({ budgetSol: 10, perTradeSol: 1, slippagePct: 0, feeSol: 0, copyImpactPct: 9, liquidityModel: false }));
+  await runPaperTick(noPool);
+  assert.ok(Math.abs(noPool.book.positions.M.entryPriceUsd - 0.109) < 1e-12);
 });
 
 test('open positions are still marked from the pair feed', async () => {
@@ -9426,7 +10015,13 @@ test('a permanently unreadable signature is abandoned, not retried forever', asy
   assert.equal(s.status().pendingRetry.length, 0, 'queue drains');
   assert.equal(s.status().stats.abandoned, 1);
   // Bounded: one on notify plus a couple of drains, not one per tick forever.
-  assert.ok(calls <= 3, `bounded attempts, got ${calls}`);
+  //
+  // Four rather than three since the processed-first probe: the notify path
+  // spends one extra call asking whether this endpoint answers early. Retries
+  // pass `fast: false` and never probe, so the total stays independent of how
+  // many drains run — which is the property this assertion exists to protect.
+  // Six drains and four calls; sixty drains would still be four.
+  assert.ok(calls <= 4, `bounded attempts, got ${calls}`);
   s.close();
 });
 
@@ -10401,6 +10996,147 @@ test('a bundled entry quotes each sub-wallet separately and fails whole', async 
   assert.equal(held.blocked, true);
 });
 
+// Shared by the concurrency tests below: a signable stub and a peak-concurrency
+// probe. A stub too short to split would fail at signing rather than exercising
+// the path under test.
+const signableTx = () => Buffer.concat([Buffer.from([1]), Buffer.alloc(64), Buffer.from('msg')]).toString('base64');
+function concurrencyProbe() {
+  let active = 0;
+  let peak = 0;
+  return {
+    peak: () => peak,
+    wrap: (fn) => async (...args) => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 5));
+      active--;
+      return fn(...args);
+    },
+  };
+}
+
+test('sub-wallet legs are built in bounded parallel waves', async () => {
+  const { buildSubWalletEntries } = await LC();
+  const { createSigners } = await import('../live_execute.mjs');
+  const signers = createSigners(await Promise.all([freshKey(), freshKey(), freshKey(), freshKey(), freshKey()]));
+  const parts = [0.002, 0.002, 0.002, 0.002, 0.002];
+  const okQuote = async () => ({ ok: true, quote: { outAmount: '1000', priceImpactPct: '0.01' } });
+  const okBuild = async () => ({ ok: true, transactionBase64: signableTx() });
+
+  // ── WHAT THIS DOES AND DOES NOT BUY ─────────────────────────────────────
+  // Five sub-wallets are TEN Jupiter requests. Measured against the shipped
+  // jupiterLimiter (8 per 10_000ms), requests 9 and 10 wait 10_016ms for the
+  // window to roll — a figure the loop shape does not appear in. Overlapping
+  // the legs reorders that waiting rather than removing it, so the honest
+  // gain at default settings is near zero and the real fix is the budget.
+  // What it does buy is overlap whenever the limiter has headroom.
+  const wide = concurrencyProbe();
+  const out = await buildSubWalletEntries({
+    trade: { mint: 'M' }, parts, signers, cfg: { slippageBps: 300 },
+    quoteFn: wide.wrap(okQuote), buildFn: okBuild,
+  });
+  assert.equal(out.ok, true);
+  assert.equal(out.legs.length, 5);
+  assert.equal(wide.peak(), 5, 'all five legs in flight at once by default');
+
+  // quoteConcurrency 1 restores the previous serial path EXACTLY — the escape
+  // hatch if a tighter limiter makes overlap counterproductive again.
+  const serial = concurrencyProbe();
+  const one = await buildSubWalletEntries({
+    trade: { mint: 'M' }, parts, signers, cfg: { slippageBps: 300, quoteConcurrency: 1 },
+    quoteFn: serial.wrap(okQuote), buildFn: okBuild,
+  });
+  assert.equal(one.ok, true);
+  assert.equal(serial.peak(), 1, 'quoteConcurrency 1 is the old behaviour');
+
+  // Bounded in between, and never above the leg count.
+  const two = concurrencyProbe();
+  await buildSubWalletEntries({
+    trade: { mint: 'M' }, parts, signers, cfg: { slippageBps: 300, quoteConcurrency: 2 },
+    quoteFn: two.wrap(okQuote), buildFn: okBuild,
+  });
+  assert.equal(two.peak(), 2);
+});
+
+test('the failing leg reported is the lowest index, not whichever lost the race', async () => {
+  const { buildSubWalletEntries } = await LC();
+  const { createSigners } = await import('../live_execute.mjs');
+  const signers = createSigners(await Promise.all([freshKey(), freshKey(), freshKey()]));
+  const parts = [0.003, 0.005, 0.004];
+  const okBuild = async () => ({ ok: true, transactionBase64: signableTx() });
+
+  // ── THE RACE THIS PINS DOWN ─────────────────────────────────────────────
+  // Serially the first failure encountered WAS the lowest leg index. In
+  // parallel every leg is in flight at once, so "whichever rejected first" is
+  // scheduling order — the same inputs would name sub-wallet 3 on one run and
+  // sub-wallet 1 on the next. An error message that moves is one nobody can
+  // act on, and failedLeg feeds the operator's retry decision.
+  //
+  // Leg 2 fails FAST, leg 0 fails SLOW. The lowest index must still win.
+  const quoteFn = async ({ amountLamports }) => {
+    if (amountLamports === 4_000_000) return { ok: false, error: 'fast failure' };
+    if (amountLamports === 3_000_000) {
+      await new Promise((r) => setTimeout(r, 25));
+      return { ok: false, error: 'slow failure', throttled: true };
+    }
+    return { ok: true, quote: { outAmount: '1' } };
+  };
+
+  // Repeated, because a race that happens to resolve correctly once proves
+  // nothing about the next run.
+  for (let i = 0; i < 5; i++) {
+    const res = await buildSubWalletEntries({
+      trade: { mint: 'M' }, parts, signers, cfg: { slippageBps: 300 }, quoteFn, buildFn: okBuild,
+    });
+    assert.equal(res.ok, false);
+    assert.equal(res.failedLeg, 0, 'the lowest failing index, every time');
+    assert.match(res.error, /sub-wallet 1: slow failure/);
+    assert.equal(res.throttled, true, 'the throttle flag travels with the reported leg');
+  }
+
+  // A THROWN worker error carries no leg field — runBounded turns it into
+  // `{ error }` — so the index has to come from the result's position or the
+  // message names the wrong sub-wallet.
+  const thrower = async ({ amountLamports }) => {
+    if (amountLamports === 5_000_000) throw new Error('boom');
+    return { ok: true, quote: { outAmount: '1' } };
+  };
+  const thrown = await buildSubWalletEntries({
+    trade: { mint: 'M' }, parts, signers, cfg: { slippageBps: 300 }, quoteFn: thrower, buildFn: okBuild,
+  });
+  assert.equal(thrown.ok, false);
+  assert.equal(thrown.failedLeg, 1, 'attributed to the leg that threw');
+  assert.match(thrown.error, /sub-wallet 2: boom/);
+});
+
+test('legs come back in partition order, not completion order', async () => {
+  const { buildSubWalletEntries } = await LC();
+  const { createSigners } = await import('../live_execute.mjs');
+  const signers = createSigners(await Promise.all([freshKey(), freshKey(), freshKey()]));
+  const parts = [0.003, 0.005, 0.004];
+
+  // Resolve in REVERSE, so completion order is provably not partition order.
+  const quoteFn = async ({ amountLamports }) => {
+    const delay = { 3_000_000: 30, 5_000_000: 15, 4_000_000: 1 }[amountLamports] ?? 0;
+    await new Promise((r) => setTimeout(r, delay));
+    return { ok: true, quote: { outAmount: String(amountLamports), priceImpactPct: '0.01' } };
+  };
+
+  const out = await buildSubWalletEntries({
+    trade: { mint: 'M' }, parts, signers, cfg: { slippageBps: 300 },
+    quoteFn, buildFn: async () => ({ ok: true, transactionBase64: signableTx() }),
+  });
+
+  assert.equal(out.ok, true);
+  // Jito executes a bundle IN THE ORDER GIVEN, and the exit profiles are
+  // indexed by subId — a bundle assembled in completion order would hand
+  // sub-wallet 1's ladder to whichever leg happened to quote first.
+  assert.deepEqual(out.legs.map((l) => l.subId), [1, 2, 3]);
+  assert.deepEqual(out.legs.map((l) => l.wallet), signers.map((s) => s.publicKey));
+  assert.deepEqual(out.legs.map((l) => l.sizeSol), parts);
+  assert.deepEqual(out.legs.map((l) => l.outAmount), [3_000_000, 5_000_000, 4_000_000]);
+});
+
 /* ------------------------------------------------------------------ *
  * Insider Shield — Birdeye holder stats
  * ------------------------------------------------------------------ */
@@ -11222,6 +11958,78 @@ test('concurrent collectors merge instead of clobbering each other', async () =>
   assert.equal(samplePct(null), null);
   const mixed = { open: new Map(), pairs: [], entryGaps: [1, { sig: 'a', pct: 3 }, 5], exitGaps: [] };
   assert.equal(calibrationSummary(mixed).medianEntryGapPct, 3);
+
+  await rm(tmp, { force: true });
+});
+
+test('a sample with no signature is deduped too, or the ledger doubles forever', async () => {
+  const { loadCalibration, saveCalibration, createCalibrationLedger, mergeSamples, tagLegacySample,
+          calibrationSummary, recordShadowEntry, recordShadowExit } = await LC();
+  const { rm, writeFile } = await import('node:fs/promises');
+  const tmp = new URL('./.tmp-anon.json', import.meta.url).pathname.slice(1);
+  await rm(tmp, { force: true });
+
+  // ── FOUND IN THE LIVE LEDGER, NOT IMAGINED ──────────────────────────────
+  // .state/calibration.json reached the 5000-row save cap holding THREE
+  // distinct exit values: one signed row and 4999 sig-less duplicates of two
+  // others. tagLegacySample tagged only bare NUMBERS, so `{sig: null, pct}` —
+  // the shape recordShadowExit writes whenever the caller has no
+  // targetSignature, which is most of the time — stayed anonymous, and
+  // mergeSamples appends anonymous rows unconditionally. Every save
+  // re-appended the whole file.
+  //
+  // Not cosmetic: calibrationSummary handed exitSamples: 5000 to trackRecord,
+  // and CAPITAL_TIERS gates promotion on minExitSamples of 20 / 60 / 150. Only
+  // the separate minRoundTrips gate — counted from LANDED sell intents, still
+  // zero — kept real capital locked. The inflation was a loaded gun, not a
+  // fired one, and it would have fired at the first 30 live round trips.
+  assert.equal(tagLegacySample({ sig: null, pct: -1.25 }, 0).sig, 'anon:-1.250000');
+  assert.equal(tagLegacySample({ pct: -1.25 }, 7).sig, 'anon:-1.250000', 'an absent sig is the same as a null one');
+  assert.equal(tagLegacySample({ sig: 'real', pct: -1.25 }, 0).sig, 'real', 'a real signature is never overwritten');
+
+  // Identity must come from the VALUE alone. A positional tag is stable only
+  // while array order is, and the re-append shifts every index — which is
+  // precisely why the bare-number scheme could not catch this shape.
+  assert.equal(tagLegacySample({ sig: null, pct: 3 }, 0).sig, tagLegacySample({ sig: null, pct: 3 }, 999).sig);
+
+  // Identical anonymous rows collapse; distinct ones survive.
+  assert.equal(mergeSamples([{ sig: null, pct: -1.1 }], [{ sig: null, pct: -1.1 }]).length, 1);
+  assert.equal(mergeSamples([{ sig: null, pct: -1.1 }], [{ sig: null, pct: -2.2 }]).length, 2);
+
+  // ── THE DOUBLING ITSELF ─────────────────────────────────────────────────
+  // Written in the shape the bot actually produced, then saved repeatedly.
+  // Before the fix this climbed toward 5000; it must now stay flat.
+  await writeFile(tmp, JSON.stringify({
+    open: {}, pairs: [],
+    entryGaps: [{ sig: null, pct: 0.19 }],
+    exitGaps: [{ sig: 'signed1', pct: 4.31 }, { sig: null, pct: -1.11 }, { sig: null, pct: -1.1 }],
+  }), 'utf8');
+
+  for (let i = 0; i < 6; i++) await saveCalibration(await loadCalibration(tmp), tmp);
+  const back = await loadCalibration(tmp);
+  assert.equal(back.exitGaps.length, 3, 'six saves must not grow three rows');
+  assert.equal(back.entryGaps.length, 1);
+
+  // Rows collapse, observations do not: every distinct measured value survives.
+  assert.deepEqual(back.exitGaps.map((s) => s.pct).sort((x, y) => x - y), [-1.11, -1.1, 4.31]);
+
+  // ── VIA THE RECORDING PATH, WHICH IS HOW IT ARISES ──────────────────────
+  // recordShadowExit without a targetSignature is the real producer. Two
+  // collectors watching one wallet see the same exit and must contribute one
+  // sample between them, exactly as the signed path already guarantees.
+  await rm(tmp, { force: true });
+  for (const _ of [1, 2]) {
+    const led = createCalibrationLedger();
+    recordShadowEntry(led, { mint: 'M', ourFillUsd: 1, targetFillUsd: 1, ourTokens: 10, quoteGapPct: 0.5, at: 0 });
+    recordShadowExit(led, { mint: 'M', ourFillUsd: 2, targetFillUsd: 2.05, exitGapPct: -2.5, at: 10 });
+    await saveCalibration(led, tmp);
+  }
+
+  const s = calibrationSummary(await loadCalibration(tmp));
+  assert.equal(s.exitSamples, 1, 'the same unsigned exit seen twice is one sample');
+  assert.equal(s.entrySamples, 1);
+  assert.equal(s.roundTrips, 1);
+  assert.equal(s.medianExitGapPct, -2.5, 'the surviving row keeps its value');
 
   await rm(tmp, { force: true });
 });
