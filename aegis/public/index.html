@@ -1,0 +1,1169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Aegis Paper Book</title>
+<style>
+/* Hand-written, inlined, and no CDN. package.json: the scanner "stays
+   dependency-free and runs on Node built-ins alone" — a CSS framework does not
+   earn a dependency, and a CDN <script> is worse than one: a third party
+   executing in a page that displays your positions, refetched on every load,
+   and broken when you are offline. The server's CSP blocks it anyway. */
+:root {
+  --bg: #090c10;
+  --panel: #121824;
+  --panel-2: #171f2e;
+  --line: #232c3d;
+  --text: #e3e9f2;
+  --dim: #7d8899;
+  --dimmer: #55606f;
+  --up: #00e676;
+  --down: #ff3d57;
+  --warn: #ffb020;
+  --err: #ff3d57;
+  --accent: #58a6ff;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.5 var(--mono);
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.wrap { max-width: 1400px; margin: 0 auto; padding: 14px; }
+
+/* A snapshot, not a feed. Dimmed so the numbers below read as last-known
+   rather than current — they are still shown, because the last good frame is
+   the most useful thing available while the link is down. */
+body.disconnected #stats, body.disconnected #framing,
+body.disconnected main, body.disconnected #activity { opacity: .55; }
+
+/* ── header ───────────────────────────────────────────────────────────── */
+header {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.toprow {
+  display: flex; flex-wrap: wrap; gap: 10px;
+  align-items: center; justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 10px; margin-bottom: 10px;
+}
+.title { font-size: 14px; font-weight: 600; letter-spacing: .04em; }
+.title .target { color: var(--dim); font-weight: 400; }
+.pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill {
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-size: 11px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.pill.ok    { color: var(--up);   border-color: #1f4d38; }
+.pill.warn  { color: var(--warn); border-color: #4d3c14; }
+.pill.err   { color: var(--err);  border-color: #4d1f1f; }
+/* Server-sourced facts, once the transport is down. They are last-known, not
+   current, and they must not sit next to DISCONNECTED looking live. */
+.pill.stale { color: var(--dimmer); border-style: dashed; opacity: .75; }
+.pill b { color: var(--text); font-weight: 600; }
+
+/* ── GMGN-style metric strip ──────────────────────────────────────────── */
+.metrics {
+  display: flex; flex-wrap: wrap; align-items: stretch; gap: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+.metric { padding: 7px 14px; border-right: 1px solid var(--line); flex: 0 0 auto; }
+.metric:last-child { border-right: 0; }
+.metric .mk { color: var(--dim); font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; }
+.metric .mv { font-size: 14px; font-weight: 600; margin-top: 1px; white-space: nowrap; }
+.metric.slot .mv { color: var(--accent); }
+
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.stat .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+.stat .v { font-size: 20px; font-weight: 600; margin-top: 2px; }
+.stat .sub { color: var(--dimmer); font-size: 11px; margin-top: 2px; }
+.up { color: var(--up); } .down { color: var(--down); } .flat { color: var(--dim); }
+
+/* The USD decomposition. vsStart = trading + SOL drift, exactly. Rendered as
+   three lines because the total on its own is the number that lies. */
+.framing {
+  margin-top: 10px; padding-top: 10px;
+  border-top: 1px dashed var(--line);
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px;
+  font-size: 11.5px;
+}
+.framing .k { color: var(--dim); }
+.framing .note { color: var(--dimmer); grid-column: 1 / -1; }
+
+/* ── warnings ─────────────────────────────────────────────────────────── */
+#warnings { margin-top: 10px; display: grid; gap: 6px; }
+.warning {
+  border-left: 3px solid var(--warn);
+  background: #1b1810;
+  border-radius: 4px;
+  padding: 7px 10px; font-size: 11.5px; color: #e8d9b8;
+}
+.warning.error { border-left-color: var(--err); background: #1d1212; color: #f0cfcf; }
+.warning.info  { border-left-color: var(--dim); background: var(--panel-2); color: var(--dim); }
+.warning .code { color: var(--dimmer); margin-right: 8px; letter-spacing: .06em; }
+
+/* ── token tab bar ────────────────────────────────────────────────────── */
+#tabs {
+  display: flex; gap: 4px; margin-top: 12px;
+  overflow-x: auto; padding-bottom: 2px;
+}
+#tabs:empty { display: none; }
+.tab {
+  display: flex; align-items: baseline; gap: 7px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 5px 5px 0 0; border-bottom-width: 2px;
+  padding: 5px 11px; font-size: 11.5px; cursor: pointer; white-space: nowrap;
+  color: var(--dim);
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--text); border-bottom-color: var(--accent); background: var(--panel-2); }
+.tab .tg { font-weight: 600; }
+
+/* ── main grid ────────────────────────────────────────────────────────── */
+main { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 12px; margin-top: 8px; }
+/* Tier B on: charts share the top row side by side, positions run full width
+   beneath. Tier B off: the old two-column layout, because half an empty row is
+   worse than no row. */
+main.dual { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+main.dual #positions { grid-column: 1 / -1; }
+@media (max-width: 1100px) { main, main.dual { grid-template-columns: 1fr; } }
+
+section.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 0;
+}
+.panel > h2 {
+  margin: 0; padding: 9px 12px;
+  font-size: 11px; font-weight: 600; letter-spacing: .09em;
+  text-transform: uppercase; color: var(--dim);
+  border-bottom: 1px solid var(--line);
+  display: flex; justify-content: space-between; gap: 10px;
+}
+.panel > h2 .meta { color: var(--dimmer); font-weight: 400; letter-spacing: 0; text-transform: none; }
+.panel .body { padding: 12px; }
+
+/* ── chart ────────────────────────────────────────────────────────────── */
+#chart .body { min-height: 260px; display: flex; flex-direction: column; gap: 8px; }
+.chart-empty { color: var(--dimmer); text-align: center; font-size: 12px; line-height: 1.8; margin: auto; }
+.chart-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; }
+.chart-facts .k { color: var(--dim); font-size: 11px; }
+.chart-facts .v { font-size: 15px; }
+
+svg.chart { display: block; width: 100%; height: 240px; overflow: visible; }
+svg.chart .grid { stroke: var(--line); stroke-width: 1; }
+svg.chart .axis-label { fill: var(--dimmer); font-size: 9.5px; font-family: var(--mono); }
+svg.chart .line { fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
+svg.chart .line.up { stroke: var(--up); }
+svg.chart .line.down { stroke: var(--down); }
+svg.chart .area { stroke: none; opacity: .10; }
+/* A gap is drawn as an absence, not bridged. See chart.mjs on why. */
+svg.chart .gap { stroke: var(--dimmer); stroke-width: 1; stroke-dasharray: 2 4; opacity: .5; }
+svg.chart .gap-band { fill: var(--dimmer); opacity: .05; }
+svg.chart .entry-line { stroke: var(--dim); stroke-width: 1; stroke-dasharray: 3 3; opacity: .6; }
+
+svg.chart .mk { stroke-width: 1.5; }
+svg.chart .mk-ENTRY { fill: var(--accent);  stroke: var(--bg); }
+svg.chart .mk-SCALE { fill: var(--warn);    stroke: var(--bg); }
+svg.chart .mk-TP    { fill: var(--up);      stroke: var(--bg); }
+svg.chart .mk-EXIT  { fill: var(--down);    stroke: var(--bg); }
+/* Clamped markers happened outside the sampled window — drawn hollow at the
+   edge so they cannot be read as "it happened here". */
+svg.chart .mk.clamped { fill: none; stroke-width: 1.5; }
+svg.chart .mk-ENTRY.clamped { stroke: var(--accent); }
+svg.chart .mk-SCALE.clamped { stroke: var(--warn); }
+svg.chart .mk-TP.clamped    { stroke: var(--up); }
+svg.chart .mk-EXIT.clamped  { stroke: var(--down); }
+
+.chart-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 10.5px; color: var(--dim); align-items: center; }
+.chart-legend .sw { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
+.chart-caption { color: var(--dimmer); font-size: 10.5px; }
+.chart-caption b { color: var(--dim); font-weight: 600; }
+
+/* ── Tier B: the real market chart, off unless asked for ──────────────── */
+/* No margin-top: this is a grid child sharing a row with the Tier A chart, and
+   a stray margin drops it 12px below its neighbour. */
+#embed .body { padding: 12px; }
+.embed-off { color: var(--dimmer); font-size: 11.5px; line-height: 1.7; }
+.embed-consent {
+  border-left: 3px solid var(--warn);
+  background: #1b1810;
+  border-radius: 4px;
+  padding: 10px 12px;
+  font-size: 11.5px;
+  color: #e8d9b8;
+  line-height: 1.7;
+}
+.embed-consent .who { color: var(--warn); font-weight: 600; }
+.embed-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 9px; }
+button.btn {
+  font: inherit; font-size: 11px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 4px 11px; cursor: pointer;
+}
+button.btn:hover { border-color: var(--accent); color: var(--accent); }
+button.btn.danger:hover { border-color: var(--err); color: var(--err); }
+.embed-actions label { color: var(--dim); font-size: 11px; cursor: pointer; user-select: none; }
+.embed-frame { width: 100%; height: 420px; border: 1px solid var(--line); border-radius: 4px; background: #0f141b; display: block; }
+.embed-note { color: var(--dimmer); font-size: 10.5px; margin-top: 7px; line-height: 1.6; }
+
+/* ── positions ────────────────────────────────────────────────────────── */
+#positions .body { padding: 8px; display: grid; gap: 8px; max-height: 62vh; overflow-y: auto; }
+.card {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  cursor: pointer;
+}
+.card:hover { border-color: #33405280; }
+.card.focused { border-color: var(--accent); }
+.card .r1 { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.card .tick { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card .gain { font-size: 15px; font-weight: 600; white-space: nowrap; }
+.card .r2 { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--dim); font-size: 11px; margin-top: 4px; }
+.card .r3 { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; align-items: center; }
+.badge {
+  font-size: 10px; padding: 1px 6px; border-radius: 3px;
+  border: 1px solid var(--line); color: var(--dim); background: #0f141b;
+  white-space: nowrap;
+}
+.badge.assumed { color: var(--warn); border-color: #4d3c14; }
+.badge.measured { color: var(--up); border-color: #1f4d38; }
+.badge.none { color: var(--dimmer); }
+.badge.stale { color: var(--err); border-color: #4d1f1f; }
+.badge.demo { color: var(--accent); border-color: #1d3a5c; }
+.links { margin-left: auto; display: flex; gap: 6px; }
+.links a {
+  font-size: 10px; padding: 1px 7px; border-radius: 3px;
+  border: 1px solid var(--line); background: #0f141b; color: var(--dim);
+}
+.links a:hover { color: var(--accent); border-color: #1d3a5c; text-decoration: none; }
+
+/* ── whale trade stream ───────────────────────────────────────────────── */
+#activity { margin-top: 12px; }
+#activity .body { padding: 0; max-height: 34vh; overflow-y: auto; }
+.act {
+  display: flex; gap: 10px; align-items: baseline;
+  padding: 6px 12px; border-bottom: 1px solid #1a2230; font-size: 11.5px;
+}
+.act:last-child { border-bottom: 0; }
+.act:hover { background: var(--panel-2); }
+.act .t { color: var(--dimmer); white-space: nowrap; flex: 0 0 auto; }
+.act .pill-k {
+  font-weight: 700; font-size: 10px; letter-spacing: .06em;
+  padding: 1px 7px; border-radius: 3px; flex: 0 0 auto; min-width: 44px; text-align: center;
+}
+.act .pill-k.BUY  { color: var(--up);   background: #00e6761a; border: 1px solid #00e67640; }
+.act .pill-k.ADD  { color: var(--warn); background: #ffb0201a; border: 1px solid #ffb02040; }
+.act .pill-k.SELL { color: var(--down); background: #ff3d571a; border: 1px solid #ff3d5740; }
+.act .m { color: var(--text); font-weight: 600; flex: 0 0 auto; }
+.act .sol { color: var(--text); flex: 0 0 auto; }
+.act .x { color: var(--dim); flex: 1 1 auto; min-width: 0; }
+.act .tag {
+  font-size: 10px; padding: 0 6px; border-radius: 3px;
+  border: 1px solid var(--line); color: var(--dim); background: #0d1320; flex: 0 0 auto;
+}
+.act .tag.slot { color: var(--accent); border-color: #1d3a5c; }
+.act .tag.drag { color: var(--down); border-color: #4d1f2a; }
+.act .tag.drag.good { color: var(--up); border-color: #1f4d38; }
+.act a.tx { flex: 0 0 auto; font-size: 10px; color: var(--dim); }
+.act a.tx:hover { color: var(--accent); }
+
+.empty { color: var(--dimmer); padding: 16px 12px; text-align: center; font-size: 12px; }
+footer { color: var(--dimmer); font-size: 11px; text-align: center; padding: 14px 0 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="toprow">
+      <div class="title">AEGIS PAPER BOOK <span class="target" id="target"></span></div>
+      <div class="pills" id="pills"></div>
+    </div>
+    <div class="metrics" id="metrics"></div>
+    <div class="stats" id="stats"></div>
+    <div class="framing" id="framing" hidden></div>
+  </header>
+
+  <div id="warnings"></div>
+
+  <div id="tabs"></div>
+
+  <main>
+    <!-- Our marks, with our markers. The only pane that can show an entry. -->
+    <section class="panel" id="chart">
+      <h2>Price history <span class="meta" id="chart-meta"></span></h2>
+      <div class="body" id="chart-body"></div>
+    </section>
+
+    <!-- Real candles, no markers — a cross-origin frame cannot be drawn into.
+         Hidden unless --dashboard-embed; see renderEmbed. -->
+    <section class="panel" id="embed" hidden>
+      <h2>Market chart <span class="meta" id="embed-meta"></span></h2>
+      <div class="body" id="embed-body"></div>
+    </section>
+
+    <section class="panel" id="positions">
+      <h2>Open positions <span class="meta" id="pos-meta"></span></h2>
+      <div class="body" id="pos-body"></div>
+    </section>
+  </main>
+
+  <section class="panel" id="activity">
+    <h2>Whale trade stream <span class="meta" id="act-meta"></span></h2>
+    <div class="body" id="act-body"></div>
+  </section>
+
+  <footer id="foot"></footer>
+</div>
+
+<script type="module">
+'use strict';
+
+/* The chart projection is imported, not reimplemented. /chart.mjs is the same
+   file dashboard.mjs re-exports for its tests, so what is asserted in Node is
+   what draws here. */
+import { buildChartGeometry, describeChart } from './chart.mjs';
+
+/* Every value below reaches the DOM through textContent or a property, never
+   innerHTML. Token symbols are attacker-controlled — a memecoin ticker can hold
+   quotes, angle brackets and newlines — and the mint is only ever used inside
+   encodeURIComponent for a href. */
+
+var S = {
+  state: null,
+  focus: null,
+  lastOkAt: null,   // when a frame last ARRIVED, by the browser's clock
+  connected: false,
+  error: null,
+  es: null,         // EventSource
+  poll: null,       // fallback interval, only while the stream is down
+  /* Tier B. Never persisted — not to localStorage, not to a cookie. A consent
+     that survives a reload is a consent nobody remembers giving. */
+  embedLoaded: null,
+  embedConsented: false,
+  embedAuto: false,
+  embedRendered: null,   // the state key currently in the DOM
+};
+
+var AGE_MS = 500;
+var POLL_FALLBACK_MS = 5000;
+
+/* ── helpers ─────────────────────────────────────────────────────────── */
+function h(tag, opts, kids) {
+  var e = document.createElement(tag);
+  opts = opts || {};
+  if (opts.cls) e.className = opts.cls;
+  if (opts.text !== undefined && opts.text !== null) e.textContent = String(opts.text);
+  if (opts.title) e.title = opts.title;
+  if (opts.href) { e.href = opts.href; e.target = '_blank'; e.rel = 'noopener noreferrer'; }
+  if (opts.hidden) e.hidden = true;
+  (kids || []).forEach(function (k) { if (k) e.appendChild(k); });
+  return e;
+}
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+function num(n) { return typeof n === 'number' && isFinite(n); }
+
+function fmtSol(n, sign) {
+  if (!num(n)) return '—';
+  var s = Math.abs(n).toFixed(3);
+  return (sign ? (n < 0 ? '-' : '+') : (n < 0 ? '-' : '')) + s;
+}
+function fmtUsd(n, sign) {
+  if (!num(n)) return '—';
+  var s = Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (sign ? (n < 0 ? '-$' : '+$') : (n < 0 ? '-$' : '$')) + s;
+}
+function fmtPct(n, dp) {
+  if (!num(n)) return '—';
+  return (n >= 0 ? '+' : '') + n.toFixed(dp === undefined ? 2 : dp) + '%';
+}
+function fmtPrice(n) {
+  if (!num(n)) return '—';
+  if (n >= 1) return '$' + n.toFixed(4);
+  return '$' + n.toPrecision(4);
+}
+function fmtAge(ms) {
+  if (!num(ms)) return '—';
+  var s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  var m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ' + (s % 60) + 's';
+  return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+}
+function dirCls(n) { return !num(n) ? 'flat' : n > 0 ? 'up' : n < 0 ? 'down' : 'flat'; }
+function ticker(p) { return p.symbol || (p.mint ? '$' + String(p.mint).slice(0, 6) + '…' : '?'); }
+function stat(k, v, cls, sub) {
+  return h('div', { cls: 'stat' }, [
+    h('div', { cls: 'k', text: k }),
+    h('div', { cls: 'v ' + (cls || '') , text: v }),
+    sub ? h('div', { cls: 'sub', text: sub }) : null,
+  ]);
+}
+
+/* ── transport ───────────────────────────────────────────────────────── */
+/* One frame per engine tick, pushed over SSE. The polling fallback below is
+   NOT belt-and-braces: EventSource cannot be given a new query string without
+   being torn down, so changing focus reopens the stream — and if the stream is
+   unavailable for any reason, the page still works by polling rather than
+   showing nothing. */
+
+function accept(state) {
+  S.state = state;
+  S.focus = state.focusedMint;   /* the SERVER says what got focused */
+  S.lastOkAt = Date.now();
+  S.connected = true;
+  S.error = null;
+  render();
+}
+
+function fail(err) {
+  /* Do not freeze on the last good frame wearing a live face. A dashboard that
+     cannot look stale cannot be trusted when it looks fine. */
+  S.connected = false;
+  S.error = err && err.message ? err.message : String(err);
+  renderPills();
+}
+
+/** Full state, on demand. Used for the fallback and for the very first paint. */
+function refresh() {
+  var url = '/api/state' + (S.focus ? '?focus=' + encodeURIComponent(S.focus) : '');
+  return fetch(url, { cache: 'no-store' })
+    .then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(accept)
+    .catch(fail);
+}
+
+function connect() {
+  if (S.es) { S.es.close(); S.es = null; }
+  if (!window.EventSource) { startPolling(); return; }
+
+  var url = '/api/stream' + (S.focus ? '?focus=' + encodeURIComponent(S.focus) : '');
+  var es = new EventSource(url);
+  S.es = es;
+
+  es.onmessage = function (ev) {
+    stopPolling();
+    var state;
+    try { state = JSON.parse(ev.data); } catch (e) { fail(new Error('bad frame')); return; }
+    if (state && state.error) { fail(new Error(state.message || state.error)); return; }
+    accept(state);
+  };
+
+  /* EventSource retries on its own, on the cadence the server's `retry:` field
+     asked for. onerror fires on every drop, so this only has to make the drop
+     VISIBLE — reconnecting by hand here would race the browser's own retry and
+     open two streams. */
+  es.onerror = function () {
+    fail(new Error(es.readyState === 2 ? 'stream closed' : 'stream dropped, retrying'));
+    startPolling();
+  };
+}
+
+function startPolling() {
+  if (S.poll) return;
+  S.poll = setInterval(refresh, POLL_FALLBACK_MS);
+}
+function stopPolling() {
+  if (!S.poll) return;
+  clearInterval(S.poll);
+  S.poll = null;
+}
+
+/** Focus changes the query string, so the stream has to be reopened. */
+function setFocus(mint) {
+  S.focus = mint;
+  refresh().then(connect);
+}
+
+/* ── render ──────────────────────────────────────────────────────────── */
+function renderPills() {
+  var el = document.getElementById('pills');
+  clear(el);
+  var st = S.state;
+
+  /* Page age is measured by the BROWSER's clock against the last successful
+     fetch, so it keeps climbing when the server stops answering. A server-sent
+     age would sit frozen at whatever the last frame said. */
+  var pageAge = S.lastOkAt === null ? null : Date.now() - S.lastOkAt;
+  var linkCls = !S.connected ? 'err' : pageAge > 15000 ? 'warn' : 'ok';
+  var linkTxt = !S.connected
+    ? 'DISCONNECTED · frozen ' + fmtAge(pageAge) + (S.error ? ' · ' + S.error : '')
+    : 'updated ' + fmtAge(pageAge) + ' ago';
+  el.appendChild(h('span', { cls: 'pill ' + linkCls, text: linkTxt }));
+  document.body.classList.toggle('disconnected', !S.connected);
+
+  if (!st) return;
+  var f = st.freshness || {};
+
+  /* ── WHEN THE TRANSPORT IS DOWN, SERVER FACTS ARE LAST-KNOWN ────────────
+     Leaving "socket connected · whale 2s ago" next to DISCONNECTED is the
+     frozen-dashboard-wearing-a-live-face failure. Ages get the elapsed time
+     since the last good frame ADDED — that is arithmetic on two known
+     quantities, not invented data, so it is shown as a "≥" lower bound and it
+     keeps climbing. States we cannot recompute are labelled last-known. */
+  var gap = (!S.connected && S.lastOkAt !== null) ? Date.now() - S.lastOkAt : 0;
+  var stale = !S.connected;
+  var sfx = stale ? ' · last frame' : '';
+  var pre = stale ? '≥' : '';
+  function agePill(label, ms, warnOver) {
+    if (!num(ms)) return;
+    var total = ms + gap;
+    var cls = stale ? 'stale' : (warnOver && total > warnOver ? 'warn' : '');
+    el.appendChild(h('span', { cls: 'pill ' + cls, text: label + ' ' + pre + fmtAge(total) + ' ago' }));
+  }
+
+  var sockCls = stale ? 'stale' : f.socket === 'connected' ? 'ok' : f.socket === 'disconnected' ? 'err' : '';
+  el.appendChild(h('span', { cls: 'pill ' + sockCls, text: 'socket ' + (f.socket || 'unknown') + sfx }));
+  agePill('whale', f.newestWhaleEventAgeMs);
+  agePill('marks', f.lastMarkAgeMs, 60000);
+
+  var m = st.mode || {};
+  el.appendChild(h('span', { cls: 'pill', text: m.pureMirror ? 'pure mirror' : 'ladders + stops' }));
+  el.appendChild(h('span', {
+    cls: 'pill ' + (m.liquidityModel ? '' : 'warn'),
+    text: m.liquidityModel ? 'liq model ON · cap ' + m.poolCapPct + '%' : 'LIQ MODEL OFF',
+    title: m.liquidityModel ? '' : 'Fills are priced at mid against infinite depth.',
+  }));
+  if (num(st.solUsd)) {
+    el.appendChild(h('span', { cls: 'pill ' + (stale ? 'stale' : ''), text: 'SOL ' + fmtUsd(st.solUsd, false) + sfx }));
+  }
+}
+
+/* ── GMGN-style metric strip ─────────────────────────────────────────── */
+function metric(k, v, cls) {
+  return h('div', { cls: 'metric ' + (cls || '') }, [
+    h('div', { cls: 'mk', text: k }),
+    h('div', { cls: 'mv ' + (cls === 'slot' ? '' : dirCls(null)), text: v }),
+  ]);
+}
+
+function renderMetrics() {
+  var el = document.getElementById('metrics');
+  clear(el);
+  var st = S.state;
+  if (!st) return;
+  var c = st.scorecard;
+
+  el.appendChild(metric('SOL', num(st.solUsd) ? fmtUsd(st.solUsd, false) : '—'));
+
+  var t = c.target && c.target.wallet ? c.target : null;
+  el.appendChild(metric('Target', t ? (t.label || (t.wallet.slice(0, 8) + '…')) : 'none'));
+
+  el.appendChild(metric('Equity', fmtSol(c.equitySol, false) + ' SOL'));
+
+  var pnl = metric('Net P&L', fmtSol(c.totalPnlSol, true) + ' SOL');
+  pnl.querySelector('.mv').className = 'mv ' + dirCls(c.totalPnlSol);
+  el.appendChild(pnl);
+
+  var wr = metric('Win rate', c.winRatePct === null ? 'n/a' : c.winRatePct.toFixed(1) + '%');
+  el.appendChild(wr);
+
+  /* The slot badge reports the MODELLED fill offset, and only when slot fills
+     are actually on. A fixed "280ms" here would be decoration wearing the
+     clothes of a measurement. */
+  var sf = st.mode && st.mode.slotFills;
+  if (sf && sf.enabled) {
+    var o = sf.offsets || {};
+    var m = metric('Fill slot', 'N+' + o.expected + '  (N+' + o.earliest + '…N+' + o.latest + ')', 'slot');
+    m.title = 'Entries priced from real on-chain swaps at an ASSUMED landing slot. ' +
+              'Only the earliest rung is floored by a measured observation lag.';
+    el.appendChild(m);
+  } else {
+    var off = metric('Fill slot', 'off', 'slot');
+    off.querySelector('.mv').style.color = 'var(--dimmer)';
+    off.title = 'Slot-latency fills are off — entries are priced at the target\'s own fill, ' +
+                'a moment we could not have traded in. Enable with --slot-fills.';
+    el.appendChild(off);
+  }
+}
+
+/* ── position token tabs ─────────────────────────────────────────────── */
+function renderTabs() {
+  var el = document.getElementById('tabs');
+  clear(el);
+  var st = S.state;
+  if (!st || !(st.positions || []).length) return;
+
+  st.positions.forEach(function (p) {
+    var tab = h('div', { cls: 'tab' + (p.mint === st.focusedMint ? ' active' : ''), title: p.mint || '' }, [
+      h('span', { cls: 'tg', text: ticker(p) }),
+      h('span', { cls: dirCls(p.gainPct), text: fmtPct(p.gainPct, 1) }),
+    ]);
+    /* setFocus, not a bare refresh: the focus lives in the STREAM's query
+       string, so a refresh alone is overwritten by the next SSE frame. */
+    tab.addEventListener('click', function () {
+      setFocus(S.focus === p.mint ? null : p.mint);
+    });
+    el.appendChild(tab);
+  });
+}
+
+function renderStats() {
+  var el = document.getElementById('stats');
+  clear(el);
+  var st = S.state;
+  if (!st) return;
+  var c = st.scorecard;
+  var spot = st.solUsd;
+
+  el.appendChild(stat('Equity', fmtSol(c.equitySol, false) + ' SOL',
+    '', num(spot) ? fmtUsd(c.equitySol * spot, false) + ' at spot' : 'no spot price'));
+
+  el.appendChild(stat('Banked (realised)', fmtSol(c.realisedPnlSol, true) + ' SOL',
+    dirCls(c.realisedPnlSol), num(spot) ? fmtUsd(c.realisedPnlSol * spot, true) : ''));
+
+  el.appendChild(stat('Unrealised', fmtSol(c.unrealisedPnlSol, true) + ' SOL',
+    dirCls(c.unrealisedPnlSol), c.activePositions + ' open'));
+
+  el.appendChild(stat('Total P&L', fmtSol(c.totalPnlSol, true) + ' SOL',
+    dirCls(c.totalPnlSol), fmtPct(c.totalPnlPct) + ' of ' + fmtSol(c.budgetSol, false) + ' SOL'));
+
+  /* null is "nothing has resolved yet", 0 is "nothing won". The denominator
+     travels with the number so the percentage is never read alone. */
+  el.appendChild(stat('Win rate',
+    c.winRatePct === null ? 'n/a' : c.winRatePct.toFixed(1) + '%',
+    c.winRatePct === null ? 'flat' : dirCls(c.winRatePct - 50),
+    c.closedPositions === 0 ? 'nothing closed yet' : c.wins + 'W / ' + c.losses + 'L, closed only'));
+
+  el.appendChild(stat('Paid to depth', fmtSol(-(c.impactPaidSol || 0), true) + ' SOL',
+    c.impactPaidSol > 0 ? 'down' : 'flat',
+    (c.flooredFills || 0) > 0 ? c.flooredFills + ' fill(s) vs ASSUMED pool' : 'all fills vs measured pools'));
+}
+
+function renderFraming() {
+  var el = document.getElementById('framing');
+  clear(el);
+  var st = S.state;
+  var f = st && st.usdFraming;
+
+  if (!f) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+
+  /* vsStart = trading + drift, exactly. Showing the total alone is how a book
+     reports a 4% gain nobody earned when SOL moves and nothing trades. */
+  el.appendChild(h('div', {}, [
+    h('span', { cls: 'k', text: 'vs start USD  ' }),
+    h('span', { cls: dirCls(f.vsStartUsd), text: fmtUsd(f.vsStartUsd, true) }),
+  ]));
+  el.appendChild(h('div', {}, [
+    h('span', { cls: 'k', text: '— from trading  ' }),
+    h('span', { cls: dirCls(f.tradingPnlUsd), text: fmtUsd(f.tradingPnlUsd, true) }),
+  ]));
+  el.appendChild(h('div', {}, [
+    h('span', { cls: 'k', text: '— from SOL price  ' }),
+    h('span', { cls: dirCls(f.solDriftUsd), text: fmtUsd(f.solDriftUsd, true) }),
+  ]));
+  el.appendChild(h('div', { cls: 'note',
+    text: 'started ' + fmtUsd(f.budgetUsdAtStart, false) + ' @ ' + fmtUsd(f.solUsdAtStart, false) +
+          '/SOL · now ' + fmtUsd(f.solUsdNow, false) + '/SOL. The book holds SOL, so part of any dollar move is the SOL price and not a trade.' }));
+}
+
+function renderWarnings() {
+  var el = document.getElementById('warnings');
+  clear(el);
+  var st = S.state;
+  if (!st || !st.warnings) return;
+  st.warnings.forEach(function (w) {
+    el.appendChild(h('div', { cls: 'warning ' + (w.severity || 'warning') }, [
+      h('span', { cls: 'code', text: w.code }),
+      h('span', { text: w.message }),
+    ]));
+  });
+}
+
+function renderChart() {
+  var body = document.getElementById('chart-body');
+  var meta = document.getElementById('chart-meta');
+  clear(body); clear(meta);
+  var st = S.state;
+  if (!st) return;
+
+  var p = (st.positions || []).filter(function (x) { return x.mint === st.focusedMint; })[0];
+
+  if (!p) {
+    body.appendChild(h('div', { cls: 'chart-empty',
+      text: (st.positions || []).length ? 'Select a position to chart it.' : 'No open positions.' }));
+    return;
+  }
+
+  meta.textContent = ticker(p);
+
+  if (!p.series || !p.series.length) {
+    body.appendChild(h('div', { cls: 'chart-empty',
+      text: 'No samples yet for ' + ticker(p) + '. History starts accumulating on the next tick.' }));
+    return;
+  }
+
+  var width = Math.max(320, body.clientWidth || 560);
+  var geo = buildChartGeometry({
+    series: p.series,
+    marks: p.marks || [],
+    width: width,
+    height: 240,
+  });
+
+  if (!geo.ok) {
+    body.appendChild(h('div', { cls: 'chart-empty', text: 'Nothing plottable yet.' }));
+    return;
+  }
+
+  body.appendChild(drawChart(geo, p));
+
+  body.appendChild(h('div', { cls: 'chart-facts' }, [
+    h('div', {}, [h('div', { cls: 'k', text: 'marks' }), h('div', { cls: 'v', text: String(geo.sampleCount) + (p.seriesTruncated ? ' (capped)' : '') })]),
+    h('div', {}, [h('div', { cls: 'k', text: 'span' }), h('div', { cls: 'v', text: fmtAge(geo.spanMs) })]),
+    h('div', {}, [h('div', { cls: 'k', text: 'low' }), h('div', { cls: 'v', text: fmtPrice(Math.min.apply(null, p.series.map(function (s) { return s.priceUsd; }))) })]),
+    h('div', {}, [h('div', { cls: 'k', text: 'high' }), h('div', { cls: 'v', text: fmtPrice(Math.max.apply(null, p.series.map(function (s) { return s.priceUsd; }))) })]),
+  ]));
+}
+
+/* ── the SVG itself ──────────────────────────────────────────────────── */
+function svgEl(tag, attrs) {
+  var e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (var k in attrs) if (attrs[k] !== null && attrs[k] !== undefined) e.setAttribute(k, String(attrs[k]));
+  return e;
+}
+function svgTitle(node, text) {
+  var t = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+  t.textContent = text;   /* textContent here too — labels carry symbols */
+  node.appendChild(t);
+  return node;
+}
+
+var MARK_SHAPE = { ENTRY: 4.2, SCALE: 3.6, TP: 3.6, EXIT: 4.2 };
+
+function drawChart(geo, p) {
+  var svg = svgEl('svg', {
+    'class': 'chart',
+    viewBox: '0 0 ' + geo.width + ' ' + geo.height,
+    preserveAspectRatio: 'none',
+    role: 'img',
+  });
+
+  /* horizontal grid + price axis */
+  geo.yTicks.forEach(function (t) {
+    svg.appendChild(svgEl('line', { 'class': 'grid', x1: geo.plot.x, x2: geo.plot.x + geo.plot.w, y1: t.y, y2: t.y }));
+    var lbl = svgEl('text', { 'class': 'axis-label', x: geo.plot.x - 6, y: t.y + 3, 'text-anchor': 'end' });
+    lbl.textContent = fmtPrice(t.priceUsd);
+    svg.appendChild(lbl);
+  });
+
+  /* time axis, in clock time — the span is real, so the labels can be */
+  geo.xTicks.forEach(function (t, i) {
+    var lbl = svgEl('text', {
+      'class': 'axis-label',
+      x: t.x,
+      y: geo.plot.y + geo.plot.h + 13,
+      'text-anchor': i === 0 ? 'start' : i === geo.xTicks.length - 1 ? 'end' : 'middle',
+    });
+    lbl.textContent = new Date(t.t).toTimeString().slice(0, 8);
+    svg.appendChild(lbl);
+  });
+
+  /* the entry price, as a reference line: everything above it is profit */
+  if (num(p.entryPriceUsd) && p.entryPriceUsd >= geo.yDomain[0] && p.entryPriceUsd <= geo.yDomain[1]) {
+    var ey = geo.plot.y + geo.plot.h - ((p.entryPriceUsd - geo.yDomain[0]) / (geo.yDomain[1] - geo.yDomain[0])) * geo.plot.h;
+    svg.appendChild(svgEl('line', { 'class': 'entry-line', x1: geo.plot.x, x2: geo.plot.x + geo.plot.w, y1: ey, y2: ey }));
+  }
+
+  /* gaps: banded and dashed, never bridged */
+  geo.gaps.forEach(function (g) {
+    svg.appendChild(svgEl('rect', { 'class': 'gap-band', x: g.x1, y: geo.plot.y, width: Math.max(1, g.x2 - g.x1), height: geo.plot.h }));
+    var d = svgEl('line', { 'class': 'gap', x1: g.x1, x2: g.x2, y1: geo.plot.y + geo.plot.h / 2, y2: geo.plot.y + geo.plot.h / 2 });
+    svgTitle(d, 'No samples for ' + fmtAge(g.durationMs) + ' — nothing was observed here, so nothing is drawn.');
+    svg.appendChild(d);
+  });
+
+  /* the line, coloured by where it ended relative to entry */
+  var dir = num(p.gainPct) ? (p.gainPct >= 0 ? ' up' : ' down') : '';
+  geo.segments.forEach(function (d) {
+    svg.appendChild(svgEl('path', { 'class': 'line' + dir, d: d }));
+  });
+
+  /* markers last, so they sit on top of the line */
+  geo.markers.forEach(function (m) {
+    var r = MARK_SHAPE[m.kind] || 3.6;
+    var node;
+    if (m.kind === 'EXIT' || m.kind === 'SCALE') {
+      /* a diamond, so the kinds are distinguishable without relying on colour */
+      node = svgEl('path', {
+        'class': 'mk mk-' + m.kind + (m.clamped ? ' clamped' : ''),
+        d: 'M ' + m.x + ' ' + (m.y - r) + ' L ' + (m.x + r) + ' ' + m.y + ' L ' + m.x + ' ' + (m.y + r) + ' L ' + (m.x - r) + ' ' + m.y + ' Z',
+      });
+    } else {
+      node = svgEl('circle', { 'class': 'mk mk-' + m.kind + (m.clamped ? ' clamped' : ''), cx: m.x, cy: m.y, r: r });
+    }
+    svgTitle(node, m.kind + ' · ' + m.label + ' · ' + fmtPrice(m.priceUsd) +
+      (m.clamped
+        ? '  (happened ' + m.clampedFrom + ' the sampled window — pinned to the edge, not to this time)'
+        : '  at ' + new Date(m.t).toTimeString().slice(0, 8)));
+    svg.appendChild(node);
+  });
+
+  var wrap = document.createDocumentFragment();
+  wrap.appendChild(svg);
+
+  /* legend, only for the kinds actually present */
+  var present = {};
+  geo.markers.forEach(function (m) { present[m.kind] = true; });
+  var legend = h('div', { cls: 'chart-legend' });
+  ['ENTRY', 'SCALE', 'TP', 'EXIT'].forEach(function (k) {
+    if (!present[k]) return;
+    var sw = h('span', { cls: 'sw' });
+    sw.style.background = { ENTRY: 'var(--accent)', SCALE: 'var(--warn)', TP: 'var(--up)', EXIT: 'var(--down)' }[k];
+    legend.appendChild(h('span', {}, [sw, h('span', { text: k.toLowerCase() })]));
+  });
+  if (geo.markers.some(function (m) { return m.clamped; })) {
+    legend.appendChild(h('span', { text: '○ hollow = outside the sampled window' }));
+  }
+  wrap.appendChild(legend);
+
+  /* The caption is the honest part. These are marks, not candles: no highs, no
+     lows, nothing between two samples. */
+  var cap = h('div', { cls: 'chart-caption' });
+  cap.appendChild(h('b', { text: 'our marks' }));
+  cap.appendChild(h('span', { text: ' · ' + describeChart(geo) + ' · not candles: no high/low, and nothing between two samples' }));
+  wrap.appendChild(cap);
+
+  return wrap;
+}
+
+function renderPositions() {
+  var body = document.getElementById('pos-body');
+  var meta = document.getElementById('pos-meta');
+  clear(body); clear(meta);
+  var st = S.state;
+  if (!st) return;
+
+  var ps = st.positions || [];
+  meta.textContent = ps.length + (ps.length === 1 ? ' position' : ' positions');
+
+  if (!ps.length) {
+    body.appendChild(h('div', { cls: 'empty', text: 'No open positions.' }));
+    return;
+  }
+
+  ps.forEach(function (p) {
+    var pool = p.poolMeasured === true
+      ? h('span', { cls: 'badge measured', text: '✓ measured pool', title: 'Entry priced against a pool that was actually read.' })
+      : p.poolMeasured === false
+        ? h('span', { cls: 'badge assumed', text: '⚠ assumed pool', title: 'No pool was read. Fill priced against the constant floor, which overcharges a 1 SOL buy by roughly 2.5 points against measured pools.' })
+        : h('span', { cls: 'badge none', text: '– no depth model', title: 'The liquidity model is off, so depth was never spoken about.' });
+
+    var mint = encodeURIComponent(p.mint || '');
+    var card = h('div', { cls: 'card' + (p.mint === st.focusedMint ? ' focused' : '') }, [
+      h('div', { cls: 'r1' }, [
+        h('div', { cls: 'tick', text: ticker(p), title: p.mint || '' }),
+        h('div', { cls: 'gain ' + dirCls(p.gainPct), text: fmtPct(p.gainPct, 1) }),
+      ]),
+      h('div', { cls: 'r2' }, [
+        h('span', { text: num(p.valueUsd) ? fmtUsd(p.valueUsd, false) : fmtSol(p.valueSol, false) + ' SOL' }),
+        h('span', { text: 'entry ' + fmtPrice(p.entryPriceUsd) }),
+        h('span', { text: 'mark ' + fmtPrice(p.markPriceUsd) }),
+        h('span', { text: 'held ' + fmtAge(p.heldMs) }),
+        h('span', { text: 'stake ' + fmtSol(p.stakeSol, false) + ' SOL' }),
+      ]),
+      h('div', { cls: 'r3' }, [
+        pool,
+        p.markStale ? h('span', { cls: 'badge stale', text: 'STALE ' + fmtAge(p.markAgeMs) }) : null,
+        p.liquidityCapped ? h('span', { cls: 'badge assumed', text: 'pool-capped' }) : null,
+        p.demo ? h('span', { cls: 'badge demo', text: 'demo' }) : null,
+        (p.firedRungs || []).length ? h('span', { cls: 'badge', text: p.firedRungs.join(', ') }) : null,
+        h('span', { cls: 'links' }, [
+          h('a', { href: 'https://gmgn.ai/sol/token/' + mint, text: 'GMGN' }),
+          h('a', { href: 'https://solscan.io/token/' + mint, text: 'Solscan' }),
+          h('a', { href: 'https://dexscreener.com/solana/' + mint, text: 'DEX' }),
+        ]),
+      ]),
+    ]);
+
+    /* A link click must not also re-focus the card underneath it. */
+    card.querySelectorAll('a').forEach(function (a) {
+      a.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    });
+    card.addEventListener('click', function () {
+      setFocus(S.focus === p.mint ? null : p.mint);
+    });
+
+    body.appendChild(card);
+  });
+}
+
+function renderActivity() {
+  var body = document.getElementById('act-body');
+  var meta = document.getElementById('act-meta');
+  clear(body); clear(meta);
+  var st = S.state;
+  if (!st) return;
+
+  var rows = (st.activity || []).slice().reverse();   /* newest first */
+  meta.textContent = rows.length ? rows.length + ' events this session' : '';
+
+  if (!rows.length) {
+    body.appendChild(h('div', { cls: 'empty', text: 'Nothing yet.' }));
+    return;
+  }
+
+  rows.forEach(function (a) {
+    if (typeof a === 'string') {
+      body.appendChild(h('div', { cls: 'act' }, [h('span', { cls: 'm', text: a })]));
+      return;
+    }
+    var kind = String(a.kind || '').trim();
+    var row = h('div', { cls: 'act' }, [
+      h('span', { cls: 't', text: a.stamp || '' }),
+      h('span', { cls: 'pill-k ' + kind, text: kind }),
+      h('span', { cls: 'm', text: a.symbol || (a.mint ? String(a.mint).slice(0, 8) + '…' : '') }),
+    ]);
+
+    /* Exact SOL, as a number rather than buried in a rendered tail. */
+    if (num(a.sizeSol)) {
+      row.appendChild(h('span', { cls: 'sol', text: fmtSol(a.sizeSol, false) + ' SOL' }));
+    }
+
+    /* The modelled fill slot for THIS trade — not a constant. Absent when slot
+       fills were off or the chain could not answer, because there is then no
+       slot to name. */
+    if (num(a.fillSlotOffset)) {
+      row.appendChild(h('span', {
+        cls: 'tag slot',
+        text: 'N+' + a.fillSlotOffset + (num(a.fillLagMs) ? ' · ' + (a.fillLagMs / 1000).toFixed(1) + 's' : ''),
+        title: 'Priced from real on-chain swaps at an assumed landing slot.',
+      }));
+    }
+
+    /* What arriving late cost, against the price the target actually got. */
+    if (num(a.dragPct)) {
+      row.appendChild(h('span', {
+        cls: 'tag drag' + (a.dragPct <= 0 ? ' good' : ''),
+        text: 'drag ' + fmtPct(a.dragPct, 2),
+        title: 'Our fill against the target\'s own fill on the trade that caused ours.',
+      }));
+    }
+
+    if (num(a.impactPct) && a.impactPct > 0) {
+      row.appendChild(h('span', {
+        cls: 'tag',
+        text: 'impact ' + a.impactPct.toFixed(2) + '%' + (a.poolMeasured === false ? '*' : ''),
+        title: a.poolMeasured === false ? 'Priced against the ASSUMED pool floor, not a pool anyone read.' : '',
+      }));
+    }
+    if (a.liquidityCapped) row.appendChild(h('span', { cls: 'tag', text: 'pool-capped' }));
+
+    var tail = kind === 'SELL'
+      ? (a.trigger || '') + (num(a.gainPct) ? ' (' + fmtPct(a.gainPct, 0) + ')' : '')
+      : (a.whale || '');
+    row.appendChild(h('span', { cls: 'x', text: tail }));
+
+    /* 1-click Solscan for the TRANSACTION that caused this row. Falls back to
+       the token when the signature was not carried. */
+    if (a.signature) {
+      row.appendChild(h('a', { cls: 'tx', href: 'https://solscan.io/tx/' + encodeURIComponent(a.signature), text: 'tx ↗' }));
+    } else if (a.mint) {
+      row.appendChild(h('a', { cls: 'tx', href: 'https://solscan.io/token/' + encodeURIComponent(a.mint), text: 'token ↗' }));
+    }
+
+    body.appendChild(row);
+  });
+}
+
+/* ── Tier B: DexScreener's chart, in an iframe, only if asked twice ────── */
+/* Twice, deliberately: --dashboard-embed is the operator allowing it, and the
+   button below is the moment a request actually leaves this machine. The first
+   is a capability; the second is the disclosure. Nothing is fetched from
+   dexscreener.com until the second one happens. */
+
+function renderEmbed() {
+  var panel = document.getElementById('embed');
+  var body = document.getElementById('embed-body');
+  var meta = document.getElementById('embed-meta');
+  var st = S.state;
+
+  if (!st || !st.mode || !st.mode.embed || !st.mode.embed.enabled) {
+    /* Not merely hidden — never built. With Tier B off the server also sends
+       frame-src 'none' and no embedUrl, so there is nothing here to trip over. */
+    panel.hidden = true;
+    clear(body);
+    S.embedRendered = null;
+    return;
+  }
+  panel.hidden = false;
+
+  var p = (st.positions || []).filter(function (x) { return x.mint === st.focusedMint; })[0];
+
+  /* ── REBUILD ONLY WHEN THE ANSWER CHANGES ───────────────────────────────
+     render() runs on every frame — once a second. Recreating the <iframe>
+     each time would re-request dexscreener.com once a second: a load the page
+     never intended and they never agreed to serve. So the desired state is
+     reduced to a key, and an unchanged key leaves the existing frame alone. */
+  var desired = !p ? 'none'
+    : !p.embedUrl ? 'nourl'
+    : (S.embedLoaded === p.mint || (S.embedAuto && S.embedConsented)) ? 'frame:' + p.mint
+    : 'consent:' + p.mint;
+
+  if (S.embedRendered === desired) return;
+  S.embedRendered = desired;
+
+  clear(body); clear(meta);
+
+  if (!p) {
+    body.appendChild(h('div', { cls: 'embed-off', text: 'Select a position to load its market chart.' }));
+    return;
+  }
+  meta.textContent = ticker(p) + ' · dexscreener.com';
+
+  if (!p.embedUrl) {
+    body.appendChild(h('div', { cls: 'embed-off', text: 'No embed URL for this mint.' }));
+    return;
+  }
+
+  if (desired.indexOf('frame:') === 0) {
+    S.embedLoaded = p.mint;
+    var frame = h('iframe', { cls: 'embed-frame' });
+    frame.src = p.embedUrl;
+    /* ── WHY allow-same-origin, AND WHAT WAS ACTUALLY ESTABLISHED ──────────
+       Established: `sandbox="allow-scripts"` ALONE is wrong. It gives the frame
+       an opaque origin, their settings load has no storage to read, and it
+       hangs at "Loading chart settings…" — a distinct stage, with a mechanism
+       that explains itself. allow-same-origin fixes that stage; the frame then
+       advances to "Loading pair…".
+
+       NOT established: whether the sandbox affects anything after that. The
+       "Loading pair…" hang was seen with this sandbox, with allow="", AND with
+       a completely plain iframe — and a plain iframe both succeeded and failed
+       on the same mint minutes apart. That points at DexScreener's side
+       (throttling after ~10 embed loads in a few minutes is the obvious
+       candidate), not at any attribute here. A cross-origin frame's internals
+       are invisible to devtools, so this cannot be pinned down from our side.
+
+       So the restriction stays: it is not shown to break anything, and the
+       failures it was briefly blamed for happen without it too. Prefer the
+       tighter setting when the evidence against it does not hold up.
+
+       The pair allow-scripts + allow-same-origin is the classic warning only
+       when the framed document is SAME-ORIGIN with the embedder — it could then
+       script the parent and strip its own sandbox. This frame is cross-origin,
+       so the pair returns DexScreener's origin to DexScreener and hands us
+       nothing away.
+
+       What the sandbox still buys: no top-level navigation, no popups, no form
+       submission, no modals, no downloads. A chart needs none of them. */
+    frame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+    frame.setAttribute('referrerpolicy', 'no-referrer');
+    frame.setAttribute('loading', 'lazy');
+    frame.setAttribute('title', 'DexScreener market chart');
+    body.appendChild(frame);
+
+    var actions = h('div', { cls: 'embed-actions' });
+    var stop = h('button', { cls: 'btn danger', text: 'Unload' });
+    stop.addEventListener('click', function () {
+      S.embedLoaded = null; S.embedAuto = false; renderEmbed();
+    });
+    actions.appendChild(stop);
+
+    var autoWrap = h('label', {});
+    var auto = h('input', {});
+    auto.type = 'checkbox';
+    auto.checked = !!S.embedAuto;
+    auto.addEventListener('change', function () { S.embedAuto = auto.checked; });
+    autoWrap.appendChild(auto);
+    autoWrap.appendChild(h('span', { text: ' keep loading when I switch position (this session)' }));
+    actions.appendChild(autoWrap);
+    body.appendChild(actions);
+
+    /* The honest caption. This chart has real wicks and no idea who we are. */
+    body.appendChild(h('div', { cls: 'embed-note',
+      text: 'DexScreener\'s own chart — real candles with highs and lows, from every trade, not just our samples. ' +
+            'It cannot show our entry, scale-ins, TP rungs or exit: it is a cross-origin frame and nothing can be drawn into it. ' +
+            'For those, use the price-history panel above.' }));
+    return;
+  }
+
+  /* Not loaded. Say exactly what clicking does, before it is clicked. */
+  var consent = h('div', { cls: 'embed-consent' }, [
+    h('div', {}, [
+      h('span', { cls: 'who', text: 'Loading this sends a request to dexscreener.com. ' }),
+      h('span', { text:
+        'Their server learns your IP and which mint you are looking at, live, and can correlate that across the session — ' +
+        'so it learns which tokens this book holds and roughly when you opened them. ' +
+        'The engine\'s own price reads are server-side and carry no browser session; this frame is not the same thing.' }),
+    ]),
+  ]);
+  var actions = h('div', { cls: 'embed-actions' });
+  var load = h('button', { cls: 'btn', text: 'Load ' + ticker(p) + ' chart' });
+  load.addEventListener('click', function () {
+    S.embedConsented = true;
+    S.embedLoaded = p.mint;
+    renderEmbed();
+  });
+  actions.appendChild(load);
+  actions.appendChild(h('span', { cls: 'embed-off', text: 'Nothing has been requested yet.' }));
+  consent.appendChild(actions);
+  body.appendChild(consent);
+}
+
+function render() {
+  renderPills();
+  renderMetrics();
+  renderStats();
+  renderFraming();
+  renderWarnings();
+  renderTabs();
+  renderChart();
+  renderEmbed();
+  renderPositions();
+  renderActivity();
+
+  /* Two chart panes share the top row only when Tier B is actually on. Half an
+     empty row is worse than no row. */
+  var dual = !!(S.state && S.state.mode && S.state.mode.embed && S.state.mode.embed.enabled);
+  document.querySelector('main').classList.toggle('dual', dual);
+
+  var st = S.state;
+  document.getElementById('target').textContent =
+    st && st.scorecard && st.scorecard.target && st.scorecard.target.wallet
+      ? '· ' + st.scorecard.target.wallet
+      : '';
+  document.getElementById('foot').textContent =
+    'Paper book. Nothing here is signed, sent or spent. Read-only view — the engine is the one process that writes.';
+}
+
+document.getElementById('foot').textContent = 'connecting…';
+/* One fetch for the first paint — the stream's own opening frame would also do
+   it, but this paints before the socket handshake completes. */
+refresh().then(connect);
+setInterval(renderPills, AGE_MS);   /* staleness climbs even when the server is gone */
+</script>
+</body>
+</html>

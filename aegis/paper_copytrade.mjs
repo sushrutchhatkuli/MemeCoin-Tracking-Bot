@@ -76,6 +76,9 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
+process.stdout?.on?.('error', () => {});
+process.stderr?.on?.('error', () => {});
+
 import { fetchPairsBatch, fetchDexScreenerPrice } from './sources.mjs';
 import { loadObservations } from './wallet_observations.mjs';
 import { websocketUrlFor } from './discovery_daemon.mjs';
@@ -177,6 +180,62 @@ export const PAPER_DEFAULTS = {
   // Below this the fee and rent inside solSpent distort the implied price
   // enough to matter, so the pair lookup is used instead.
   impliedMinSpendSol: 0.05,
+  // ── DEX LIQUIDITY MODEL ───────────────────────────────────────────────────
+  // Price every fill against the pool it would actually have to cross, instead
+  // of at the quoted mid. See the "DEX liquidity" section for the arithmetic
+  // and for the pool depths it was measured against.
+  //
+  // ON by default, unlike copyImpactPct, and the difference is that this is not
+  // a constant: it is read per token from the pair that prices the position, so
+  // there is no single number to be wrong about. What IS a constant is
+  // poolFloorSol, which is why poolDepthLookup exists to keep it rare.
+  liquidityModel: true,
+  // ── SLOT-LATENCY FILLS ────────────────────────────────────────────────────
+  // Price entries and exits from REAL on-chain swaps at the slot we could
+  // actually have landed in, instead of at the target's own fill or a
+  // DexScreener mid. See the "Slot-latency fills" section for the measured
+  // observation lag this is built on, and for the two things it still cannot
+  // model (our own impact, and fill probability).
+  //
+  // OFF BY DEFAULT, and the reason is cost rather than doubt: the existing
+  // implied-price path makes NO extra RPC call, because the swap carries its
+  // own price. This one spends a getSignaturesForAddress plus up to
+  // slotFillMaxLookups getTransaction calls PER MIRRORED TRADE. That is a real
+  // bill and the operator should choose to pay it.
+  slotFills: false,
+  // Slots after the target's trade. `expected` is what the book trades on;
+  // earliest and latest are reported beside it as an uncertainty spread.
+  // earliest is floored by a MEASURED observation lag; the other two are
+  // assumptions — see DEFAULT_SLOT_OFFSETS.
+  slotOffsets: { earliest: 3, expected: 5, latest: 10 },
+  // Transactions read per window. Bounds the bill on a busy token.
+  slotFillMaxLookups: 40,
+  // Largest share of a pool's SOL side one paper trade may take.
+  poolCapPct: 5,
+  // Assumed depth when a pool cannot be read. Conservative, and WRONG — see the
+  // section header. 30 SOL is roughly $2,500 at current spot.
+  poolFloorSol: 30,
+  // Resolve pool depth for chain-mirrored candidates that priced themselves
+  // from the swap and would otherwise skip the pair lookup entirely.
+  //
+  // ── OFF, BECAUSE THE FAST PATH IS A MEASURED PROPERTY AND THIS IS NOT ─────
+  // An implied entry deliberately makes NO pair lookup: the swap carries its own
+  // price and the round trip plus fetchPairsBatch's 250ms internal pace is the
+  // latency the whole path exists to avoid. Turning that off by default would
+  // trade a property this repo engineered and tested for one the operator did
+  // not ask for.
+  //
+  // WHAT IT COSTS TO LEAVE IT OFF, stated plainly: an entry with no pool on file
+  // pays poolFloorSol instead. Against the 117-260 SOL pools measured for this
+  // population that overcharges a 1 SOL buy by roughly 2.5 percentage points,
+  // every time, and the scorecard's "priced against the ASSUMED pool floor" line
+  // is how you see it happening.
+  //
+  // EXITS ARE UNAFFECTED EITHER WAY. Open positions are marked through the pair
+  // feed every tick, so a sell always has real depth — which is where the model
+  // matters most, since a position that ran 10x is the one the pool cannot
+  // absorb. Turn this on to put entries on the same footing.
+  poolDepthLookup: false,
   // SCALE IN. When the target buys MORE of something already held, add to the
   // position instead of declining the trade. A copy that ignores the second buy
   // mirrors a conviction the target expressed only once.
@@ -308,6 +367,18 @@ export function paperConfig(overrides = {}) {
   cfg.useImpliedEntry = cfg.useImpliedEntry !== false;
   cfg.copyImpactPct = Math.max(0, Number(cfg.copyImpactPct) || 0);
   cfg.impliedMinSpendSol = Math.max(0, Number(cfg.impliedMinSpendSol) || 0);
+  cfg.liquidityModel = cfg.liquidityModel !== false;
+  cfg.poolDepthLookup = cfg.poolDepthLookup !== false;
+  // A cap of 0 sizes every trade to nothing and a cap above 100 lets one order
+  // claim more than the pool holds. Both are config mistakes that produce a book
+  // which looks like it is working, so 0 and anything unreadable go back to the
+  // default while an over-large value is clamped to the whole pool.
+  const capPct = Number(cfg.poolCapPct);
+  cfg.poolCapPct = Number.isFinite(capPct) && capPct > 0 ? Math.min(100, capPct) : PAPER_DEFAULTS.poolCapPct;
+  // A floor of 0 is not "no floor", it is a pool of nothing: priceImpactPct
+  // would refuse it and every unmeasured fill would silently go back to being
+  // free. Falls back to the default instead.
+  cfg.poolFloorSol = Number(cfg.poolFloorSol) > 0 ? Number(cfg.poolFloorSol) : PAPER_DEFAULTS.poolFloorSol;
   cfg.rpcMirror = { ...PAPER_DEFAULTS.rpcMirror, ...(cfg.rpcMirror ?? {}) };
   // Pure mirror without the chain feed would be a book that can never sell:
   // the ledger records buys only, so the sole exit path would be gone. Forced
@@ -360,7 +431,7 @@ export function paperConfig(overrides = {}) {
  * those would silently make the mirror sample a biased subset of the whale's
  * activity rather than a smaller version of it.
  */
-export function mirrorPositionSize(cfg, { whaleSpendSol = null, balanceSol = 0 } = {}) {
+export function mirrorPositionSize(cfg, { whaleSpendSol = null, balanceSol = 0, poolSol = null } = {}) {
   const spendable = balanceSol - cfg.feeSol;
   if (!(spendable > 0)) return { ok: false, reason: 'insufficient virtual balance' };
 
@@ -383,10 +454,296 @@ export function mirrorPositionSize(cfg, { whaleSpendSol = null, balanceSol = 0 }
 
   // Capped by what is actually free, so a whale buying 30 SOL cannot overdraw a
   // book holding one.
-  const sizeSol = Math.min(target, spendable);
-  if (!(sizeSol > 0)) return { ok: false, reason: 'insufficient virtual balance', basis };
+  const afterBalance = Math.min(target, spendable);
+  if (!(afterBalance > 0)) return { ok: false, reason: 'insufficient virtual balance', basis };
 
-  return { ok: true, sizeSol, basis, capped: sizeSol < target };
+  // ── AND THEN BY THE POOL, WHICH IS THE HARDER CONSTRAINT ──────────────────
+  // A book with balance to spare can still not fill against a pool that is not
+  // there. capTradeToPool is a no-op when the caller passes no depth, so every
+  // existing caller — live_copytrade among them — behaves exactly as before.
+  const pooled = capTradeToPool(afterBalance, poolSol, {
+    poolCapPct: cfg.poolCapPct,
+    enabled: cfg.liquidityModel !== false,
+  });
+  const sizeSol = pooled.sizeSol;
+
+  // Checked AGAIN after the pool cap. minTradeSol exists so the book does not
+  // take positions too small to be worth their own fees, and a trade shrunk to
+  // dust by pool depth is dust for the same reason — the earlier check only saw
+  // what was requested. Declined with the pool named, because "below
+  // minTradeSol" alone sends the operator to the wrong knob.
+  if (cfg.minTradeSol > 0 && sizeSol < cfg.minTradeSol) {
+    return {
+      ok: false,
+      reason:
+        `pool depth caps this at ${sizeSol.toFixed(4)} SOL ` +
+        `(${cfg.poolCapPct}% of a ${poolSol?.toFixed?.(1) ?? '?'} SOL pool), below minTradeSol ${cfg.minTradeSol}`,
+      basis,
+      liquidityCapped: true,
+    };
+  }
+
+  return {
+    ok: true,
+    sizeSol,
+    basis,
+    // BALANCE cap only. Measured against the pre-pool size on purpose: these are
+    // two different constraints with two different fixes — add funds, or accept
+    // that the pool is not there — and a single flag that means either sends the
+    // operator to the wrong one.
+    capped: afterBalance < target,
+    liquidityCapped: pooled.capped,
+    requestedSol: afterBalance,
+    maxPoolTradeSol: pooled.maxTradeSol,
+    poolSol: pooled.poolSol,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * DEX liquidity: pool depth, price impact, and the size cap
+ * ------------------------------------------------------------------ *
+ *
+ * A paper fill at the quoted mid assumes infinite depth. Nothing on Solana has
+ * infinite depth, and this book trades the shallowest end of it: MEASURED
+ * 2026-08-19 across five pumpswap pairs the ledger had just seen bought, the
+ * SOL side of the pool held
+ *
+ *     117.2   143.0   179.9   255.1   260.4   SOL
+ *
+ * against $21.6k - $46.1k of total pool value. A 1 SOL buy is 0.4-0.9% of that
+ * depth; a 10 SOL buy is 4-8%, and a position that ran 10x is trying to sell
+ * back a size the pool never had.
+ *
+ * ── WHY size/(pool + size) IS THE EXACT CONSTANT-PRODUCT ANSWER ─────────────
+ * For reserves R (SOL) and T (token) with R·T = k:
+ *
+ *   BUY of s SOL   tokens out = T·s/(R+s), against T·s/R at the mid.
+ *                  The shortfall is exactly s/(R+s) of what the mid implied.
+ *   SELL worth v   SOL out = v·R/(R+v) — short of v by exactly v/(R+v).
+ *
+ * So one formula is exact on both legs, provided it is applied as a SHARE OF
+ * VALUE rather than as a price adjustment. On the sell it is both: the exit
+ * price is mid × (1 - impact). On the BUY it is not — paying `mid × (1 + s/R)`
+ * per token is what gives you (1 - impact) of the tokens, and mid × (1+impact)
+ * is a different, smaller number. entryFillUsd divides rather than multiplies
+ * for exactly this reason, and 1/(1 - s/(R+s)) is identically 1 + s/R.
+ *
+ * At the 5% cap the two forms differ by 25 basis points. Uncapped at 50% of a
+ * pool they differ by a third, which is the case this model exists to price.
+ *
+ * ── THE FLOOR IS A REAL COST, NOT A SAFE DEFAULT ───────────────────────────
+ * An unmeasured pool falls back to poolFloorSol, 30 SOL. Against the depths
+ * measured above that is 4-8x too shallow, and it charges a 1 SOL entry 3.2%
+ * where the real pools charge 0.4-0.9%. It is the conservative direction, and
+ * conservative is still WRONG — it is there so a missing lookup cannot be read
+ * as free liquidity, not because 30 SOL is a good estimate of anything.
+ * poolDepthLookup defaults on so the floor stays rare.
+ *
+ * ── ENTRIES ARE CAPPED, EXITS ARE NOT ──────────────────────────────────────
+ * Deliberately asymmetric. A capped entry is a smaller position; a capped exit
+ * is a position that cannot be closed, which would leave the book holding bags
+ * it decided to sell and make every stop and rung advisory. An oversized exit
+ * instead pays the full curve — a position now worth half its pool gives up 33%
+ * getting out — which is self-limiting in the way that matters and is the
+ * honest reason a 10x on paper is not a 10x in a wallet.
+ */
+
+/**
+ * The SOL side of the pool, from a DexScreener pair. PURE.
+ *
+ * VERIFIED against live payloads 2026-08-19: on a SOL-quoted pumpswap pair,
+ * `liquidity.quote` IS the SOL reserve — BABYANSEM read 179.8981 against
+ * `liquidity.usd` 32,306.5 at $86.05/SOL, and 179.9 × 86.05 = $15.5k, half the
+ * pool, exactly as a constant-product pair requires.
+ *
+ * A USDC-quoted pair does NOT work that way and the same field would be read as
+ * 16.3 MILLION SOL — the real WSOL/USDC pair on Orca returns
+ * `liquidity.quote: 16322245`, which is dollars. Hence the quote-token check
+ * before the field is trusted, and the halve-and-convert path for everything
+ * else.
+ */
+/**
+ * pump.fun's initial virtual reserves: 30 SOL against 1,073,000,191 tokens.
+ *
+ * Their product is the curve's k, and it is what makes a bonding-curve token
+ * priceable at all — see pumpFunCurveSol.
+ */
+export const PUMPFUN_VIRTUAL_SOL = 30;
+export const PUMPFUN_VIRTUAL_TOKENS = 1_073_000_191;
+const PUMPFUN_K = PUMPFUN_VIRTUAL_SOL * PUMPFUN_VIRTUAL_TOKENS;
+
+/**
+ * Depth of a pump.fun bonding curve, from its price alone. PURE.
+ *
+ * ── WHY THIS EXISTS: DEXSCREENER PUBLISHES NO `liquidity` FOR A CURVE ──────
+ * MEASURED 2026-08-19 over the 56 most recently observed mints: 23 of them —
+ * 41% — were `dexId: 'pumpfun'`, and EVERY ONE returned `liquidity: undefined`
+ * while returning a perfectly good price. Those are pre-migration tokens, which
+ * is where a sub-$100k-entry target does most of its trading, so leaving them
+ * to poolFloorSol would mean the floor was not the fallback — it was the model.
+ *
+ * ── AND IT IS DERIVABLE, BECAUSE THE CURVE IS CONSTANT-PRODUCT TOO ─────────
+ * The curve holds virtualSol x virtualTokens = k, and quotes
+ * price = virtualSol / virtualTokens. Two equations, one unknown:
+ *
+ *     virtualSol = sqrt(k x priceNative)
+ *
+ * VERIFIED two ways on live pairs the same day. Every derived reserve landed
+ * inside the curve's only valid range — 31.66 to 100.28 virtual SOL, which is
+ * 1.7 to 70 SOL of real deposits against a curve that migrates near 85:
+ *
+ *     murb      60.66      Kirkify  100.28      GOD CANDLE  43.19
+ *     EUPHORIA  52.55      RABBIT    75.89      WASB        31.66
+ *
+ * And the implied market cap matches DexScreener's own to within 0.05% —
+ * murb derived $9,896 against a reported $9,901.34, Kirkify $27,047 against
+ * $27,051.45 — which is an independent check on the constants above rather
+ * than on the algebra.
+ *
+ * THE VIRTUAL RESERVE IS THE RIGHT DEPTH, not the real one. Impact on the curve
+ * is size/(virtualSol + size); pricing against real deposits would overstate
+ * the cost of every early buy, badly, on exactly the trades this target makes.
+ */
+export function pumpFunCurveSol(pair) {
+  const priceNative = Number(pair?.priceNative);
+  if (!Number.isFinite(priceNative) || priceNative <= 0) return null;
+  const virtualSol = Math.sqrt(PUMPFUN_K * priceNative);
+  if (!Number.isFinite(virtualSol)) return null;
+  // A curve cannot hold less than it started with, and one that has passed
+  // ~115 virtual SOL has migrated and should be quoting a real pool instead —
+  // a number far outside that band means this is not a curve and the price was
+  // read against the wrong shape.
+  if (virtualSol > 200) return null;
+  return Math.max(PUMPFUN_VIRTUAL_SOL, virtualSol);
+}
+
+export function poolReserveSol(pair, { solUsd = null, floorSol = 30 } = {}) {
+  // Checked BEFORE the liquidity fields, because a curve has neither and would
+  // otherwise fall straight through to the floor.
+  if (String(pair?.dexId ?? '').toLowerCase() === 'pumpfun') {
+    const curve = pumpFunCurveSol(pair);
+    if (curve !== null) {
+      return { reserveSol: curve, measured: true, basis: 'pump.fun bonding curve, derived from price' };
+    }
+  }
+
+  const quoteAddress = String(pair?.quoteToken?.address ?? '');
+  const quoteSymbol = String(pair?.quoteToken?.symbol ?? '').toUpperCase();
+  const quoteReserve = Number(pair?.liquidity?.quote);
+  const solQuoted = quoteAddress === WSOL_MINT || quoteSymbol === 'SOL' || quoteSymbol === 'WSOL';
+
+  if (solQuoted && Number.isFinite(quoteReserve) && quoteReserve > 0) {
+    return {
+      reserveSol: quoteReserve,
+      measured: true,
+      basis: `SOL reserve of the ${pair?.dexId ?? 'dex'} pair`,
+    };
+  }
+
+  // Half the pool's dollar value is the quote side of a constant-product pair,
+  // whatever it is denominated in. One conversion away from the reserve, and
+  // the only route available on a pair quoted in something other than SOL.
+  const liquidityUsd = Number(pair?.liquidity?.usd);
+  if (Number.isFinite(liquidityUsd) && liquidityUsd > 0 && Number.isFinite(solUsd) && solUsd > 0) {
+    return {
+      reserveSol: liquidityUsd / 2 / solUsd,
+      measured: true,
+      basis: `half of $${Math.round(liquidityUsd).toLocaleString('en-US')} pool value at $${solUsd}/SOL`,
+    };
+  }
+
+  return { reserveSol: floorSol, measured: false, basis: `unmeasured — conservative floor ${floorSol} SOL` };
+}
+
+/**
+ * Which pool depth a trade is actually priced against. PURE.
+ *
+ * The one place "no depth on file" turns into a number, so the floor cannot be
+ * applied in one code path and forgotten in another. `active: false` when the
+ * model is switched off, which is not the same as a pool of zero.
+ */
+/**
+ * Which pool depth a trade is actually priced against. PURE.
+ *
+ * ── undefined AND null ARE DIFFERENT ANSWERS, AND THE FLOOR ONLY ANSWERS ONE ─
+ *   undefined  no depth was SOUGHT. The caller is not participating in the
+ *              liquidity model — a direct openPaperPosition, a demo trade, a
+ *              price fetcher that returns bare numbers and cannot carry depth.
+ *              The model stays out of it entirely.
+ *   null       depth was sought and NOT FOUND. This is the case poolFloorSol
+ *              exists for: a pair that priced but reported no liquidity, or a
+ *              mint the feed could not resolve at all.
+ *
+ * Collapsing the two would charge the floor to every caller that never asked,
+ * which is not conservatism — it is inventing a market for a trade nobody
+ * looked up. runPaperTick passes null explicitly wherever a lookup was made and
+ * came back empty, so the floor still lands on every case it was asked to.
+ */
+export function resolvePoolSol(poolSolReserve, cfg = PAPER_DEFAULTS) {
+  if (cfg?.liquidityModel === false) return { reserveSol: null, measured: null, active: false };
+  if (poolSolReserve === undefined) return { reserveSol: null, measured: null, active: false };
+  const measured = Number.isFinite(poolSolReserve) && poolSolReserve > 0;
+  return {
+    reserveSol: measured ? poolSolReserve : (cfg?.poolFloorSol ?? PAPER_DEFAULTS.poolFloorSol),
+    measured,
+    active: true,
+  };
+}
+
+/**
+ * Price impact of moving `sizeSol` through a pool holding `poolSol`. PURE.
+ *
+ *   impact% = sizeSol / (poolSol + sizeSol) × 100
+ *
+ * Returns null — never 0 — when there is no pool to price against. Zero impact
+ * and unknown impact are different claims and the callers treat them
+ * differently.
+ */
+export function priceImpactPct(sizeSol, poolSol) {
+  if (!(sizeSol > 0)) return 0;
+  if (!Number.isFinite(poolSol) || poolSol <= 0) return null;
+  return (sizeSol / (poolSol + sizeSol)) * 100;
+}
+
+/**
+ * Hold a trade to a share of the pool it has to fill against. PURE.
+ *
+ * Capping rather than declining is the point: the trade still happens, at the
+ * size the pool can actually absorb. Declining would silently make the mirror a
+ * biased subset of the target's activity — the same trap mirrorPositionSize's
+ * unattributed-spend fallback exists to avoid.
+ */
+export function capTradeToPool(sizeSol, poolSol, { poolCapPct = 5, enabled = true } = {}) {
+  if (!enabled || !Number.isFinite(poolSol) || poolSol <= 0) {
+    return { sizeSol, capped: false, maxTradeSol: null, poolSol: null };
+  }
+  const maxTradeSol = poolSol * (poolCapPct / 100);
+  if (!(sizeSol > maxTradeSol)) return { sizeSol, capped: false, maxTradeSol, poolSol };
+  return { sizeSol: maxTradeSol, capped: true, maxTradeSol, poolSol, requestedSol: sizeSol };
+}
+
+/**
+ * What a buy actually fills at. PURE.
+ *
+ * DIVIDES by (1 - impact) rather than multiplying by (1 + impact). See the
+ * section header: paying that price per token is what leaves you holding
+ * (1 - impact) of the tokens the mid implied, which is the constant-product
+ * result. Multiplying would understate the entry by impact² and flatter every
+ * position in the book.
+ */
+export function entryFillUsd(midPriceUsd, { impactPct = 0, slippagePct = 0 } = {}) {
+  const spread = 1 + Math.max(0, slippagePct) / 100;
+  // Bounded below 100%: an order that takes the entire pool has no finite fill,
+  // and a division by zero would write Infinity into a position's entry price.
+  const impact = Math.min(Math.max(Number(impactPct) || 0, 0), 99) / 100;
+  return (midPriceUsd * spread) / (1 - impact);
+}
+
+/** What a sell actually fills at. PURE. Impact and spread both come off. */
+export function exitFillUsd(midPriceUsd, { impactPct = 0, slippagePct = 0 } = {}) {
+  const spread = 1 - Math.min(100, Math.max(0, slippagePct)) / 100;
+  const impact = Math.min(Math.max(Number(impactPct) || 0, 0), 100) / 100;
+  return midPriceUsd * spread * (1 - impact);
 }
 
 /**
@@ -414,16 +771,22 @@ export function mirrorPositionSize(cfg, { whaleSpendSol = null, balanceSol = 0 }
  * The peak is kept for the same reason it exists: it is the highest price seen
  * while the position was open, and buying more does not unsee it.
  */
-export function scaleInPaperPosition(book, { mint, priceUsd, cfg, now = Date.now(), whaleSpendSol = null }) {
+export function scaleInPaperPosition(book, { mint, priceUsd, cfg, now = Date.now(), whaleSpendSol = null, poolSolReserve }) {
   const p = book.positions[mint];
   if (!p) return { ok: false, reason: 'no such position' };
   if (!Number.isFinite(priceUsd) || priceUsd <= 0) return { ok: false, reason: 'no usable price' };
 
-  const sized = mirrorPositionSize(cfg, { whaleSpendSol, balanceSol: book.balanceSol });
+  const pool = resolvePoolSol(poolSolReserve, cfg);
+  const sized = mirrorPositionSize(cfg, { whaleSpendSol, balanceSol: book.balanceSol, poolSol: pool.reserveSol });
   if (!sized.ok) return { ok: false, reason: sized.reason };
   const addSol = sized.sizeSol;
 
-  const fillPriceUsd = priceUsd * (1 + cfg.slippagePct / 100);
+  // The add crosses the pool on its own, so it pays impact on its own size —
+  // NOT on the blended position. The first lot already paid for the depth it
+  // took, and charging the total again would bill a scale-in twice for SOL that
+  // moved through the pool minutes ago.
+  const impactPct = pool.active ? priceImpactPct(addSol, pool.reserveSol) : null;
+  const fillPriceUsd = entryFillUsd(priceUsd, { impactPct: impactPct ?? 0, slippagePct: cfg.slippagePct });
   const s1 = p.stakeSol;
   const e1 = p.entryPriceUsd;
 
@@ -440,6 +803,10 @@ export function scaleInPaperPosition(book, { mint, priceUsd, cfg, now = Date.now
   p.peakPriceUsd = Math.max(p.peakPriceUsd ?? priceUsd, priceUsd);
   p.lastPricedAt = now;
   p.scaleIns = (p.scaleIns ?? 0) + 1;
+  // Cumulative, so a position built over four adds reports what all four paid
+  // rather than only the last one.
+  p.entryImpactSol = (p.entryImpactSol ?? 0) + addSol * ((impactPct ?? 0) / 100);
+  if (sized.liquidityCapped) p.liquidityCappedEntries = (p.liquidityCappedEntries ?? 0) + 1;
 
   return {
     ok: true,
@@ -449,6 +816,11 @@ export function scaleInPaperPosition(book, { mint, priceUsd, cfg, now = Date.now
     basis: sized.basis,
     capped: sized.capped,
     blendedEntryUsd: blended,
+    impactPct,
+    poolSol: pool.reserveSol,
+    poolMeasured: pool.measured,
+    liquidityCapped: sized.liquidityCapped === true,
+    requestedSol: sized.requestedSol,
   };
 }
 
@@ -494,26 +866,32 @@ export function exitMatchesOrigin(position, signal) {
   };
 }
 
-export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, now = Date.now(), source = null, demo = false, whaleSpendSol = null, originatingWhale = null }) {
+export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, now = Date.now(), source = null, demo = false, whaleSpendSol = null, originatingWhale = null, poolSolReserve }) {
   if (!mint) return { ok: false, reason: 'no mint' };
   if (!Number.isFinite(priceUsd) || priceUsd <= 0) return { ok: false, reason: 'no usable price' };
   if (book.positions[mint]) {
     if (!cfg.scaleIn) return { ok: false, reason: 'already holding' };
-    return scaleInPaperPosition(book, { mint, priceUsd, cfg, now, whaleSpendSol });
+    return scaleInPaperPosition(book, { mint, priceUsd, cfg, now, whaleSpendSol, poolSolReserve });
   }
 
   const open = Object.keys(book.positions).length;
   if (open >= cfg.maxOpenPositions) return { ok: false, reason: `at max open positions (${cfg.maxOpenPositions})` };
 
-  const sized = mirrorPositionSize(cfg, { whaleSpendSol, balanceSol: book.balanceSol });
+  const pool = resolvePoolSol(poolSolReserve, cfg);
+  const sized = mirrorPositionSize(cfg, { whaleSpendSol, balanceSol: book.balanceSol, poolSol: pool.reserveSol });
   if (!sized.ok) return { ok: false, reason: sized.reason };
   const size = sized.sizeSol;
+
+  // Impact is computed on the CAPPED size, which is the size that actually
+  // crosses the pool. Charging it on what was requested would bill a 500 SOL
+  // order for a 500 SOL market move it was never allowed to make.
+  const impactPct = pool.active ? priceImpactPct(size, pool.reserveSol) : null;
 
   // Slippage raises the effective entry price. Modelled on the PRICE rather
   // than skimmed off the size, so the position's whole P&L curve carries it —
   // taking it off the size instead would make a 1.5% cost vanish the moment
-  // the token moved.
-  const fillPriceUsd = priceUsd * (1 + cfg.slippagePct / 100);
+  // the token moved. Pool impact rides the same lever, for the same reason.
+  const fillPriceUsd = entryFillUsd(priceUsd, { impactPct: impactPct ?? 0, slippagePct: cfg.slippagePct });
 
   book.balanceSol -= size + cfg.feeSol;
   book.positions[mint] = {
@@ -561,9 +939,30 @@ export function openPaperPosition(book, { mint, symbol = null, priceUsd, cfg, no
     // Tagged so the scorecard can disclose that a number includes trades that
     // were never mirrored from the target.
     ...(demo ? { demo: true } : {}),
+    // ── What the pool cost this entry ─────────────────────────────────────
+    // Recorded on the position rather than only returned, because the exit
+    // happens on a different tick and the scorecard has to be able to say what
+    // the round trip paid in depth without replaying the book.
+    entryPoolSol: pool.reserveSol,
+    entryPoolMeasured: pool.measured,
+    entryImpactPct: impactPct,
+    entryImpactSol: size * ((impactPct ?? 0) / 100),
+    ...(sized.liquidityCapped ? { liquidityCappedEntries: 1, requestedSol: sized.requestedSol } : {}),
     lastPricedAt: now,
   };
-  return { ok: true, position: book.positions[mint], sizeSol: size, basis: sized.basis, capped: sized.capped };
+  return {
+    ok: true,
+    position: book.positions[mint],
+    sizeSol: size,
+    basis: sized.basis,
+    capped: sized.capped,
+    impactPct,
+    poolSol: pool.reserveSol,
+    poolMeasured: pool.measured,
+    liquidityCapped: sized.liquidityCapped === true,
+    requestedSol: sized.requestedSol,
+    maxPoolTradeSol: sized.maxPoolTradeSol,
+  };
 }
 
 /**
@@ -636,16 +1035,29 @@ export function evaluatePaperExits(position, priceUsd, cfg) {
  * behaviour "sell half, let the rest run" describes, and the one that cannot
  * sell more than 100% of a position across a ladder.
  */
-export function applyPaperExit(book, mint, { priceUsd, trigger, sellFraction = 1, cfg, now = Date.now(), label = null }) {
+export function applyPaperExit(book, mint, { priceUsd, trigger, sellFraction = 1, cfg, now = Date.now(), label = null, poolSolReserve }) {
   const p = book.positions[mint];
   if (!p) return { ok: false, reason: 'no such position' };
   if (!Number.isFinite(priceUsd) || priceUsd <= 0) return { ok: false, reason: 'no usable price' };
 
-  const exitPriceUsd = priceUsd * (1 - cfg.slippagePct / 100);
   const fraction = Math.min(1, Math.max(0, sellFraction));
   const costBasisSold = p.stakeSol * fraction;
+
+  // ── SIZED AT THE MID, THEN CHARGED ────────────────────────────────────────
+  // Impact depends on how much SOL is coming out, and how much comes out
+  // depends on impact. Broken by measuring the order against what the MID would
+  // have paid, which is the size of the position being pushed through the pool
+  // regardless of what it fetches. Iterating to a fixed point would move the
+  // answer by impact² — 0.2% of the fill at a 5% impact, against a pool figure
+  // that is itself a tick old.
+  const pool = resolvePoolSol(poolSolReserve, cfg);
+  const midProceedsSol = p.entryPriceUsd > 0 ? costBasisSold * (priceUsd / p.entryPriceUsd) : costBasisSold;
+  const impactPct = pool.active ? priceImpactPct(midProceedsSol, pool.reserveSol) : null;
+
+  const exitPriceUsd = exitFillUsd(priceUsd, { impactPct: impactPct ?? 0, slippagePct: cfg.slippagePct });
   const multiple = exitPriceUsd / p.entryPriceUsd;
   const proceeds = costBasisSold * multiple;
+  const impactSol = midProceedsSol * ((impactPct ?? 0) / 100);
 
   book.balanceSol += proceeds - cfg.feeSol;
   p.stakeSol -= costBasisSold;
@@ -653,6 +1065,7 @@ export function applyPaperExit(book, mint, { priceUsd, trigger, sellFraction = 1
   if (trigger?.startsWith('TP')) p.firedRungs.push(trigger);
   p.markPriceUsd = priceUsd;
   p.lastPricedAt = now;
+  p.exitImpactSol = (p.exitImpactSol ?? 0) + impactSol;
 
   const fullyClosed = p.stakeSol <= 1e-9 || fraction >= 1;
   if (fullyClosed) {
@@ -671,10 +1084,28 @@ export function applyPaperExit(book, mint, { priceUsd, trigger, sellFraction = 1
       label,
       source: p.source,
       ...(p.demo ? { demo: true } : {}),
+      // The depth bill for the whole round trip, so a closed row can answer
+      // "how much of this result was the pool" without the position it came
+      // from — which no longer exists by the time anyone asks.
+      entryImpactSol: p.entryImpactSol ?? 0,
+      exitImpactSol: p.exitImpactSol ?? 0,
+      exitImpactPct: impactPct,
+      exitPoolSol: pool.reserveSol,
+      exitPoolMeasured: pool.measured,
+      liquidityCappedEntries: p.liquidityCappedEntries ?? 0,
     });
     delete book.positions[mint];
   }
-  return { ok: true, proceedsSol: proceeds, closed: fullyClosed, trigger };
+  return {
+    ok: true,
+    proceedsSol: proceeds,
+    closed: fullyClosed,
+    trigger,
+    impactPct,
+    impactSol,
+    poolSol: pool.reserveSol,
+    poolMeasured: pool.measured,
+  };
 }
 
 /**
@@ -690,19 +1121,29 @@ export function applyPaperExit(book, mint, { priceUsd, trigger, sellFraction = 1
  * advance the mid-runner's ladder — which is the whole reason they are separate
  * accounts rather than one position with three rules.
  */
-export function applySubWalletExit(book, mint, subId, { priceUsd, trigger, sellFraction = 1, cfg, now = Date.now(), label = null }) {
+export function applySubWalletExit(book, mint, subId, { priceUsd, trigger, sellFraction = 1, cfg, now = Date.now(), label = null, poolSolReserve }) {
   const p = book.positions[mint];
   const sub = p?.subs?.find((s) => s.subId === subId);
   if (!p || !sub) return { ok: false, reason: 'no such sub-position' };
   if (!Number.isFinite(priceUsd) || priceUsd <= 0) return { ok: false, reason: 'no usable price' };
   if (!(sub.stakeSol > 0)) return { ok: false, reason: 'already closed' };
 
-  const exitPriceUsd = priceUsd * (1 - cfg.slippagePct / 100);
   const fraction = Math.min(1, Math.max(0, sellFraction));
   const costBasisSold = sub.stakeSol * fraction;
+
+  // Impact is charged on THIS SUB'S share, which is the whole point of the
+  // split: three sub-wallets leaving separately each cross a third of the pool
+  // depth one combined exit would have, and the shallower each order is the
+  // less it pays. Billing the parent's size on every sub would erase the only
+  // mechanical advantage splitting has.
+  const pool = resolvePoolSol(poolSolReserve, cfg);
+  const midProceedsSol = sub.entryPriceUsd > 0 ? costBasisSold * (priceUsd / sub.entryPriceUsd) : costBasisSold;
+  const impactPct = pool.active ? priceImpactPct(midProceedsSol, pool.reserveSol) : null;
+  const exitPriceUsd = exitFillUsd(priceUsd, { impactPct: impactPct ?? 0, slippagePct: cfg.slippagePct });
   const proceeds = costBasisSold * (exitPriceUsd / sub.entryPriceUsd);
 
   book.balanceSol += proceeds - cfg.feeSol;
+  p.exitImpactSol = (p.exitImpactSol ?? 0) + midProceedsSol * ((impactPct ?? 0) / 100);
   sub.stakeSol -= costBasisSold;
   sub.realisedSol += proceeds - costBasisSold - cfg.feeSol;
   if (trigger?.startsWith('TP')) sub.firedRungs.push(trigger);
@@ -745,10 +1186,26 @@ export function applySubWalletExit(book, mint, subId, { priceUsd, trigger, sellF
       label,
       source: p.source,
       ...(p.demo ? { demo: true } : {}),
+      entryImpactSol: p.entryImpactSol ?? 0,
+      exitImpactSol: p.exitImpactSol ?? 0,
+      exitImpactPct: impactPct,
+      exitPoolSol: pool.reserveSol,
+      exitPoolMeasured: pool.measured,
+      liquidityCappedEntries: p.liquidityCappedEntries ?? 0,
     });
     delete book.positions[mint];
   }
-  return { ok: true, proceedsSol: proceeds, subClosed, positionClosed: allClosed, trigger, subId };
+  return {
+    ok: true,
+    proceedsSol: proceeds,
+    subClosed,
+    positionClosed: allClosed,
+    trigger,
+    subId,
+    impactPct,
+    poolSol: pool.reserveSol,
+    poolMeasured: pool.measured,
+  };
 }
 
 /** Mark a position to market and roll its peak. PURE. */
@@ -817,6 +1274,26 @@ export function paperScorecard(book, cfg = PAPER_DEFAULTS) {
     // silently contaminates the win rate the book exists to report.
     demoPositions: positions.filter((p) => p.demo === true).length,
     demoClosed: closed.filter((c) => c.demo === true).length,
+    // ── WHAT THE POOLS TOOK ───────────────────────────────────────────────
+    // Reported next to the P&L rather than buried in the book, because it is
+    // the difference between this scorecard and the one that assumed infinite
+    // depth — and on a thin-pool population it is not a rounding line. Summed
+    // over open positions AND closed rows so a running book discloses the drag
+    // it has already paid, not only the part that has resolved.
+    liquidityModel: cfg?.liquidityModel !== false,
+    poolCapPct: cfg?.poolCapPct ?? PAPER_DEFAULTS.poolCapPct,
+    impactPaidSol:
+      positions.reduce((a, p) => a + (p.entryImpactSol ?? 0) + (p.exitImpactSol ?? 0), 0) +
+      closed.reduce((a, c) => a + (c.entryImpactSol ?? 0) + (c.exitImpactSol ?? 0), 0),
+    liquidityCappedTrades:
+      positions.filter((p) => (p.liquidityCappedEntries ?? 0) > 0).length +
+      closed.filter((c) => (c.liquidityCappedEntries ?? 0) > 0).length,
+    // Fills priced against poolFloorSol rather than a pool anyone read — entries
+    // and exits both, which is why it is not called flooredEntries. A high count
+    // means the scorecard is measuring an assumption, not a market.
+    flooredFills:
+      positions.filter((p) => p.entryPoolMeasured === false).length +
+      closed.filter((c) => c.exitPoolMeasured === false).length,
   };
 }
 
@@ -898,6 +1375,33 @@ export function renderModeLine(cfg = {}, { trackedWhales = null, compound = null
   return `  MODE   ${whales} · ${mirror} · ${compounding}\n  SIZING ${sizing}${subs} · max ${cfg.maxOpenPositions} open`;
 }
 
+/**
+ * What the pool did to one trade, for the activity log. PURE.
+ *
+ * Returns '' when there is nothing to say, so a line about a fill that crossed
+ * a deep pool at no measurable cost is not padded with a zero.
+ *
+ * ── THE CAP IS STATED WITH BOTH NUMBERS ────────────────────────────────────
+ * `[LIQUIDITY CAPPED]` alone says a trade was held back but not from what to
+ * what, and the gap is the whole point: 500 SOL cut to 1.5 is a different event
+ * from 1.6 cut to 1.5, and in a fixed-height log they would otherwise read the
+ * same. An impact figure derived from the assumed floor says so in the same
+ * breath — it is a property of the model, not of the market.
+ */
+export function liquidityTag(row = {}) {
+  const parts = [];
+  if (Number.isFinite(row.impactPct)) {
+    parts.push(`impact ${row.impactPct.toFixed(2)}%${row.poolMeasured === false ? ' (assumed pool)' : ''}`);
+  }
+  if (row.liquidityCapped) {
+    const from = Number.isFinite(row.requestedSol) ? row.requestedSol.toFixed(4) : '?';
+    const to = Number.isFinite(row.sizeSol) ? row.sizeSol.toFixed(4) : '?';
+    const pool = Number.isFinite(row.poolSol) ? ` — ${row.poolSol.toFixed(1)} SOL pool` : '';
+    parts.push(`[LIQUIDITY CAPPED ${from} → ${to} SOL${pool}]`);
+  }
+  return parts.length ? `  ${parts.join('  ')}` : '';
+}
+
 export function renderScorecard(card, { title = 'PAPER COPYTRADE SCORECARD', solUsd = null, width = 64 } = {}) {
   const bar = '═'.repeat(Math.max(8, width));
   if (!Number.isFinite(solUsd) || solUsd <= 0) {
@@ -950,6 +1454,18 @@ export function renderScorecard(card, { title = 'PAPER COPYTRADE SCORECARD', sol
       '',
       `  vs start USD   ${usd(vsStart).padStart(14)}   started ${usd(card.budgetUsdAtStart, { sign: false })} @ ${usd(card.solUsdAtStart, { sign: false })}/SOL`,
       `    of which SOL price movement: ${usd(solDrift)} — not the strategy`
+    );
+  }
+
+  if (card.liquidityModel && (card.impactPaidSol > 0 || card.liquidityCappedTrades || card.flooredFills)) {
+    lines.push(
+      '',
+      `  Pool impact    ${usd(toUsd(-(card.impactPaidSol ?? 0))).padStart(14)}   (${sol(-(card.impactPaidSol ?? 0))} SOL paid to depth)` +
+        (card.liquidityCappedTrades ? `\n    ${card.liquidityCappedTrades} trade(s) [LIQUIDITY CAPPED] at ${card.poolCapPct}% of pool` : '') +
+        // Named separately from the capped count because they are different
+        // problems: a capped trade was measured and held back, a floored one was
+        // never measured at all and its cost is an assumption.
+        (card.flooredFills ? `\n    ${card.flooredFills} fill(s) priced against the ASSUMED pool floor, not a real pool` : '')
     );
   }
 
@@ -1118,20 +1634,32 @@ const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 
 /** Minimal JSON-RPC. No key, no provider-specific extensions. */
 export async function solanaRpc(url, method, params, { timeoutMs = 15_000, fetchImpl = fetch } = {}) {
-  try {
-    const res = await fetchImpl(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
-    const body = await res.json();
-    if (body?.error) return { ok: false, error: body.error.message ?? 'rpc error' };
-    return { ok: true, result: body?.result ?? null };
-  } catch (err) {
-    return { ok: false, error: err.message };
+  const maxRetries = 3;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetchImpl(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (res.status === 429 && attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, (attempt + 1) * 500));
+        continue;
+      }
+      if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+      const body = await res.json();
+      if (body?.error) return { ok: false, error: body.error.message ?? 'rpc error' };
+      return { ok: true, result: body?.result ?? null };
+    } catch (err) {
+      if (attempt < maxRetries && (err.name === 'AbortError' || err.message?.includes('fetch failed'))) {
+        await new Promise((r) => setTimeout(r, (attempt + 1) * 300));
+        continue;
+      }
+      return { ok: false, error: err.message };
+    }
   }
+  return { ok: false, error: 'HTTP 429 (rate limited)' };
 }
 
 /**
@@ -1147,9 +1675,8 @@ export async function solanaRpc(url, method, params, { timeoutMs = 15_000, fetch
  *   SOL out + token in   -> BUY
  *   SOL in  + token out  -> SELL
  *
- * WSOL is skipped for the same reason computeOnChainWinRate skips it: it is the
- * SOL side of the swap wearing a token's clothes, and counting it would make
- * every trade look like a WSOL round trip.
+ * WSOL is included in the effective SOL delta: it is the SOL side of the swap
+ * wearing a token's clothes when trading via DEX aggregators and HFT bots.
  *
  * A transaction touching MORE THAN ONE non-WSOL mint is not attributed. A
  * multi-hop route or a two-token action cannot be split into "the position"
@@ -1181,12 +1708,18 @@ export function parseWalletSwap(tx, { wallet } = {}) {
   const pre = meta.preBalances?.[idx];
   const post = meta.postBalances?.[idx];
   if (!Number.isFinite(pre) || !Number.isFinite(post)) return null;
-  const solDelta = (post - pre) / 1e9;
+  const nativeSolDelta = (post - pre) / 1e9;
+
+  const isWalletOwner = (b) => b?.owner === wallet || keys[b?.accountIndex] === wallet;
+  const preWsol = meta.preTokenBalances?.find((b) => isWalletOwner(b) && b.mint === WSOL_MINT)?.uiTokenAmount?.uiAmount ?? 0;
+  const postWsol = meta.postTokenBalances?.find((b) => isWalletOwner(b) && b.mint === WSOL_MINT)?.uiTokenAmount?.uiAmount ?? 0;
+  const wsolDelta = postWsol - preWsol;
+  const solDelta = nativeSolDelta + wsolDelta;
 
   const owned = (rows) => {
     const m = new Map();
     for (const b of rows ?? []) {
-      if (b?.owner !== wallet || !b?.mint || b.mint === WSOL_MINT) continue;
+      if (!isWalletOwner(b) || !b?.mint || b.mint === WSOL_MINT) continue;
       m.set(b.mint, Number(b.uiTokenAmount?.uiAmount ?? 0));
     }
     return m;
@@ -1205,6 +1738,10 @@ export function parseWalletSwap(tx, { wallet } = {}) {
   const base = {
     signature: tx.transaction?.signatures?.[0] ?? null,
     blockTime: tx.blockTime ? tx.blockTime * 1000 : null,
+    // The slot this trade landed in. Additive, and load-bearing for the
+    // slot-latency fill model: a fill window is expressed in slots from the
+    // target's own, so without this there is nothing to count from.
+    slot: Number.isFinite(tx.slot) ? tx.slot : null,
     mint,
     solDelta,
   };
@@ -1329,6 +1866,311 @@ export function impliedExitPriceUsd(trade, { solUsd = null, minReceiveSol = 0.01
   return Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : null;
 }
 
+/* ------------------------------------------------------------------ *
+ * Slot-latency fills — reconstructing the price we could actually have got
+ * ------------------------------------------------------------------ *
+ *
+ * The book's default entry price is the target's own implied fill, or a
+ * DexScreener mid. Both are wrong in the same direction: they price us at a
+ * moment we could not have traded in.
+ *
+ * ── WHY NOT SLOT N+1 ────────────────────────────────────────────────────────
+ * Measured in this repo, not assumed. discovery_daemon.mjs has run the same
+ * socket since 2026-08-10: ~570ms from `logsSubscribe` notification to a
+ * fetchable transaction, and the `confirmed` read back costs a further
+ * 396-779ms across 2-3 attempts. Roughly 1.0-1.4 SECONDS before Node has even
+ * parsed the trade. A slot is ~400ms, so slot N+1 has already passed while we
+ * are still reading, and we have not begun to build, sign or send anything.
+ * Pricing a fill at N+1 is not slightly optimistic; it is optimistic by exactly
+ * the amount that matters on a token that runs 2x in its first minute.
+ *
+ * ── WHAT IS MEASURED HERE AND WHAT IS ASSUMED ───────────────────────────────
+ * MEASURED: the observation lag above, which puts a hard floor at about N+3.
+ * ASSUMED: everything else. N+5 as the expected landing slot and N+10 as the
+ * tail are GUESSES, because nobody has measured where our transactions land —
+ * this book has never sent one. The band is a stated assumption, and every
+ * consumer of it is expected to say so rather than render it as a measurement.
+ *
+ * ── WHAT THIS STILL CANNOT DO ───────────────────────────────────────────────
+ * The reconstructed price is the price of a world in which WE DID NOT TRADE.
+ * Had our order been in that slot it would have moved the pool further and
+ * displaced someone who really filled. Against the $4,692 pool this book has
+ * held, a $1,500 buy is 34.42% impact — we are not a rounding error in these
+ * pools. Nor does any of this model fill PROBABILITY: the book still fills
+ * 100% of attempts, and real ones die on slippage bounds, expired blockhashes
+ * and lost tip auctions. Both gaps are deliberate and documented, not fixed.
+ */
+
+/** Solana's target slot time. Used only to render a slot offset as seconds. */
+export const SLOT_MS = 400;
+
+/**
+ * Rows kept for the WEB activity feed.
+ *
+ * Deliberately not the terminal's 6. The terminal is fixed-height, so an
+ * unbounded log there pushes the numbers off screen; a DOM panel scrolls one
+ * pane without moving another, which is one of the few things the web view can
+ * do that the terminal structurally cannot. Matches dashboard.mjs's own
+ * ACTIVITY_LIMIT so the two ends agree on the ceiling.
+ */
+export const WEB_ACTIVITY_LIMIT = 500;
+
+/**
+ * The fill window, in slots after the target's own trade.
+ *
+ * `expected` is what the book trades on. The other two are reported beside it
+ * as an uncertainty spread — one number to act on, with its error bars visible,
+ * rather than three books that invite picking the flattering one.
+ */
+export const DEFAULT_SLOT_OFFSETS = { earliest: 3, expected: 5, latest: 10 };
+
+/**
+ * One transaction -> the price that swap executed at. PURE.
+ *
+ * The swapper is taken to be the FEE PAYER, which is the first account key.
+ * That is true of essentially every retail and bot swap, and it lets this reuse
+ * `parseWalletSwap` unchanged rather than growing a second decoder — including
+ * its refusal to read a transaction whose token balances moved for more than
+ * one mint, which is how routing and arbitrage transactions decline themselves
+ * instead of producing a fabricated price.
+ *
+ * `minSolAbs` exists for the same reason `impliedEntryPriceUsd` has
+ * `minSpendSol`: a dust swap divides two tiny numbers and the answer is noise.
+ */
+export function decodeSwapAtSlot(tx, { mint, solUsd = null, minSolAbs = 0.01, parser = parseWalletSwap } = {}) {
+  if (!tx || !mint) return null;
+  if (!Number.isFinite(solUsd) || solUsd <= 0) return null;
+
+  const keys = (tx.transaction?.message?.accountKeys ?? []).map((k) => (typeof k === 'string' ? k : k?.pubkey));
+  const feePayer = keys[0];
+  if (!feePayer) return null;
+
+  const trade = parser(tx, { wallet: feePayer });
+  if (!trade || trade.mint !== mint) return null;
+
+  const solAbs = trade.kind === 'BUY' ? trade.solSpent : trade.solReceived;
+  const tokenAbs = Math.abs(trade.tokenDelta ?? 0);
+  if (!Number.isFinite(solAbs) || solAbs < minSolAbs) return null;
+  if (!Number.isFinite(tokenAbs) || tokenAbs <= 0) return null;
+
+  const priceUsd = (solAbs / tokenAbs) * solUsd;
+  if (!Number.isFinite(priceUsd) || priceUsd <= 0) return null;
+
+  return {
+    slot: Number.isFinite(tx.slot) ? tx.slot : (trade.slot ?? null),
+    signature: trade.signature,
+    kind: trade.kind,
+    priceUsd,
+    solAbs,
+    tokenAbs,
+    swapper: feePayer,
+  };
+}
+
+/**
+ * The last price on chain at or before a slot. PURE.
+ *
+ * ── A SLOT USUALLY HAS NO TRADE IN IT ───────────────────────────────────────
+ * For any one memecoin, most slots contain no swap at all. "The price at slot
+ * N+5" is therefore almost never an observation; it is the last observed trade
+ * carried forward. That distinction is reported rather than smoothed over:
+ * `exact` says whether a swap actually landed in that slot, and `staleSlots`
+ * says how far the carry-forward reached. A price carried 40 slots is a much
+ * weaker claim than one carried 1, and only the caller can decide if it is
+ * good enough.
+ *
+ * Returns null when nothing traded at or before the slot — the honest answer,
+ * and the caller's cue to fall back rather than invent.
+ */
+export function reconstructPriceAtSlot(swaps, targetSlot) {
+  if (!Array.isArray(swaps) || !swaps.length || !Number.isFinite(targetSlot)) return null;
+
+  let best = null;
+  for (const s of swaps) {
+    if (!s || !Number.isFinite(s.slot) || !Number.isFinite(s.priceUsd)) continue;
+    if (s.slot > targetSlot) continue;
+    if (!best || s.slot > best.slot) best = s;
+  }
+  if (!best) return null;
+
+  return {
+    priceUsd: best.priceUsd,
+    sourceSlot: best.slot,
+    signature: best.signature,
+    exact: best.slot === targetSlot,
+    staleSlots: targetSlot - best.slot,
+  };
+}
+
+/**
+ * The execution band. PURE.
+ *
+ * ── "EARLIEST" IS NOT "BEST" AND THE NAMES SAY SO ───────────────────────────
+ * The draft called N+3 the best case. It is the earliest reachable slot, which
+ * is only the best PRICE if the token rose across the window — and on a token
+ * that dumped, the earliest fill is the worst one. So the rungs are named for
+ * what they are (slot offsets), and best/worst by price are derived separately
+ * and direction-aware: for a BUY the best case is the lowest price, for a SELL
+ * the highest.
+ */
+export function buildExecutionBand({
+  swaps = [],
+  whaleSlot,
+  offsets = DEFAULT_SLOT_OFFSETS,
+  side = 'BUY',
+  maxObservedSlot = null,
+} = {}) {
+  if (!Number.isFinite(whaleSlot)) {
+    return { reconstructed: false, reason: 'no whale slot', rungs: null, fillPriceUsd: null };
+  }
+
+  const rungs = {};
+  for (const [name, offset] of Object.entries(offsets)) {
+    const at = reconstructPriceAtSlot(swaps, whaleSlot + offset);
+    rungs[name] = at ? { slotOffset: offset, slot: whaleSlot + offset, ...at } : { slotOffset: offset, slot: whaleSlot + offset, priceUsd: null };
+  }
+
+  const expected = rungs.expected;
+  if (!expected || !Number.isFinite(expected.priceUsd)) {
+    return {
+      reconstructed: false,
+      reason: swaps.length ? 'nothing traded at or before the expected slot' : 'no swaps decoded in the window',
+      whaleSlot,
+      rungs,
+      fillPriceUsd: null,
+      swapCount: swaps.length,
+    };
+  }
+
+  const priced = Object.values(rungs).map((r) => r.priceUsd).filter((p) => Number.isFinite(p));
+  const lo = Math.min(...priced);
+  const hi = Math.max(...priced);
+  // A buy wants the low price; a sell wants the high one.
+  const bestCaseUsd = side === 'SELL' ? hi : lo;
+  const worstCaseUsd = side === 'SELL' ? lo : hi;
+
+  return {
+    reconstructed: true,
+    whaleSlot,
+    side,
+    rungs,
+    // What the book actually trades on. One number, with the spread beside it.
+    fillPriceUsd: expected.priceUsd,
+    fillSlot: expected.slot,
+    fillSlotOffset: expected.slotOffset,
+    fillLagMs: expected.slotOffset * SLOT_MS,
+    bestCaseUsd,
+    worstCaseUsd,
+    spreadPct: lo > 0 ? ((hi - lo) / lo) * 100 : 0,
+    swapCount: swaps.length,
+    // False when the chain had not yet produced the far end of the window at
+    // the moment we looked. The latest rung is then a carry-forward of an
+    // earlier slot rather than an observation, and the spread is understated.
+    windowComplete: Number.isFinite(maxObservedSlot)
+      ? maxObservedSlot >= whaleSlot + (offsets.latest ?? 0)
+      : null,
+    // The band is an assumption about where our transaction would land. It is
+    // carried on the payload so no renderer has to remember to say it.
+    assumption: 'landing slot is assumed, not measured — this book has never sent a transaction',
+  };
+}
+
+/**
+ * Real swaps for one mint across the fill window.
+ *
+ * ── COST, STATED PLAINLY ────────────────────────────────────────────────────
+ * One getSignaturesForAddress plus up to `maxLookups` getTransaction calls PER
+ * MIRRORED TRADE. That is why `slotFills` is off by default: the existing entry
+ * path costs zero extra RPC because the swap carries its own price. This buys
+ * a better fill model with credits, and the operator should choose that.
+ */
+export async function fetchSlotWindowSwaps({
+  mint,
+  whaleSlot,
+  maxOffset = DEFAULT_SLOT_OFFSETS.latest,
+  rpcUrl = PUBLIC_SOLANA_RPC,
+  rpcImpl = solanaRpc,
+  solUsd = null,
+  signatureLimit = 100,
+  maxLookups = 40,
+  delayMs = 60,
+  decoder = decodeSwapAtSlot,
+} = {}) {
+  if (!mint || !Number.isFinite(whaleSlot)) return { ok: false, error: 'no mint or slot', swaps: [] };
+  if (!Number.isFinite(solUsd) || solUsd <= 0) return { ok: false, error: 'no SOL price', swaps: [] };
+
+  const sigs = await rpcImpl(rpcUrl, 'getSignaturesForAddress', [mint, { limit: signatureLimit }]);
+  if (!sigs.ok) return { ok: false, error: sigs.error, swaps: [] };
+  const list = Array.isArray(sigs.result) ? sigs.result : [];
+
+  // How far the chain had got when we asked. Taken from the newest signature on
+  // the page rather than a separate getSlot call — one fewer round trip, and it
+  // is the same question: is the far end of the window in the past yet.
+  const maxObservedSlot = list.reduce((m, s) => (Number.isFinite(s?.slot) && s.slot > m ? s.slot : m), -Infinity);
+
+  const inWindow = list
+    .filter((s) => !s?.err && Number.isFinite(s?.slot) && s.slot >= whaleSlot && s.slot <= whaleSlot + maxOffset)
+    .sort((a, b) => a.slot - b.slot)
+    .slice(0, maxLookups);
+
+  const swaps = [];
+  for (const s of inWindow) {
+    const tx = await rpcImpl(rpcUrl, 'getTransaction', [
+      s.signature,
+      { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 },
+    ]);
+    if (tx.ok && tx.result) {
+      const decoded = decoder(tx.result, { mint, solUsd });
+      if (decoded) swaps.push(decoded);
+    }
+    if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+  }
+
+  return {
+    ok: true,
+    swaps,
+    scanned: inWindow.length,
+    candidates: list.length,
+    maxObservedSlot: Number.isFinite(maxObservedSlot) ? maxObservedSlot : null,
+    // Signatures in the window we did not read, because maxLookups bounded us.
+    skipped: Math.max(0, list.filter((s) => !s?.err && Number.isFinite(s?.slot) && s.slot >= whaleSlot && s.slot <= whaleSlot + maxOffset).length - inWindow.length),
+  };
+}
+
+/**
+ * Window -> band, in one call. The seam the tick uses.
+ *
+ * Returns an unreconstructed band rather than throwing or guessing when the
+ * chain cannot answer, so the caller's fallback is an ordinary branch.
+ */
+export async function resolveExecutionBand({
+  mint,
+  whaleSlot,
+  side = 'BUY',
+  cfg = PAPER_DEFAULTS,
+  solUsd = null,
+  rpcUrl,
+  fetcher = fetchSlotWindowSwaps,
+} = {}) {
+  const offsets = cfg?.slotOffsets ?? DEFAULT_SLOT_OFFSETS;
+  const res = await fetcher({
+    mint,
+    whaleSlot,
+    maxOffset: offsets.latest,
+    rpcUrl: rpcUrl ?? cfg?.rpcMirror?.url ?? PUBLIC_SOLANA_RPC,
+    solUsd,
+    maxLookups: cfg?.slotFillMaxLookups ?? 40,
+  });
+  if (!res.ok) {
+    return { reconstructed: false, reason: res.error ?? 'window unavailable', rungs: null, fillPriceUsd: null };
+  }
+  return {
+    ...buildExecutionBand({ swaps: res.swaps, whaleSlot, offsets, side, maxObservedSlot: res.maxObservedSlot }),
+    scanned: res.scanned,
+    skipped: res.skipped,
+  };
+}
+
 /**
  * The target's recent trades, newest signature first.
  *
@@ -1442,11 +2284,121 @@ export async function fetchWhaleTrades({
  * drain() returns the same shape fetchWhaleTrades does, so it drops straight
  * into runPaperTick's tradeFetcher and every existing test still applies.
  */
+/* ------------------------------------------------------------------ *
+ * `processed` lookup capability
+ * ------------------------------------------------------------------ */
+
+/**
+ * Whether this endpoint answers getTransaction at `processed`, learned at run
+ * time rather than assumed.
+ *
+ * ── WHY IT IS PROBED AND NOT BELIEVED ───────────────────────────────────────
+ * The socket subscribes at `processed` and then reads back at `confirmed`,
+ * which costs a measured 396-779ms and 2-3 attempts because the notification
+ * outruns the read. Reading at `processed` too would remove that wait.
+ *
+ * The catch is that the Solana JSON-RPC spec lists `processed` as NOT supported
+ * on getTransaction — the account and signature-status methods take it, the
+ * transaction and block lookups do not. Providers differ in how they say so:
+ * some return an "Invalid param" error, some quietly coerce to `confirmed` and
+ * simply never answer early.
+ *
+ * So it is TRIED. An endpoint that refuses outright is marked on its first
+ * answer; one that accepts the parameter and never delivers early is marked
+ * after a bounded number of misses. Either way the extra round trip is paid a
+ * handful of times and then never again — the fast path cannot become a
+ * permanent tax on every resolve, which is the failure mode that would make
+ * this a latency REGRESSION rather than an improvement.
+ *
+ * ── PER SOCKET, DELIBERATELY, NOT PER ENDPOINT ──────────────────────────────
+ * Sharing one map across sockets would probe once for five whales instead of
+ * five times, and it was written that way first. It is hidden cross-instance
+ * state: two sockets on one URL become order-dependent, and so do two tests.
+ * The saving is at most a few RPC calls once per process — nothing against
+ * correctness that is local and obvious.
+ */
+function createProcessedProbe() {
+  return { supported: null, misses: 0 };
+}
+
+/**
+ * Does this RPC error mean the endpoint refuses `processed` here? PURE.
+ *
+ * Matched on the message because JSON-RPC error CODES are not distinctive: the
+ * same -32602 covers a malformed signature, and treating that as "processed is
+ * unsupported" would disable the fast path on the first typo'd signature.
+ */
+export function isUnsupportedCommitment(error) {
+  const s = String(error ?? '').toLowerCase();
+  if (!s) return false;
+  return (
+    (s.includes('commitment') && (s.includes('not supported') || s.includes('invalid') || s.includes('unsupported'))) ||
+    s.includes('processed is not supported')
+  );
+}
+
+/**
+ * One signature -> one parsed trade, or null. Shared by both transports.
+ *
+ * Factored out rather than copied because the per-wallet socket and the
+ * multiplexed feed must read chain IDENTICALLY. Two copies of the commitment
+ * ladder is two places for the probe, the retry count and the fast path to
+ * drift, and the drift would show up as one transport quietly seeing fewer
+ * trades than the other — the exact class of bug this module keeps paying for.
+ */
+function createResolver({ rpcUrl, rpcImpl, cfg = {}, log = () => {}, probe, stats }) {
+  return async (signature, wallet, { fast = true } = {}) => {
+    if (fast && probe.supported !== false && cfg.processedFirst !== false) {
+      const early = await rpcImpl(rpcUrl, 'getTransaction', [
+        signature,
+        { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'processed' },
+      ]);
+      if (early.ok && early.result) {
+        probe.supported = true;
+        probe.misses = 0;
+        stats.fastResolved++;
+        return { ok: true, trade: parseWalletSwap(early.result, { wallet }) };
+      }
+      if (!early.ok && isUnsupportedCommitment(early.error)) {
+        probe.supported = false;
+        log(`   getTransaction refuses processed here (${early.error}) — confirmed only from now on`);
+      } else if (++probe.misses >= (cfg.processedProbeLimit ?? 8)) {
+        probe.supported = false;
+        log(`   processed reads never landed early in ${probe.misses} attempts — confirmed only from now on`);
+      }
+    }
+
+    let lastErr = null;
+    for (let attempt = 0; attempt <= (cfg.lookupRetries ?? 4); attempt++) {
+      const tx = await rpcImpl(rpcUrl, 'getTransaction', [
+        signature,
+        { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' },
+      ]);
+      if (tx.ok && tx.result) return { ok: true, trade: parseWalletSwap(tx.result, { wallet }) };
+      if (!tx.ok) lastErr = tx.error;
+      await new Promise((r) => setTimeout(r, cfg.lookupRetryDelayMs ?? 300));
+    }
+    return { ok: false, error: lastErr ?? 'transaction not found' };
+  };
+}
+
 export function createWhaleSocket({
   wallet,
   rpcUrl,
   cfg = {},
   log = () => {},
+  // ── PUSH INSTEAD OF BUFFER ─────────────────────────────────────────────────
+  // Supplied, a resolved trade goes straight to the consumer instead of waiting
+  // in `state.buffer` for the next drain. That wait was MEASURED as the single
+  // largest term in the copy pipeline: the tick runs every `--watch N` seconds
+  // (default 5), so a trade resolved just after one costs a further 0-5000ms
+  // for no reason but the loop's shape — a mean of 2500ms against a total
+  // budget of about 6000ms.
+  //
+  // OPTIONAL BY DESIGN. Absent, the buffer behaves exactly as before, which is
+  // what paper_copytrade's own --watch path still relies on. This is additive,
+  // not a migration.
+  onTrade = null,
   WebSocketImpl = globalThis.WebSocket,
   rpcImpl = solanaRpc,
 } = {}) {
@@ -1459,11 +2411,12 @@ export function createWhaleSocket({
     // drains — see the failure path below for why dropping them lost trades.
     pendingRetry: [],
     newestSignature: null,
-    stats: { notifications: 0, resolved: 0, failed: 0, recovered: 0, abandoned: 0, reconnects: 0, duplicates: 0 },
+    stats: { notifications: 0, resolved: 0, failed: 0, recovered: 0, abandoned: 0, reconnects: 0, duplicates: 0, pushed: 0, handlerErrors: 0, fastResolved: 0 },
     lastError: null,
     closed: false,
   };
   const seen = new Set();
+  const probe = createProcessedProbe();
 
   if (!wallet || !wsUrl || typeof WebSocketImpl !== 'function') {
     state.lastError = !wallet ? 'no target wallet' : !wsUrl ? 'no websocket url' : 'no WebSocket implementation';
@@ -1476,16 +2429,22 @@ export function createWhaleSocket({
     };
   }
 
-  const resolve = async (signature) => {
-    for (let attempt = 0; attempt <= (cfg.lookupRetries ?? 4); attempt++) {
-      const tx = await rpcImpl(rpcUrl, 'getTransaction', [
-        signature,
-        { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' },
-      ]);
-      if (tx.ok && tx.result) return parseWalletSwap(tx.result, { wallet });
-      await new Promise((r) => setTimeout(r, cfg.lookupRetryDelayMs ?? 300));
-    }
-    return null;
+  const resolveTx = createResolver({ rpcUrl, rpcImpl, cfg, log, probe, stats: state.stats });
+  const resolve = async (signature, { fast = true } = {}) => {
+    // ── FAST PATH: read at the commitment we were notified at ──────────────
+    // A processed read of a signature we were just told about is warm if the
+    // endpoint supports it, which removes the retry ladder below entirely.
+    //
+    // FIRST ATTEMPT ONLY. A signature coming back through pendingRetry is
+    // already seconds late, so an early read has nothing left to win there —
+    // and probing on every retry would DOUBLE the calls on exactly the
+    // signatures that are already failing. Skipped too once the endpoint has
+    // been shown not to answer; see createProcessedProbe for why this is
+    // probed rather than assumed.
+    //
+    // The ladder itself lives in createResolver, shared with the multiplexed
+    // feed so the two transports cannot read chain differently.
+    return resolveTx(signature, wallet, { fast });
   };
 
   let ws = null;
@@ -1538,35 +2497,35 @@ export function createWhaleSocket({
       }
 
       // Resolved HERE, not at drain time, so the tick never waits on RPC.
-      const trade = await resolve(signature);
+      const res = await resolve(signature);
+      if (!res.ok) {
+        state.pendingRetry.push({ signature, attempts: 1 });
+        state.stats.failed++;
+        return;
+      }
+      const trade = res.trade;
       if (trade) {
-        state.buffer.push(trade);
         state.newestSignature = signature;
         state.stats.resolved++;
         log(`   socket ${trade.kind} ${trade.mint.slice(0, 8)}…`);
-      } else {
-        // ── A FAILED RESOLUTION USED TO LOSE THE TRADE OUTRIGHT ────────────
-        // The notification is the only time this signature is ever offered:
-        // the poll runs only while catching up, so once it is caught up
-        // nothing goes back for a signature the socket could not read. An
-        // audit found exactly that — a BUY the target made that "never
-        // reached the book", against a FEED line reading "1 notified, 0
-        // resolved".
-        //
-        // The cause is timing, not corruption. A `processed` notification can
-        // arrive before a `confirmed` read can see it, measured at 396-779ms
-        // needing 2-3 attempts, so a slower one simply outruns the retries
-        // inside resolve(). Queued for another attempt on subsequent drains
-        // rather than dropped, and given up on only after retryAttempts, so a
-        // genuinely unreadable signature cannot be retried forever.
-        state.pendingRetry.push({ signature, attempts: 1 });
-        state.stats.failed++;
+
+        if (onTrade) {
+          state.stats.pushed++;
+          Promise.resolve(onTrade(trade)).catch((err) => {
+            state.stats.handlerErrors++;
+            log(`   onTrade threw for ${trade.mint.slice(0, 8)}…: ${err?.message ?? err}`);
+          });
+        } else {
+          state.buffer.push(trade);
+        }
       }
     };
 
     ws.onerror = (err) => {
       state.lastError = err?.message ?? 'socket error';
     };
+    if (typeof ws.on === 'function') ws.on('error', () => {});
+    if (typeof ws.addEventListener === 'function') ws.addEventListener('error', () => {});
     ws.onclose = () => {
       state.connected = false;
       scheduleReconnect();
@@ -1586,7 +2545,7 @@ export function createWhaleSocket({
   return {
     wallet,
     isConnected: () => state.connected,
-    status: () => ({ ...state, buffered: state.buffer.length }),
+    status: () => ({ ...state, buffered: state.buffer.length, processedProbe: { ...probe } }),
     /**
      * Hand over everything resolved since the last call. Oldest first, so a buy
      * and a later sell of one mint apply in order — the same requirement the
@@ -1599,12 +2558,14 @@ export function createWhaleSocket({
       if (state.pendingRetry.length) {
         const queue = state.pendingRetry.splice(0, state.pendingRetry.length);
         for (const item of queue) {
-          const trade = await resolve(item.signature);
-          if (trade) {
-            state.buffer.push(trade);
-            state.newestSignature = item.signature;
-            state.stats.resolved++;
-            state.stats.recovered++;
+          const res = await resolve(item.signature, { fast: false });
+          if (res.ok) {
+            if (res.trade) {
+              state.buffer.push(res.trade);
+              state.newestSignature = item.signature;
+              state.stats.resolved++;
+              state.stats.recovered++;
+            }
             continue;
           }
           if (item.attempts + 1 >= (cfg.retryAttempts ?? 5)) {
@@ -1753,16 +2714,365 @@ export function resolveTargets(watchlist, book = null, { limit = 5 } = {}) {
  * interleaves buys and sells chronologically, and a batch out of order can
  * close a position before the buy that opened it.
  */
+/**
+ * Every tracked wallet on ONE WebSocket connection.
+ *
+ * ── THE BUG THIS EXISTS TO FIX, MEASURED ────────────────────────────────────
+ * createWhaleCluster opened one connection PER WALLET, because logsSubscribe's
+ * `mentions` filter takes a single address. Providers cap concurrent
+ * connections per key, and Helius drops the surplus with close code 1006 — no
+ * close frame, no error body, nothing an `onerror` handler can report. The bot
+ * then showed a healthy socket feed while watching a fraction of the list.
+ *
+ * MEASURED against mainnet.helius-rpc.com with five wallets:
+ *
+ *     5 connections opened together      1 of 5 survived
+ *     5 connections opened 1.5s apart    3 of 5 survived
+ *     1 connection, 5 subscriptions      5 of 5 live
+ *
+ * Which wallet survived was a RACE, so it changed between runs — the symptom
+ * was "it stopped copying the whale I just added", and the whale that went
+ * silent was whichever lost. One subscription per address is a protocol
+ * requirement; one CONNECTION per address never was.
+ *
+ * ── ATTRIBUTION IS BY SUBSCRIPTION ID, NEVER BY GUESS ───────────────────────
+ * With one socket per wallet, the connection identified the wallet. Multiplexed
+ * it cannot, so every notification is attributed through `params.subscription`
+ * against the id the server returned when the subscription was confirmed. A
+ * notification whose id is unknown is COUNTED AND DROPPED rather than assigned
+ * to a likely wallet: crediting a trade to the wrong whale would corrupt the
+ * cluster signal and the exit-origin check, both of which key on wallet.
+ *
+ * ── ONE CONNECTION PER FEED, NOT A GLOBAL REGISTRY ──────────────────────────
+ * A module-level map keyed by RPC url would share one connection across every
+ * caller in the process. That is hidden cross-instance state of exactly the
+ * kind that made the per-socket probe order-dependent. This app builds one
+ * feed per run, so an instance-scoped connection already is one per endpoint.
+ */
+export function createWhaleFeed({
+  wallets = [],
+  rpcUrl,
+  cfg = {},
+  log = () => {},
+  onTrade = null,
+  WebSocketImpl = globalThis.WebSocket,
+  rpcImpl = solanaRpc,
+} = {}) {
+  const wsUrl = websocketUrlFor(rpcUrl);
+  const entries = wallets
+    .map((w) => (typeof w === 'string' ? { address: w, label: null } : { address: w?.address, label: w?.label ?? null }))
+    .filter((e) => e.address);
+
+  const state = {
+    connected: false,
+    closed: false,
+    lastError: null,
+    stats: {
+      notifications: 0, resolved: 0, failed: 0, recovered: 0, abandoned: 0,
+      reconnects: 0, duplicates: 0, pushed: 0, handlerErrors: 0, fastResolved: 0,
+      unattributed: 0, refusedSubs: 0,
+    },
+  };
+
+  const perWallet = new Map(
+    entries.map((e) => [e.address, {
+      label: e.label,
+      subId: null,
+      buffer: [],
+      pendingRetry: [],
+      newestSignature: null,
+      // Per wallet, not shared: one transaction can mention two tracked
+      // wallets and will then notify once per subscription. A shared set would
+      // drop the second and lose that wallet's side of the trade.
+      seen: new Set(),
+    }])
+  );
+
+  const probe = createProcessedProbe();
+  const resolveTx = createResolver({ rpcUrl, rpcImpl, cfg, log, probe, stats: state.stats });
+
+  if (!entries.length || !wsUrl || typeof WebSocketImpl !== 'function') {
+    state.lastError = !entries.length ? 'no tracked wallets' : !wsUrl ? 'no websocket url' : 'no WebSocket implementation';
+    return {
+      size: entries.length,
+      wallets: entries.map((e) => e.address),
+      isConnected: () => false,
+      connectedCount: () => 0,
+      subscribedCount: () => 0,
+      missingWallets: () => entries.map((e) => e.address),
+      status: () => ({ ...state, subscribed: [], missing: entries.map((e) => e.address) }),
+      drain: async () => ({ ok: false, error: state.lastError, trades: [], cursors: {}, errors: [], scanned: 0, pending: 0, source: 'socket' }),
+      close: () => {},
+    };
+  }
+
+  // subId -> address, and requestId -> address while a subscribe is in flight.
+  const subToWallet = new Map();
+  const pendingSubs = new Map();
+  let nextRequestId = 1;
+  let ws = null;
+  let backoff = cfg.reconnectBackoffMs ?? 1_000;
+
+  /**
+   * Re-establish the WHOLE subscription set as a unit.
+   *
+   * Every id from the previous connection is void the moment it drops, so the
+   * maps are cleared before a single request goes out. Without that, a
+   * notification carrying a recycled id from the new connection could match a
+   * stale entry and be attributed to the wrong wallet — and because request
+   * ids are never reused, a late confirmation from the old round simply finds
+   * nothing in `pendingSubs` and is ignored.
+   */
+  const subscribeAll = () => {
+    subToWallet.clear();
+    pendingSubs.clear();
+    for (const w of perWallet.values()) w.subId = null;
+    for (const address of perWallet.keys()) {
+      const id = nextRequestId++;
+      pendingSubs.set(id, address);
+      ws.send(JSON.stringify({
+        jsonrpc: '2.0',
+        id,
+        method: 'logsSubscribe',
+        params: [{ mentions: [address] }, { commitment: cfg.socketCommitment ?? 'processed' }],
+      }));
+    }
+    log(`   one connection, ${perWallet.size} subscription(s) requested`);
+  };
+
+  const handleNotification = async (address, value) => {
+    const w = perWallet.get(address);
+    const signature = value?.signature;
+    if (!w || !signature) return;
+
+    // A failed transaction moved nothing.
+    if (value.err) return;
+    if (w.seen.has(signature)) { state.stats.duplicates++; return; }
+    w.seen.add(signature);
+    if (w.seen.size > SEEN_SIGNATURE_LIMIT * 2) {
+      for (const s of [...w.seen].slice(0, w.seen.size - SEEN_SIGNATURE_LIMIT)) w.seen.delete(s);
+    }
+
+    const res = await resolveTx(signature, address);
+    if (!res.ok) {
+      w.pendingRetry.push({ signature, attempts: 1 });
+      state.stats.failed++;
+      return;
+    }
+    const trade = res.trade;
+    if (!trade) return;
+
+    w.newestSignature = signature;
+    state.stats.resolved++;
+    const stamped = { ...trade, wallet: address, walletLabel: w.label };
+    log(`   ${trade.kind} ${trade.mint.slice(0, 8)}… ${address.slice(0, 8)}…`);
+
+    if (onTrade) {
+      state.stats.pushed++;
+      Promise.resolve(onTrade(stamped)).catch((err) => {
+        state.stats.handlerErrors++;
+        log(`   onTrade threw for ${trade.mint.slice(0, 8)}…: ${err?.message ?? err}`);
+      });
+    } else {
+      w.buffer.push(stamped);
+    }
+  };
+
+  const connect = () => {
+    if (state.closed) return;
+    try {
+      ws = new WebSocketImpl(wsUrl);
+    } catch (err) {
+      state.lastError = err.message;
+      scheduleReconnect();
+      return;
+    }
+
+    ws.onopen = () => {
+      state.connected = true;
+      state.lastError = null;
+      backoff = cfg.reconnectBackoffMs ?? 1_000;
+      subscribeAll();
+    };
+
+    ws.onmessage = async (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+
+      // A subscribe reply, matched by the request id we sent.
+      if (msg.id != null && pendingSubs.has(msg.id)) {
+        const address = pendingSubs.get(msg.id);
+        pendingSubs.delete(msg.id);
+        if (msg.error) {
+          state.stats.refusedSubs++;
+          state.lastError = `subscribe ${address.slice(0, 8)}…: ${msg.error.message ?? 'refused'}`;
+          log(`   SUBSCRIBE REFUSED ${address.slice(0, 8)}… — ${msg.error.message ?? 'no reason given'}`);
+          return;
+        }
+        if (msg.result !== undefined && msg.result !== null) {
+          subToWallet.set(msg.result, address);
+          const w = perWallet.get(address);
+          if (w) w.subId = msg.result;
+        }
+        return;
+      }
+
+      if (msg.method !== 'logsNotification') return;
+      state.stats.notifications++;
+
+      const address = subToWallet.get(msg.params?.subscription);
+      if (!address) {
+        // Unknown subscription id. Counted, never guessed at — see the header.
+        state.stats.unattributed++;
+        return;
+      }
+      await handleNotification(address, msg.params?.result?.value);
+    };
+
+    ws.onerror = (err) => { state.lastError = err?.message ?? 'socket error'; };
+    if (typeof ws.on === 'function') ws.on('error', () => {});
+    if (typeof ws.addEventListener === 'function') ws.addEventListener('error', () => {});
+    ws.onclose = () => {
+      state.connected = false;
+      subToWallet.clear();
+      pendingSubs.clear();
+      for (const w of perWallet.values()) w.subId = null;
+      scheduleReconnect();
+    };
+  };
+
+  const scheduleReconnect = () => {
+    if (state.closed) return;
+    state.stats.reconnects++;
+    const wait = backoff;
+    backoff = Math.min(backoff * 2, cfg.maxReconnectBackoffMs ?? 30_000);
+    setTimeout(connect, wait).unref?.();
+  };
+
+  connect();
+
+  const missingWallets = () => [...perWallet.entries()].filter(([, w]) => w.subId === null).map(([a]) => a);
+
+  return {
+    size: perWallet.size,
+    wallets: [...perWallet.keys()],
+    // Connected means DELIVERING: the transport is open and at least one
+    // subscription is confirmed. An open socket with no live subscription
+    // returns nothing, and reporting it as connected is precisely how the
+    // dropped-connection bug stayed invisible — the caller would stop polling.
+    isConnected: () => state.connected && subToWallet.size > 0,
+    connectedCount: () => subToWallet.size,
+    subscribedCount: () => subToWallet.size,
+    missingWallets,
+    status: () => ({
+      ...state,
+      buffered: [...perWallet.values()].reduce((a, w) => a + w.buffer.length, 0),
+      pendingRetry: [...perWallet.values()].flatMap((w) => w.pendingRetry),
+      subscribed: [...subToWallet.values()],
+      missing: missingWallets(),
+      processedProbe: { ...probe },
+      transport: 'multiplexed',
+    }),
+
+    async drain() {
+      const trades = [];
+      const cursors = {};
+
+      for (const [address, w] of perWallet) {
+        if (w.pendingRetry.length) {
+          const queue = w.pendingRetry.splice(0, w.pendingRetry.length);
+          for (const item of queue) {
+            const res = await resolveTx(item.signature, address, { fast: false });
+            if (res.ok) {
+              if (res.trade) {
+                w.buffer.push({ ...res.trade, wallet: address, walletLabel: w.label });
+                w.newestSignature = item.signature;
+                state.stats.resolved++;
+                state.stats.recovered++;
+              }
+              continue;
+            }
+            if (item.attempts + 1 >= (cfg.retryAttempts ?? 5)) {
+              state.stats.abandoned++;
+              continue;
+            }
+            w.pendingRetry.push({ signature: item.signature, attempts: item.attempts + 1 });
+          }
+        }
+
+        for (const t of w.buffer.splice(0, w.buffer.length)) trades.push(t);
+        // Deliberately NOT advanced from the socket: if it drops, the poll
+        // fallback must re-read the window it was covering rather than skip it.
+        cursors[address] = null;
+      }
+
+      trades.sort((a, b) => (a.blockTime ?? 0) - (b.blockTime ?? 0));
+      return {
+        ok: (state.connected && subToWallet.size > 0) || trades.length > 0,
+        error: state.connected ? null : (state.lastError ?? 'socket not connected'),
+        trades,
+        cursors,
+        errors: [],
+        // Carried so the dashboard's "N new tx" reflects the socket. The old
+        // cluster omitted it, so that counter read 0 on every socket tick no
+        // matter how many trades arrived.
+        scanned: trades.length,
+        pending: 0,
+        source: 'socket',
+      };
+    },
+
+    close() {
+      state.closed = true;
+      try { ws?.close(); } catch { /* already closing */ }
+    },
+  };
+}
+
+/**
+ * The tracked wallets as one feed.
+ *
+ * DEFAULTS TO ONE MULTIPLEXED CONNECTION — see createWhaleFeed for the measured
+ * reason. Passing `socketFactory` selects the older connection-per-wallet mode
+ * instead, which remains the path the per-socket tests drive and an escape
+ * hatch for an endpoint that dislikes many subscriptions on one connection.
+ * That mode is subject to the provider connection cap and should not be the
+ * default on Helius.
+ */
 export function createWhaleCluster({
   wallets = [],
   rpcUrl,
   cfg = {},
   log = () => {},
-  socketFactory = createWhaleSocket,
+  // Threaded down to every socket. See createWhaleSocket for why pushing beats
+  // buffering; the cluster's only added job is identity, below.
+  onTrade = null,
+  socketFactory = null,
+  WebSocketImpl = globalThis.WebSocket,
+  rpcImpl = solanaRpc,
 } = {}) {
+  if (!socketFactory && cfg.multiplex !== false) {
+    return createWhaleFeed({ wallets, rpcUrl, cfg, log, onTrade, WebSocketImpl, rpcImpl });
+  }
+
+  const factory = socketFactory ?? createWhaleSocket;
   const sockets = wallets.map((w) => {
     const address = typeof w === 'string' ? w : w.address;
-    return { address, label: typeof w === 'string' ? null : (w.label ?? null), socket: socketFactory({ wallet: address, rpcUrl, cfg, log }) };
+    const label = typeof w === 'string' ? null : (w.label ?? null);
+
+    // ── THE SOCKET DOES NOT KNOW WHOSE IT IS ───────────────────────────────
+    // A socket is constructed per wallet but the trade it resolves carries no
+    // wallet field, because parseWalletSwap describes the swap and not the
+    // subscription. drain() has always stamped it on the way out; the push
+    // path has to do the same or every pushed trade arrives anonymous.
+    //
+    // That is not cosmetic here: orderByRank breaks same-block ties on
+    // rankOf(t.wallet), and an undefined wallet ranks Infinity — so all five
+    // whales would tie at the bottom and the operator-approved precedence
+    // would silently become socket scheduling order.
+    const stamped = onTrade ? (t) => onTrade({ ...t, wallet: address, walletLabel: label }) : null;
+
+    return { address, label, socket: factory({ wallet: address, rpcUrl, cfg, log, onTrade: stamped }) };
   });
 
   return {
@@ -2067,7 +3377,7 @@ export async function fetchPrices(mints, { batchFetcher = fetchPairsBatch } = {}
  */
 export async function fetchMarketData(
   mints,
-  { batchFetcher = fetchPairsBatch, singleFetcher = fetchDexScreenerPrice, maxSingleLookups = 8 } = {}
+  { batchFetcher = fetchPairsBatch, singleFetcher = fetchDexScreenerPrice, maxSingleLookups = 8, solUsd = null } = {}
 ) {
   const out = new Map();
   if (!mints?.length) return out;
@@ -2083,7 +3393,16 @@ export async function fetchMarketData(
       continue;
     }
     const symbol = typeof pair?.baseToken?.symbol === 'string' ? pair.baseToken.symbol.trim() : null;
-    out.set(mint, { priceUsd, symbol: symbol || null, source: 'batch' });
+    // The pool comes from the SAME payload as the price, at no extra request —
+    // the pair that sets the price is by construction the pair a fill would
+    // cross, since fetchPairsBatch already keeps the deepest one per token.
+    const pool = poolReserveSol(pair, { solUsd });
+    out.set(mint, {
+      priceUsd,
+      symbol: symbol || null,
+      source: 'batch',
+      poolSol: pool.measured ? pool.reserveSol : null,
+    });
   }
 
   // ── PER-MINT FALLBACK ─────────────────────────────────────────────────────
@@ -2099,7 +3418,21 @@ export async function fetchMarketData(
   if (!singleFetcher || !missing.length) return out;
   for (const mint of missing.slice(0, maxSingleLookups)) {
     const single = await singleFetcher(mint).catch(() => null);
-    if (single?.ok) out.set(mint, { priceUsd: single.priceUsd, symbol: single.symbol, source: 'dexscreener-single' });
+    if (!single?.ok) continue;
+    // This endpoint returns liquidityUsd but not the pair, so the quote token is
+    // unknown and the reserve field cannot be read directly. Half the pool value
+    // converted at spot is the only route left, and it is the same arithmetic
+    // poolReserveSol falls back to for any pair not quoted in SOL.
+    const poolSol =
+      Number.isFinite(single.liquidityUsd) && single.liquidityUsd > 0 && Number.isFinite(solUsd) && solUsd > 0
+        ? single.liquidityUsd / 2 / solUsd
+        : null;
+    out.set(mint, {
+      priceUsd: single.priceUsd,
+      symbol: single.symbol,
+      source: 'dexscreener-single',
+      poolSol,
+    });
   }
   return out;
 }
@@ -2112,10 +3445,29 @@ export async function fetchMarketData(
  * would make every one of those mirror nothing.
  */
 export function readQuote(value) {
-  if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? { priceUsd: value, symbol: null } : null;
+  if (typeof value === 'number') {
+    // NO poolSol KEY AT ALL, which resolvePoolSol reads as "depth was never
+    // sought" rather than "sought and missing". A bare number is a shape that
+    // cannot carry depth, so a caller injecting one — every test that passes a
+    // price map, and any custom fetcher — gets the infinite-depth behaviour it
+    // has always had instead of being charged an assumed pool it never saw.
+    // report.liquidity.depthUnavailable counts these so the choice is visible.
+    return Number.isFinite(value) && value > 0 ? { priceUsd: value, symbol: null } : null;
+  }
   const priceUsd = Number(value?.priceUsd);
   if (!Number.isFinite(priceUsd) || priceUsd <= 0) return null;
-  return { priceUsd, symbol: value?.symbol ?? null };
+  const poolSol = Number(value?.poolSol);
+  const carriesDepth = value !== null && typeof value === 'object' && 'poolSol' in value;
+  return {
+    priceUsd,
+    symbol: value?.symbol ?? null,
+    // The key is OMITTED rather than set to undefined when the quote never had
+    // one. `{poolSol: undefined}` and `{}` read the same to every consumer here
+    // but not to assert.deepStrictEqual, and a shape that fails an equality
+    // check it should pass is a trap for the next person writing a test.
+    // null, never the floor: resolvePoolSol owns that decision.
+    ...(carriesDepth ? { poolSol: Number.isFinite(poolSol) && poolSol > 0 ? poolSol : null } : {}),
+  };
 }
 
 /**
@@ -2151,6 +3503,11 @@ export async function runPaperTick({
   // implied path is simply skipped and the pair lookup is used, rather than a
   // guessed rate producing a wrong entry.
   solUsd = null,
+  // The slot-window reader behind `slotFills`. Injected so the reconstruction
+  // can be driven from written-down transaction shapes in tests — without this
+  // seam a tick test would reach the network, which is the one thing this
+  // engine's tests have never done.
+  slotSwapFetcher = fetchSlotWindowSwaps,
 } = {}) {
   const report = { opened: [], exits: [], marked: 0, declined: [], target: null, chain: null };
 
@@ -2288,6 +3645,13 @@ export async function runPaperTick({
           // position falls back to the target, which is correct for a
           // single-wallet poll.
           wallet: t.wallet ?? null,
+          // The slot the target's buy landed in. The fill window is counted
+          // from here; without it slotFills has nothing to anchor to and the
+          // candidate simply keeps the implied price.
+          whaleSlot: t.slot ?? null,
+          // The target's own transaction, so the activity feed can link the
+          // trade that caused ours rather than only the token.
+          signature: t.signature ?? null,
         };
       }),
     ...ledgerCandidates,
@@ -2298,20 +3662,62 @@ export async function runPaperTick({
   // tells us today's price. Candidates only need one when the swap could not
   // price them, which is the whole latency win: a mirrored entry no longer
   // waits on a network round trip plus fetchPairsBatch's 250ms internal pace.
+  //
+  // ── AND SO DOES EVERY CANDIDATE, ONCE THE LIQUIDITY MODEL IS ON ───────────
+  // An implied entry knows its price but not its pool, and without the pool the
+  // fill falls back to poolFloorSol — 30 SOL against a population measured at
+  // 117-260. That is a 2.5-point overcharge on every entry, applied silently.
+  // The lookup usually costs nothing: open positions are marked through this
+  // same batch call, so the candidate rides along in a request already being
+  // made. It costs one round trip only when the book is empty AND every
+  // candidate priced itself, which is exactly the tick where nothing else is
+  // waiting on it. poolDepthLookup: false restores the old behaviour.
   const needPrices = [
-    ...new Set([...openMints, ...candidates.filter((c) => !c.impliedPriceUsd).map((c) => c.mint)]),
+    ...new Set([
+      ...openMints,
+      ...candidates
+        .filter((c) => !c.impliedPriceUsd || (cfg.liquidityModel !== false && cfg.poolDepthLookup !== false))
+        .map((c) => c.mint),
+    ]),
   ];
-  const raw = await priceFetcher(needPrices);
+  const raw = await priceFetcher(needPrices, { solUsd });
   // Normalised once, so every reader below sees one shape whether the fetcher
   // returned bare numbers or {priceUsd, symbol} records.
   const quotes = new Map();
   const prices = new Map();
+  // Holds undefined and null as MEANINGFULLY DIFFERENT values, which is why
+  // every quote is recorded rather than only the ones carrying a number:
+  // `pools.get(mint)` then returns the depth, or null for a quote that looked
+  // and found none, or undefined for a shape that cannot report depth at all.
+  // See resolvePoolSol — the floor answers exactly one of those three.
+  const pools = new Map();
+  let depthUnavailable = 0;
+  let poolsMeasured = 0;
   for (const [mint, value] of raw ?? []) {
     const q = readQuote(value);
     if (!q) continue;
     quotes.set(mint, q);
     prices.set(mint, q.priceUsd);
+    pools.set(mint, q.poolSol);
+    if (q.poolSol === undefined) depthUnavailable++;
+    else if (q.poolSol !== null) poolsMeasured++;
   }
+  // Counted rather than inferred later: "how many of this tick's fills were
+  // priced against a pool nobody read" is the first question to ask of a result
+  // this model produces.
+  report.liquidity = {
+    modelled: cfg.liquidityModel !== false,
+    poolCapPct: cfg.poolCapPct,
+    poolFloorSol: cfg.poolFloorSol,
+    poolsMeasured,
+    poolsNeeded: needPrices.length,
+    // Quotes from a source that cannot report depth — the liquidity model does
+    // not run on these at all, and a tick where this is high is a tick whose
+    // P&L still assumes infinite liquidity.
+    depthUnavailable,
+    capped: 0,
+    flooredFills: 0,
+  };
 
   // Indexed so the ordered pass below can find the candidate a BUY row refers
   // to. Last write wins on a repeated mint, which is correct: two buys of one
@@ -2336,10 +3742,46 @@ export async function runPaperTick({
   report.compound = compound;
   const sizingCfg = compound.active ? { ...cfg, pctWhale: compound.effectivePctWhale } : cfg;
 
+  // ── SLOT-LATENCY FILLS ────────────────────────────────────────────────────
+  // Resolved BEFORE the ordered pass so openCandidate stays synchronous — it is
+  // called from inside the ordered buy/sell walk, and making that walk async
+  // would reorder a buy and the sell that follows it, which the walk exists to
+  // prevent.
+  //
+  // Only candidates that carry a slot are eligible. A ledger candidate has no
+  // slot and keeps the pair price, which is correct: there is no target trade
+  // to count a window from.
+  const bands = new Map();
+  if (cfg.slotFills === true && Number.isFinite(solUsd)) {
+    report.slotFills = { attempted: 0, reconstructed: 0, failed: 0, reasons: [] };
+    for (const c of candidates) {
+      if (!Number.isFinite(c.whaleSlot) || bands.has(c.mint)) continue;
+      report.slotFills.attempted++;
+      const band = await resolveExecutionBand({
+        mint: c.mint,
+        whaleSlot: c.whaleSlot,
+        side: 'BUY',
+        cfg,
+        solUsd,
+        rpcUrl: cfg.rpcMirror?.url,
+        fetcher: slotSwapFetcher,
+      });
+      bands.set(c.mint, band);
+      if (band.reconstructed) report.slotFills.reconstructed++;
+      else {
+        report.slotFills.failed++;
+        if (band.reason) report.slotFills.reasons.push(band.reason);
+      }
+    }
+  }
+
   const openCandidate = (c) => {
-    // The swap's own price wins when it exists; the pair lookup is the
-    // fallback for a spend too small to imply one, or a ledger candidate.
-    const price = c.impliedPriceUsd ?? prices.get(c.mint);
+    // Priority: a fill reconstructed from real on-chain swaps at the slot we
+    // could actually have landed in, then the swap's own price, then the pair
+    // lookup. The reconstruction is skipped rather than faked when the chain
+    // could not answer — see buildExecutionBand's `reconstructed: false`.
+    const band = bands.get(c.mint);
+    const price = (band?.reconstructed ? band.fillPriceUsd : null) ?? c.impliedPriceUsd ?? prices.get(c.mint);
     const res = openPaperPosition(book, {
       mint: c.mint,
       // A chain buy arrives with no symbol; the quote that priced it has one.
@@ -2353,12 +3795,26 @@ export async function runPaperTick({
       // keeps single-wallet runs and ledger-sourced candidates unchanged.
       originatingWhale: c.wallet ?? book.target?.address ?? null,
       whaleSpendSol: c.whaleSpendSol ?? null,
+      poolSolReserve: pools.has(c.mint) ? pools.get(c.mint) : null,
     });
     if (res.ok) {
+      if (res.liquidityCapped) report.liquidity.capped++;
+      if (res.poolMeasured === false) report.liquidity.flooredFills++;
+      // Recorded ON the position, not only in the report: the uncertainty
+      // belongs to the fill for as long as the position is open, and the
+      // dashboard reads it from the book on every later tick.
+      if (band?.reconstructed && res.position) res.position.executionBand = band;
       report.opened.push({
         mint: c.mint,
         symbol: res.position?.symbol ?? c.symbol ?? null,
         sizeSol: res.sizeSol,
+        executionBand: band?.reconstructed ? band : null,
+        // The target's tx, and the price THEY got. Together these let the feed
+        // state the cost of arriving late: our fill against theirs, on the
+        // trade that caused ours.
+        signature: c.signature ?? null,
+        whaleFillUsd: c.whaleFillUsd ?? null,
+        entryPriceUsd: res.position?.entryPriceUsd ?? null,
         originatingWhale: res.position?.originatingWhale ?? null,
         basis: res.basis ?? null,
         whaleSpendSol: c.whaleSpendSol ?? null,
@@ -2367,6 +3823,13 @@ export async function runPaperTick({
         // event.
         scaledIn: res.scaledIn === true,
         blendedEntryUsd: res.blendedEntryUsd ?? null,
+        // What the pool did to this fill, carried to the activity log. A size
+        // that was cut and one that was not look identical as a number.
+        impactPct: res.impactPct ?? null,
+        poolSol: res.poolSol ?? null,
+        poolMeasured: res.poolMeasured ?? null,
+        liquidityCapped: res.liquidityCapped === true,
+        requestedSol: res.requestedSol ?? null,
       });
     } else report.declined.push({ mint: c.mint, reason: res.reason });
     return res;
@@ -2446,12 +3909,15 @@ export async function runPaperTick({
           const res = applySubWalletExit(book, t.mint, sub.subId, {
             priceUsd: price, trigger: 'WHALE_SELL', sellFraction: fraction, cfg, now,
             label: `target sold ${(fraction * 100).toFixed(0)}% of its bag`,
+            poolSolReserve: pools.has(t.mint) ? pools.get(t.mint) : null,
           });
           if (res.ok) {
+            if (res.poolMeasured === false) report.liquidity.flooredFills++;
             report.exits.push({
               mint: t.mint, symbol: p.symbol, trigger: 'WHALE_SELL',
               label: `target sold ${(fraction * 100).toFixed(0)}%`,
               gainPct, subId: sub.subId, profile: sub.profile, seller: t.wallet ?? null,
+              impactPct: res.impactPct ?? null, poolSol: res.poolSol ?? null, poolMeasured: res.poolMeasured ?? null,
             });
           }
         }
@@ -2465,8 +3931,10 @@ export async function runPaperTick({
         cfg,
         now,
         label: `target sold ${(fraction * 100).toFixed(0)}% of its bag`,
+        poolSolReserve: pools.has(t.mint) ? pools.get(t.mint) : null,
       });
       if (res.ok) {
+        if (res.poolMeasured === false) report.liquidity.flooredFills++;
         report.exits.push({
           mint: t.mint,
           symbol: p.symbol,
@@ -2474,6 +3942,9 @@ export async function runPaperTick({
           label: `target sold ${(fraction * 100).toFixed(0)}%`,
           gainPct,
           seller: t.wallet ?? null,
+          impactPct: res.impactPct ?? null,
+          poolSol: res.poolSol ?? null,
+          poolMeasured: res.poolMeasured ?? null,
         });
       }
       continue;
@@ -2515,6 +3986,10 @@ export async function runPaperTick({
           cfg,
           now,
           label: `no price for ${ageH.toFixed(0)}h`,
+          // No pool on file — the position is here BECAUSE its pair stopped
+          // pricing, so this exit pays the floor. Correct rather than harsh: a
+          // token that fell out of the feed is not one you get out of cheaply.
+          poolSolReserve: null,
         });
         report.exits.push({ mint, trigger: 'STALE' });
       }
@@ -2531,11 +4006,13 @@ export async function runPaperTick({
         sub.peakPriceUsd = Math.max(sub.peakPriceUsd ?? price, price);
         for (const exit of evaluatePaperExits(sub, price, subWalletCfg(cfg, profile))) {
           if (!book.positions[mint]) break;
-          const res = applySubWalletExit(book, mint, sub.subId, { priceUsd: price, ...exit, cfg, now });
+          const res = applySubWalletExit(book, mint, sub.subId, { priceUsd: price, ...exit, cfg, now, poolSolReserve: pools.has(mint) ? pools.get(mint) : null });
           if (res.ok) {
+            if (res.poolMeasured === false) report.liquidity.flooredFills++;
             report.exits.push({
               mint, symbol: p.symbol, trigger: exit.trigger, label: exit.label,
               gainPct: exit.gainPct, subId: sub.subId, profile: sub.profile,
+              impactPct: res.impactPct ?? null, poolSol: res.poolSol ?? null, poolMeasured: res.poolMeasured ?? null,
             });
           }
         }
@@ -2543,8 +4020,14 @@ export async function runPaperTick({
     } else {
       for (const exit of evaluatePaperExits(p, price, cfg)) {
         if (!book.positions[mint]) break;
-        const res = applyPaperExit(book, mint, { priceUsd: price, ...exit, cfg, now });
-        if (res.ok) report.exits.push({ mint, symbol: p.symbol, trigger: exit.trigger, label: exit.label, gainPct: exit.gainPct });
+        const res = applyPaperExit(book, mint, { priceUsd: price, ...exit, cfg, now, poolSolReserve: pools.has(mint) ? pools.get(mint) : null });
+        if (res.ok) {
+          if (res.poolMeasured === false) report.liquidity.flooredFills++;
+          report.exits.push({
+            mint, symbol: p.symbol, trigger: exit.trigger, label: exit.label, gainPct: exit.gainPct,
+            impactPct: res.impactPct ?? null, poolSol: res.poolSol ?? null, poolMeasured: res.poolMeasured ?? null,
+          });
+        }
       }
     }
   }
@@ -2814,6 +4297,20 @@ export async function main(argv = []) {
   // PURE MIRROR. Re-run through paperConfig so the invariants it enforces —
   // chain feed on, sells mirrored — apply to a flag exactly as they do to a
   // config file, rather than being set here and drifting from it.
+  if (argv.includes('--slot-fills')) {
+    Object.assign(cfg, paperConfig({ ...cfg, slotFills: true }));
+    const o = cfg.slotOffsets ?? DEFAULT_SLOT_OFFSETS;
+    console.log(`Slot-latency fills: entries priced from real on-chain swaps at slot N+${o.expected}.`);
+    console.log(`  Band N+${o.earliest} … N+${o.latest} reported beside every fill as an uncertainty spread.`);
+    console.log('  MEASURED: the ~1.0-1.4s observation lag, which floors the window at N+3.');
+    console.log(`  ASSUMED: that we would land at N+${o.expected}. Nobody has measured where our`);
+    console.log('  orders land, because this book has never sent one.');
+    console.log('  NOT MODELLED: our own price impact, and fill probability — the book');
+    console.log('  still fills 100% of attempts.');
+    console.log(`  Costs 1 + up to ${cfg.slotFillMaxLookups} RPC calls per mirrored trade.`);
+    console.log('');
+  }
+
   if (argv.includes('--pure-mirror')) {
     Object.assign(cfg, paperConfig({ ...cfg, pureMirror: true }));
     console.log('Pure mirror: the target decides every entry AND every exit.');
@@ -2867,6 +4364,12 @@ export async function main(argv = []) {
     console.log('');
   }
 
+  if (argv.includes('--dashboard') && !argv.includes('--watch')) {
+    console.error('Error: --dashboard needs --watch <seconds> (e.g. --watch 5) — a single tick has nothing to stream.');
+    process.exitCode = 1;
+    return;
+  }
+
   // Fetched once up front: every USD figure on the dashboard derives from it,
   // and a book opened with a USD budget cannot be sized without it.
   const solUsd = (await fetchSolUsd()) ?? 75.30;
@@ -2893,6 +4396,8 @@ export async function main(argv = []) {
     console.warn('');
   }
 
+  let book = null;
+
   if (argv.includes('--reset')) {
     const fresh = freshBook();
     const resolved = resolveTarget(watchlist, null);
@@ -2907,24 +4412,28 @@ export async function main(argv = []) {
     // The socket needs no equivalent: a subscription only ever delivers what
     // happens after it opens. This closes the poll half.
     if (fresh.target?.address) {
-      const anchor = await fetchLatestSignature({
-        wallet: fresh.target.address,
-        rpcUrl: cfg.rpcMirror.url,
-      });
-      if (anchor.ok) {
-        fresh.lastSignature = anchor.signature;
-        console.log(
-          anchor.signature
-            ? `Anchored at ${anchor.signature.slice(0, 12)}… — everything before it is ignored.`
-            : 'Target has no transaction history yet — nothing to anchor past.'
-        );
+      if (argv.includes('--catchup')) {
+        console.log('Catchup mode (--catchup): scanning recent whale trades on startup instead of ignoring past history.');
       } else {
-        // Said loudly rather than swallowed: an unanchored reset silently
-        // replays history, which is exactly what anchoring exists to stop, and
-        // it looks identical to a working fresh book.
-        console.warn(`   [WARN] could not read the latest signature (${anchor.error}).`);
-        console.warn('          This book will replay recent history on its first tick.');
-        console.warn('          Re-run --reset once the node answers to start genuinely clean.');
+        const anchor = await fetchLatestSignature({
+          wallet: fresh.target.address,
+          rpcUrl: cfg.rpcMirror.url,
+        });
+        if (anchor.ok) {
+          fresh.lastSignature = anchor.signature;
+          console.log(
+            anchor.signature
+              ? `Anchored at ${anchor.signature.slice(0, 12)}… — everything before it is ignored.`
+              : 'Target has no transaction history yet — nothing to anchor past.'
+          );
+        } else {
+          // Said loudly rather than swallowed: an unanchored reset silently
+          // replays history, which is exactly what anchoring exists to stop, and
+          // it looks identical to a working fresh book.
+          console.warn(`   [WARN] could not read the latest signature (${anchor.error}).`);
+          console.warn('          This book will replay recent history on its first tick.');
+          console.warn('          Re-run --reset once the node answers to start genuinely clean.');
+        }
       }
     }
 
@@ -2939,24 +4448,25 @@ export async function main(argv = []) {
       console.log(renderScorecard(paperScorecard(fresh, cfg), { solUsd }));
       return;
     }
-  }
-
-  let book = await loadBook();
-  if (!book) {
-    book = freshBook();
-    console.log(
-      budgetUsd !== null
-        ? `No paper book found — starting one at ${usd(budgetUsd, { sign: false })}.`
-        : `No paper book found — starting one at ${book.budgetSol.toFixed(3)} virtual SOL.`
-    );
-  } else if (budgetUsd !== null) {
-    // An existing book is NOT silently re-funded. Changing the budget under a
-    // running book would rewrite the denominator of every percentage already
-    // reported, so the operator is told how to do it deliberately.
-    console.log(
-      `Note: a book already exists (${book.budgetSol.toFixed(3)} SOL). ` +
-        `--budget only applies to a new book — add --reset to start over at ${usd(budgetUsd, { sign: false })}.`
-    );
+    book = fresh;
+  } else {
+    book = await loadBook();
+    if (!book) {
+      book = freshBook();
+      console.log(
+        budgetUsd !== null
+          ? `No paper book found — starting one at ${usd(budgetUsd, { sign: false })}.`
+          : `No paper book found — starting one at ${book.budgetSol.toFixed(3)} virtual SOL.`
+      );
+    } else if (budgetUsd !== null) {
+      // An existing book is NOT silently re-funded. Changing the budget under a
+      // running book would rewrite the denominator of every percentage already
+      // reported, so the operator is told how to do it deliberately.
+      console.log(
+        `Note: a book already exists (${book.budgetSol.toFixed(3)} SOL). ` +
+          `--budget only applies to a new book — add --reset to start over at ${usd(budgetUsd, { sign: false })}.`
+      );
+    }
   }
 
   if (argv.includes('--target')) {
@@ -3018,6 +4528,66 @@ export async function main(argv = []) {
   const canClear = shouldWipeScreen({ intervalSec, isTTY: process.stdout.isTTY });
 
   const recent = [];
+  // The web feed. Separate from `recent` on purpose — see the push loop below.
+  const webActivity = [];
+
+  let dash = null;
+  let dashBannerLine = '';
+  let lastWhaleEventAt = null;
+  let lastMarkAt = null;
+
+  if (argv.includes('--dashboard')) {
+    if (!intervalSec) {
+      console.error('Error: --dashboard needs --watch <seconds> — a single tick has nothing to stream.');
+      process.exitCode = 1;
+      return;
+    }
+    const portFlag = numericFlag(argv, '--dashboard-port');
+    if (portFlag.error) {
+      console.error(`Error: ${portFlag.error}`);
+      process.exitCode = 1;
+      return;
+    }
+    const { startDashboard, dashboardBanner, DEFAULT_DASHBOARD_PORT, DEFAULT_DASHBOARD_HOST } =
+      await import('./dashboard.mjs');
+
+    const hostIndex = argv.indexOf('--dashboard-host');
+    const dashHost = hostIndex !== -1 ? String(argv[hostIndex + 1] ?? '') : DEFAULT_DASHBOARD_HOST;
+    const embed = argv.includes('--dashboard-embed');
+
+    const started = await startDashboard({
+      host: dashHost || DEFAULT_DASHBOARD_HOST,
+      port: portFlag.value ?? DEFAULT_DASHBOARD_PORT,
+      embed,
+      book,
+      cfg,
+      getContext: () => ({
+        solUsd: spotCache.value,
+        socket:
+          typeof socket?.isConnected === 'function'
+            ? socket.isConnected()
+              ? 'connected'
+              : 'disconnected'
+            : socketEnabled
+              ? 'disconnected'
+              : 'off',
+        newestWhaleEventAt: lastWhaleEventAt,
+        lastMarkAt: lastMarkAt,
+        // NOT `recent` — that one is capped at 6 for the terminal's fixed
+        // height, and handing it over capped the web log to 6 as well.
+        activity: webActivity,
+      }),
+    });
+
+    if (!started.ok) {
+      console.error(`  DASHBOARD  not started — ${started.message}`);
+    } else {
+      dash = started;
+      dashBannerLine =
+        dashboardBanner(started.urls, { isTTY: process.stdout.isTTY }) +
+        (embed ? '\n  TIER B ENABLED — loading a market chart tells dexscreener.com which mint you hold' : '');
+    }
+  }
 
   // ---- websocket wallet listener -----------------------------------
   //
@@ -3159,6 +4729,13 @@ export async function main(argv = []) {
     lastCompound = report.compound ?? lastCompound;
     await saveBook(book);
 
+    // Freshness inputs for the dashboard header. `marked` counts positions
+    // re-priced this tick, so a run where every price lookup failed leaves
+    // lastMarkAt where it was and the page says so instead of implying the
+    // marks are current.
+    if (report.marked > 0) lastMarkAt = Date.now();
+    if (report.opened.length || report.exits.length) lastWhaleEventAt = Date.now();
+
     let spot = spotCache.value;
     if (Date.now() - spotCache.at >= SPOT_REFRESH_MS) {
       spot = (await fetchSolUsd()) ?? spotCache.value ?? solUsd;
@@ -3187,6 +4764,7 @@ export async function main(argv = []) {
         tail:
           ` — ${o.sizeSol.toFixed(4)} SOL` +
           (o.basis && cfg.pctWhale ? `  (${o.basis})` : '') +
+          liquidityTag(o) +
           (o.scaledIn && Number.isFinite(o.blendedEntryUsd)
             ? `  entry now $${o.blendedEntryUsd.toPrecision(4)}`
             : '') +
@@ -3202,9 +4780,66 @@ export async function main(argv = []) {
         tail:
           ` — ${e.label ?? e.trigger}` +
           `${Number.isFinite(e.gainPct) ? ` (${e.gainPct >= 0 ? '+' : ''}${e.gainPct.toFixed(0)}%)` : ''}` +
+          liquidityTag(e) +
           (e.whale ? `  (${e.whale})` : ''),
       });
     }
+    // ── THE WEB FEED IS A SEPARATE ARRAY, AND IT HAS TO BE ────────────────
+    // `recent` is capped at 6 immediately below because the TERMINAL is
+    // fixed-height. Handing that same array to the dashboard — which is what
+    // this did until now — meant the web activity log was silently capped at 6
+    // as well, while the plan claimed it kept the whole session. A scrolling
+    // DOM panel is one of the few things the terminal structurally cannot do,
+    // and it was being thrown away by an aliasing bug.
+    //
+    // These rows are also STRUCTURED rather than pre-formatted: the ticker
+    // needs the SOL figure, the fill slot, the drag against the target's own
+    // fill and the signature as separate fields, and a rendered string cannot
+    // be taken apart again.
+    for (const o of report.opened) {
+      const ourFill = o.entryPriceUsd;
+      const theirFill = o.whaleFillUsd;
+      webActivity.push({
+        stamp,
+        at: Date.now(),
+        kind: o.scaledIn ? 'ADD' : 'BUY',
+        mint: o.mint,
+        symbol: o.symbol ?? null,
+        sizeSol: o.sizeSol ?? null,
+        signature: o.signature ?? null,
+        whale: whaleTag(o.originatingWhale, watchlist)?.text ?? null,
+        impactPct: o.impactPct ?? null,
+        poolMeasured: o.poolMeasured ?? null,
+        liquidityCapped: o.liquidityCapped === true,
+        fillSlotOffset: o.executionBand?.fillSlotOffset ?? null,
+        fillLagMs: o.executionBand?.fillLagMs ?? null,
+        // What arriving late cost, against the price the target actually got.
+        // Null when either side is unknown rather than 0, which would read as
+        // "we matched them".
+        dragPct:
+          Number.isFinite(ourFill) && Number.isFinite(theirFill) && theirFill > 0
+            ? (ourFill / theirFill - 1) * 100
+            : null,
+      });
+    }
+    for (const e of report.exits) {
+      webActivity.push({
+        stamp,
+        at: Date.now(),
+        kind: 'SELL',
+        mint: e.mint,
+        symbol: e.symbol ?? null,
+        sizeSol: e.proceedsSol ?? null,
+        signature: e.signature ?? null,
+        whale: whaleTag(e.seller, watchlist, { withWinRate: false })?.text ?? null,
+        trigger: e.label ?? e.trigger ?? null,
+        gainPct: Number.isFinite(e.gainPct) ? e.gainPct : null,
+        impactPct: e.impactPct ?? null,
+        poolMeasured: e.poolMeasured ?? null,
+      });
+    }
+    while (webActivity.length > WEB_ACTIVITY_LIMIT) webActivity.shift();
+
     // Bounded, because the dashboard is fixed-height by design — an unbounded
     // activity log would push the numbers off the screen, which is the exact
     // scrolling this mode exists to stop.
@@ -3274,7 +4909,17 @@ export async function main(argv = []) {
       );
       console.log(
         `  FEED   ${feed}` +
+          // SUBSCRIPTION COVERAGE LEADS, because its absence is what made the
+          // connection-cap bug invisible: four of five wallets silently
+          // unsubscribed looked exactly like four quiet whales. A count that
+          // does not match the tracked total is the single most important
+          // thing on this line.
+          (s?.subscribed && trackedWhaleCount
+            ? ` · ${s.subscribed.length}/${trackedWhaleCount} subscribed`
+            : '') +
+          (s?.missing?.length ? `  ⛔ ${s.missing.map((a) => a.slice(0, 8) + '…').join(', ')} NOT SUBSCRIBED` : '') +
           (s ? ` · ${s.stats.notifications} notified, ${s.stats.resolved} resolved` : '') +
+          (s?.stats.unattributed ? `, ${s.stats.unattributed} unattributed` : '') +
           // Retrying and abandoned are different facts: one is in flight, the
           // other is a trade this book will never see. Only the second is a
           // hole in the mirror, so they are never merged into one counter.
@@ -3310,18 +4955,46 @@ export async function main(argv = []) {
     if (intervalSec) {
       console.log(`  updated ${stamp} · every ${intervalSec}s · Ctrl+C to stop`);
     }
+
+    // ── PUSH TO THE BROWSER, LAST ────────────────────────────────────────
+    // After saveBook and after the spot refresh, so a frame never shows a book
+    // state the engine has not finished writing or a price it is about to
+    // replace. One frame per tick: the engine produces new state once per tick,
+    // and emitting more often re-sends identical bytes.
+    if (dash) {
+      dash.publish(report);
+      // Every frame, not once at startup — see dashBannerLine's assignment.
+      console.log(`${dashBannerLine}${dash.clients() ? `  ·  ${dash.clients()} viewer(s)` : ''}`);
+    }
   };
 
-  await tick();
+  try {
+    await tick();
+  } catch (err) {
+    console.error('CRITICAL TICK ERROR:', err);
+    throw err;
+  }
   if (intervalSec) {
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      await new Promise((r) => setTimeout(r, intervalSec * 1000));
-      await tick();
+    // Keep a persistent timer active on Node's event loop so it never drains.
+    const keepalive = setInterval(() => {}, 60_000);
+    try {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        await new Promise((r) => setTimeout(r, intervalSec * 1000));
+        try {
+          await tick();
+        } catch (err) {
+          console.error('CRITICAL TICK ERROR IN LOOP:', err);
+        }
+      }
+    } finally {
+      clearInterval(keepalive);
     }
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
-  await main(process.argv.slice(2));
+if (process.argv[1] && fileURLToPath(import.meta.url).toLowerCase() === resolve(process.argv[1]).toLowerCase()) {
+  main(process.argv.slice(2)).catch((err) => {
+    console.error('CRITICAL MAIN ERROR:', err);
+  });
 }
