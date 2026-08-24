@@ -15,10 +15,11 @@
     "listen": "node aegis/telegram_listener.mjs",
     "listen:login": "node aegis/telegram_listener.mjs --login",
     "listen:channels": "node aegis/telegram_listener.mjs --channels",
+    "review": "node aegis/review_channel.mjs",
     "watch:liq": "node aegis/liquidity_watch.mjs",
     "discover": "node aegis/discovery_daemon.mjs",
     "bot": "node aegis/telegram.mjs --bot",
-    "test": "node --test aegis/test/",
+    "test": "node --test \"aegis/test/*.test.mjs\"",
     "test:telegram": "node aegis/index.mjs --test-telegram"
   },
   "_dependencyNote": [

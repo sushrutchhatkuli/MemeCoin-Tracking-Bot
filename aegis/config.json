@@ -1917,7 +1917,24 @@
     "channels": [
       "Soul Sniper",
       "Whale Trending",
-      "Solana Early Trending"
+      "Solana Early Trending",
+      "TcalledPresence"
+    ],
+    "_channelsNote": [
+      "TcalledPresence added 2026-08-24 for forward capture. Listed ONCE, not",
+      "as both 'TcalledPresence' and '@TcalledPresence': channelMatches() lower-",
+      "cases each entry and strips a leading '@' before comparing, so the two",
+      "spellings normalise to the identical string. A second entry would be a",
+      "literal duplicate that reads as extra coverage and matches nothing new —",
+      "the same failure the maxQueueLength note below warns about.",
+      "",
+      "Matching is substring-based, so this entry also catches a channel whose",
+      "display title merely CONTAINS the handle. Verify what it actually binds",
+      "to with 'node telegram_listener.mjs --channels' before trusting it.",
+      "",
+      "Forward capture only. To grade what this channel already called, run",
+      "'node telegram_listener.mjs --review TcalledPresence' — this list has no",
+      "bearing on that."
     ],
     "minSecondsBetweenScans": 4,
     "dedupeWindowMinutes": 90,
