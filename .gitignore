@@ -51,6 +51,20 @@ desktop.ini
 00 To Do List.md
 *To Do List.md
 
+# ── Wallet recovery material — NEVER commit ─────────────────────────────
+# "Axiom Recovery.txt" was sitting untracked in the repo root holding a
+# 12-word BIP39 seed phrase. A seed phrase in a git history is game over:
+# history is permanent, bots scrape pushes within minutes, and rotating a
+# compromised wallet means moving every asset out of it first.
+# Keep recovery material in a password manager, never in the working tree.
+*Recovery*.txt
+*recovery*.txt
+*seed*.txt
+*mnemonic*
+*.wallet
+wallet.json
+keypair*.json
+
 # Runtime logs
 *.log
 
