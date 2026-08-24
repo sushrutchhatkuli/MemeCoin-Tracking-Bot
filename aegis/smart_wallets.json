@@ -4,7 +4,7 @@
     "the next sync. Add hand-picked wallets to a separate file instead.",
     "",
     "Source: import:C:\\Users\\sushr\\Documents\\Memecoin Potential Finder\\leaderboard.csv",
-    "Generated: 2026-08-15T22:55:18.877Z",
+    "Generated: 2026-08-25T00:04:06.568Z",
     "Rules applied: win rate >= 30% over >= 3 graded buys,",
     "net profit >= $1,000,",
     "on-chain activity >= 10 signatures.",
@@ -41,67 +41,116 @@
     "figures describe the most recent swaps rather than the whole career."
   ],
   "generated": {
-    "at": "2026-08-15T22:55:18.877Z",
+    "at": "2026-08-25T00:04:06.568Z",
     "source": "import:C:\\Users\\sushr\\Documents\\Memecoin Potential Finder\\leaderboard.csv",
     "profitRuleSkipped": false,
-    "count": 4
+    "count": 5
   },
   "wallets": [
     {
+      "address": "XUrKb2aK4jBm77q75EemchVUNRTJyeFQ5KebTJygPhF",
+      "rank": 1,
+      "composite_score": 0.6113,
+      "composite_parts": {
+        "win_rate": 1,
+        "profit": 0.028,
+        "volume": 1
+      },
+      "label": "Elite Whale #1 (100% WR | +$212k)",
+      "win_rate": "100%",
+      "graded_buys": null,
+      "all_time_net_profit_usd": "+$212k",
+      "onchain_signatures": 17184,
+      "solscan": "https://solscan.io/account/XUrKb2aK4jBm77q75EemchVUNRTJyeFQ5KebTJygPhF",
+      "source": "imported-leaderboard",
+      "stats_updated": "2026-08-25",
+      "metrics_basis": "imported from leaderboard.csv",
+      "enabled": true,
+      "net_profit_usd": "+$212k"
+    },
+    {
+      "address": "4BQ6ATUt26GFdiYQfht23iwfKyYD9D7XbL5ATqNGk3xK",
+      "rank": 2,
+      "composite_score": 0.5716,
+      "composite_parts": {
+        "win_rate": 0.971,
+        "profit": 0.176,
+        "volume": 0.565
+      },
+      "label": "Elite Whale #2 (99% WR | +$408k)",
+      "win_rate": "99%",
+      "graded_buys": null,
+      "all_time_net_profit_usd": "+$408k",
+      "onchain_signatures": 10248,
+      "solscan": "https://solscan.io/account/4BQ6ATUt26GFdiYQfht23iwfKyYD9D7XbL5ATqNGk3xK",
+      "source": "imported-leaderboard",
+      "stats_updated": "2026-08-25",
+      "metrics_basis": "imported from leaderboard.csv",
+      "enabled": true,
+      "net_profit_usd": "+$408k"
+    },
+    {
       "address": "Ar2Y6o1QmrRAskjii1cRfijeKugHH13ycxW5cd7rro1x",
-      "label": "Elite Whale #1 (62% WR | +$1500k)",
+      "rank": 3,
+      "composite_score": 0.5379,
+      "composite_parts": {
+        "win_rate": 0,
+        "profit": 1,
+        "volume": 0.69
+      },
+      "label": "Elite Whale #3 (62% WR | +$1500k)",
       "win_rate": "62%",
       "graded_buys": null,
       "all_time_net_profit_usd": "+$1500k",
       "onchain_signatures": 12237,
       "solscan": "https://solscan.io/account/Ar2Y6o1QmrRAskjii1cRfijeKugHH13ycxW5cd7rro1x",
       "source": "imported-leaderboard",
-      "stats_updated": "2026-08-15",
+      "stats_updated": "2026-08-25",
       "metrics_basis": "imported from leaderboard.csv",
       "enabled": true,
       "net_profit_usd": "+$1500k"
     },
     {
-      "address": "8zkgFGVZrDLieViwqiXFCydSX6WL5hsxmUu55yBdsNsZ",
-      "label": "Elite Whale #2 (52% WR | +$31k)",
-      "win_rate": "52%",
+      "address": "Bgokg3jutarxEMWQVospwUucSQfpG6Jw27jRbMxcvU2q",
+      "rank": 4,
+      "composite_score": 0.4,
+      "composite_parts": {
+        "win_rate": 1,
+        "profit": 0,
+        "volume": 0
+      },
+      "label": "Elite Whale #4 (100% WR | +$175k)",
+      "win_rate": "100%",
       "graded_buys": null,
-      "all_time_net_profit_usd": "+$31k",
-      "onchain_signatures": 4744,
-      "solscan": "https://solscan.io/account/8zkgFGVZrDLieViwqiXFCydSX6WL5hsxmUu55yBdsNsZ",
+      "all_time_net_profit_usd": "+$175k",
+      "onchain_signatures": 1250,
+      "solscan": "https://solscan.io/account/Bgokg3jutarxEMWQVospwUucSQfpG6Jw27jRbMxcvU2q",
       "source": "imported-leaderboard",
-      "stats_updated": "2026-08-15",
+      "stats_updated": "2026-08-25",
       "metrics_basis": "imported from leaderboard.csv",
       "enabled": true,
-      "net_profit_usd": "+$31k"
+      "net_profit_usd": "+$175k"
     },
     {
-      "address": "DZbgq3yE3r41EFszV3XastvyS8j8QnmNT37nsq7sxR66",
-      "label": "Elite Whale #3 (46% WR | +$25k)",
-      "win_rate": "46%",
+      "address": "B7XwXUuZn9zkRSV17mcn35J77hv91GJpK5jMH3Y7kk5R",
+      "rank": 5,
+      "composite_score": 0.3471,
+      "composite_parts": {
+        "win_rate": 0.813,
+        "profit": 0.012,
+        "volume": 0.085
+      },
+      "label": "Elite Whale #5 (93% WR | +$190k)",
+      "win_rate": "93%",
       "graded_buys": null,
-      "all_time_net_profit_usd": "+$25k",
-      "onchain_signatures": 179,
-      "solscan": "https://solscan.io/account/DZbgq3yE3r41EFszV3XastvyS8j8QnmNT37nsq7sxR66",
+      "all_time_net_profit_usd": "+$190k",
+      "onchain_signatures": 2605,
+      "solscan": "https://solscan.io/account/B7XwXUuZn9zkRSV17mcn35J77hv91GJpK5jMH3Y7kk5R",
       "source": "imported-leaderboard",
-      "stats_updated": "2026-08-15",
+      "stats_updated": "2026-08-25",
       "metrics_basis": "imported from leaderboard.csv",
       "enabled": true,
-      "net_profit_usd": "+$25k"
-    },
-    {
-      "address": "kEFiAX3jo5NmemysQov342TZ9mGh6yp92GDRjhA8XDf",
-      "label": "Elite Whale #4 (57% WR | +$2k)",
-      "win_rate": "57%",
-      "graded_buys": null,
-      "all_time_net_profit_usd": "+$2k",
-      "onchain_signatures": 84,
-      "solscan": "https://solscan.io/account/kEFiAX3jo5NmemysQov342TZ9mGh6yp92GDRjhA8XDf",
-      "source": "imported-leaderboard",
-      "stats_updated": "2026-08-15",
-      "metrics_basis": "imported from leaderboard.csv",
-      "enabled": true,
-      "net_profit_usd": "+$2k"
+      "net_profit_usd": "+$190k"
     }
   ]
 }
